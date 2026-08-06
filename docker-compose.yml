@@ -1,0 +1,78 @@
+# Zero Agent v2 — Docker Compose
+# Production-ready single-instance deployment.
+#
+# Usage:
+#   TELEGRAM_BOT_TOKEN=... GEMINI_API_KEY=... docker compose up -d
+#
+# Logs: docker compose logs -f zero
+# Stop: docker compose down
+# Backup DB: docker cp zero-agent:/home/zero/.zero/db ./backup
+
+services:
+  zero-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: zero-agent:latest
+    container_name: zero-agent
+    restart: unless-stopped
+    environment:
+      # --- Required secrets (set via .env or environment) ---
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is required}
+      # --- LLM provider selection ---
+      # One of: gemini, openai, openrouter, custom
+      ZERO_ROUTER__PROVIDER: ${ZERO_ROUTER_PROVIDER:-gemini}
+      # The Router API key (also used by the RouterShim to authenticate Zero's calls).
+      # For provider=gemini, set this to the same value as GEMINI_API_KEY.
+      ZERO_ROUTER__API_KEY: ${ZERO_ROUTER_API_KEY:-secret://env/GEMINI_API_KEY}
+      # --- Provider API keys (only the selected one is needed) ---
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # --- Optional: default model hint ---
+      ZERO_ROUTER__DEFAULT_MODEL: ${ZERO_ROUTER_DEFAULT_MODEL:-gemini-2.0-flash}
+      # --- Database ---
+      ZERO_DATABASE__BACKEND: sqlite
+      ZERO_DATABASE__SQLITE_DIR: /home/zero/.zero/db
+      # --- Logging ---
+      ZERO_LOGGING__LEVEL: ${ZERO_LOGGING_LEVEL:-info}
+      ZERO_LOGGING__FORMAT: json
+      ZERO_LOGGING__REDACT_SECRETS: "true"
+      # --- Telegram ---
+      ZERO_TELEGRAM__BOT_TOKEN: secret://env/TELEGRAM_BOT_TOKEN
+      ZERO_TELEGRAM__DROP_PENDING_UPDATES: ${ZERO_DROP_PENDING_UPDATES:-true}
+      # --- Agent defaults ---
+      ZERO_AGENT__MAX_TURNS: "100"
+      ZERO_AGENT__BUDGET_DEFAULT_USD: "5.0"
+      # --- Security ---
+      ZERO_SECURITY__APPROVAL_MODE: manual
+      ZERO_SECURITY__SESSION_TTL_SECONDS: "86400"
+      ZERO_SECURITY__NET_GUARD_ENABLED: "true"
+    volumes:
+      # Persist DB + logs across container restarts.
+      - zero-data:/home/zero/.zero
+      # Optional: mount a custom config file.
+      # - ./config.yaml:/home/zero/.zero/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "zero", "doctor"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2.0"
+        reservations:
+          memory: 256M
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  zero-data:
+    driver: local

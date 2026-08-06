@@ -1,3 +1,0 @@
-[console_scripts]
-zero = zero.cli:main
-zero-migrate = zero.cli.migrate:main

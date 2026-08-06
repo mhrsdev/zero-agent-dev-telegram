@@ -1,0 +1,35 @@
+{
+  "method": "POST",
+  "url": "http://127.0.0.1:8080/v1/chat/completions",
+  "headers": {
+    "Authorization": "Bearer ***",
+    "Content-Type": "application/json",
+    "X-Zero-Scope-Mode": "development",
+    "X-Zero-Scope-Key": "dev:prj_01HABCDEF0123456789GHJKL"
+  },
+  "body": {
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Hello, what is 2+2?"}
+    ],
+    "temperature": 0.0,
+    "model": "zero/coding",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read the contents of a text file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {"type": "string"},
+              "max_lines": {"type": "integer", "default": 2000}
+            },
+            "required": ["path"]
+          }
+        }
+      }
+    ]
+  }
+}

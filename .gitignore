@@ -1,0 +1,39 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.eggs/
+*.egg-info/
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime state
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+sessions/
+backups/
+
+# Build artifacts
+dist/
+build/
+*.whl
+*.tar.gz
+.DS_Store

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zero.dev/contracts/v1/capability.schema.json",
+  "title": "Zero v2 Capability Document",
+  "description": "Capability reported by Zero to Platform. T-P.2 contract.",
+  "type": "object",
+  "required": ["namespace", "name", "state"],
+  "additionalProperties": false,
+  "properties": {
+    "namespace": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+      "description": "Capability namespace (e.g. 'telegram', 'memory', 'agents')"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+    },
+    "state": {
+      "type": "string",
+      "enum": ["available", "unavailable", "degraded", "unknown"]
+    },
+    "detail": {
+      "type": ["string", "null"],
+      "maxLength": 1024
+    },
+    "last_change_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
