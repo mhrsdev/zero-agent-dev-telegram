@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Zero Develop{% endblock %}</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <a href="#main" class="skip-link">Skip to main content</a>
+    <nav class="nav" role="navigation" aria-label="Main navigation">
+        <span class="brand">Zero Develop</span>
+        <a href="/">Dashboard</a>
+        <a href="/web/projects">Projects</a>
+        <a href="/web/users">Users</a>
+        <a href="/web/audit">Audit Log</a>
+    </nav>
+    <main id="main" class="container" role="main">
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>

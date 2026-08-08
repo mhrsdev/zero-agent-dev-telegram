@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Execution {{ execution.id }} — Zero Develop{% endblock %}
+{% block content %}
+<h1>Execution</h1>
+<p><strong>Execution ID:</strong> <code>{{ execution.id }}</code></p>
+<p><strong>Plan:</strong> <code>{{ execution.plan_id }}</code></p>
+<p><strong>State:</strong> <span class="badge badge-{% if execution.state == 'completed' %}success{% elif execution.state == 'failed' or execution.state == 'cancelled' %}error{% elif execution.state == 'paused' %}warning{% else %}pending{% endif %}">{{ execution.state }}</span></p>
+{% if execution.blocker_reason %}
+<p><strong>Blocker:</strong> {{ execution.blocker_reason }}</p>
+{% endif %}
+<p><strong>Created:</strong> {{ execution.created_at }}</p>
+<p><a href="/web/projects/{{ project.id }}">&larr; Back to project</a></p>
+
+<section class="card">
+    <div class="card-header">Tasks</div>
+    {% if tasks %}
+    <table>
+        <thead><tr><th>Task ID</th><th>Objective</th><th>State</th><th>Blocker</th><th>Created</th></tr></thead>
+        <tbody>
+        {% for t in tasks %}
+            <tr>
+                <td><code>{{ t.id }}</code></td>
+                <td>{{ t.objective }}</td>
+                <td><span class="badge badge-{% if t.state == 'completed' %}success{% elif t.state == 'failed' or t.state == 'cancelled' %}error{% elif t.state == 'blocked' %}warning{% elif t.state == 'running' %}warning{% else %}pending{% endif %}">{{ t.state }}</span></td>
+                <td>{{ t.blocker_reason or '—' }}</td>
+                <td>{{ t.created_at }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No tasks yet.</p>
+    {% endif %}
+</section>
+
+<section class="card">
+    <div class="card-header">Actions</div>
+    {% if execution.state in ['pending', 'running', 'paused'] %}
+    <form method="POST" action="/web/projects/{{ project.id }}/executions/{{ execution.id }}/cancel" style="display:inline">
+        <input type="hidden" name="actor_id" value="{{ project.owner_user_id }}">
+        <button type="submit" class="btn btn-danger">Cancel Execution</button>
+    </form>
+    {% endif %}
+    {% if execution.state == 'running' %}
+    <form method="POST" action="/web/projects/{{ project.id }}/executions/{{ execution.id }}/recover" style="display:inline">
+        <input type="hidden" name="actor_id" value="{{ project.owner_user_id }}">
+        <button type="submit" class="btn btn-secondary">Recover After Restart</button>
+    </form>
+    {% endif %}
+</section>
+{% endblock %}

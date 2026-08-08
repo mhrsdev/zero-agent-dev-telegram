@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}Plan {{ plan.id }} — Zero Develop{% endblock %}
+{% block content %}
+<h1>Plan</h1>
+<p><strong>Plan ID:</strong> <code>{{ plan.id }}</code></p>
+<p><strong>State:</strong> <span class="badge badge-{% if plan.current_state == 'approved' %}success{% elif plan.current_state == 'rejected' %}error{% elif plan.current_state == 'proposed' %}warning{% else %}pending{% endif %}">{{ plan.current_state }}</span></p>
+<p><strong>Current Revision:</strong> {{ plan.current_revision_number }}</p>
+<p><strong>Created:</strong> {{ plan.created_at }}</p>
+<p><a href="/web/projects/{{ project.id }}">&larr; Back to project</a></p>
+
+<section class="card">
+    <div class="card-header">Propose New Revision</div>
+    <form method="POST" action="/web/projects/{{ project.id }}/plans/{{ plan.id }}/revisions">
+        <input type="hidden" name="actor_id" value="{{ project.owner_user_id }}">
+        <label for="objective">Objective</label>
+        <input type="text" id="objective" name="objective" required maxlength="500">
+        <br>
+        <label for="acceptance_criteria">Acceptance Criteria (one per line)</label>
+        <textarea id="acceptance_criteria" name="acceptance_criteria" rows="3" required></textarea>
+        <br>
+        <label for="source_event_ids">Source Event IDs (comma-separated)</label>
+        <input type="text" id="source_event_ids" name="source_event_ids" required
+               placeholder="evt_...">
+        <br><br>
+        <button type="submit">Propose Revision</button>
+    </form>
+    {% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+    {% if success %}<div class="alert alert-success" role="status">{{ success }}</div>{% endif %}
+</section>
+
+<section class="card">
+    <div class="card-header">Revisions</div>
+    {% if revisions %}
+    <table>
+        <thead><tr><th>#</th><th>State</th><th>Objective</th><th>Created</th><th>Actions</th></tr></thead>
+        <tbody>
+        {% for r in revisions %}
+            <tr>
+                <td>{{ r.revision_number }}</td>
+                <td><span class="badge badge-{% if r.state == 'approved' %}success{% elif r.state == 'rejected' %}error{% else %}warning{% endif %}">{{ r.state }}</span></td>
+                <td>{{ r.objective }}</td>
+                <td>{{ r.created_at }}</td>
+                <td>
+                    {% if r.state == 'proposed' and r.revision_number == plan.current_revision_number %}
+                    <form method="POST" action="/web/projects/{{ project.id }}/plans/{{ plan.id }}/approve" style="display:inline">
+                        <input type="hidden" name="actor_id" value="{{ project.owner_user_id }}">
+                        <input type="hidden" name="expected_revision_number" value="{{ r.revision_number }}">
+                        <input type="hidden" name="idempotency_key" value="web-approve-{{ r.revision_number }}">
+                        <button type="submit" class="btn">Approve</button>
+                    </form>
+                    <form method="POST" action="/web/projects/{{ project.id }}/plans/{{ plan.id }}/reject" style="display:inline">
+                        <input type="hidden" name="actor_id" value="{{ project.owner_user_id }}">
+                        <input type="hidden" name="expected_revision_number" value="{{ r.revision_number }}">
+                        <input type="hidden" name="idempotency_key" value="web-reject-{{ r.revision_number }}">
+                        <button type="submit" class="btn btn-danger">Reject</button>
+                    </form>
+                    {% endif %}
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No revisions yet.</p>
+    {% endif %}
+</section>
+
+{% if handoff %}
+<section class="card">
+    <div class="card-header">Handoff</div>
+    <p><strong>Handoff ID:</strong> <code>{{ handoff.id }}</code></p>
+    <p><strong>Execution ID:</strong>
+        {% if handoff.execution_id %}
+            <a href="/web/projects/{{ project.id }}/executions/{{ handoff.execution_id }}"><code>{{ handoff.execution_id }}</code></a>
+        {% else %}
+            <em>Not yet picked up by Worker</em>
+        {% endif %}
+    </p>
+    <p><strong>Created:</strong> {{ handoff.created_at }}</p>
+</section>
+{% endif %}
+{% endblock %}

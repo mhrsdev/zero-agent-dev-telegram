@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Zero Develop{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+
+<section class="card">
+    <div class="card-header">System Health</div>
+    <table>
+        <tr><th>Status</th><td><span class="badge badge-success">{{ health.status }}</span></td></tr>
+        <tr><th>Version</th><td><code>{{ health.version }}</code></td></tr>
+        <tr><th>Environment</th><td>{{ health.environment }}</td></tr>
+        <tr><th>Database</th><td>{{ health.database }}</td></tr>
+        <tr><th>Migrations Applied</th><td>{{ health.migration_count }}</td></tr>
+    </table>
+</section>
+
+<section class="card">
+    <div class="card-header">Quick Actions</div>
+    <div class="grid grid-2">
+        <div>
+            <h3>Identity</h3>
+            <p><a href="/web/users" class="btn btn-secondary">Manage Users</a></p>
+        </div>
+        <div>
+            <h3>Projects</h3>
+            <p><a href="/web/projects" class="btn btn-secondary">View Projects</a></p>
+        </div>
+    </div>
+</section>
+
+<section class="card">
+    <div class="card-header">Recent Projects</div>
+    {% if projects %}
+    <table>
+        <thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Created</th></tr></thead>
+        <tbody>
+        {% for p in projects %}
+            <tr>
+                <td><code>{{ p.id }}</code></td>
+                <td><a href="/web/projects/{{ p.id }}">{{ p.name }}</a></td>
+                <td><code>{{ p.owner_user_id }}</code></td>
+                <td>{{ p.created_at }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No projects yet. <a href="/web/projects/new">Create one</a>.</p>
+    {% endif %}
+</section>
+{% endblock %}

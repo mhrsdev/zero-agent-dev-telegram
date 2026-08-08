@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Sign in — Zero Develop{% endblock %}
+{% block content %}
+<section class="card" aria-labelledby="login-title">
+  <h1 id="login-title">Sign in</h1>
+  <p>Use a Zero access token issued by the server owner.</p>
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <form method="post" action="/web/login" autocomplete="off">
+    <label for="access-token">Access token</label>
+    <input id="access-token" name="access_token" type="password" required autocomplete="off">
+    <button type="submit">Sign in</button>
+  </form>
+</section>
+{% endblock %}

@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Users — Zero Develop{% endblock %}
+{% block content %}
+<h1>Users</h1>
+
+<section class="card">
+    <div class="card-header">Create User</div>
+    <form method="POST" action="/web/users">
+        <label for="display_name">Display Name</label>
+        <input type="text" id="display_name" name="display_name" required
+               maxlength="200" autocomplete="name">
+        <br><br>
+        <button type="submit">Create User</button>
+    </form>
+    {% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+    {% if success %}<div class="alert alert-success" role="status">{{ success }}</div>{% endif %}
+</section>
+
+<section class="card">
+    <div class="card-header">All Users</div>
+    {% if users %}
+    <table>
+        <thead><tr><th>ID</th><th>Display Name</th><th>Status</th><th>Created</th></tr></thead>
+        <tbody>
+        {% for u in users %}
+            <tr>
+                <td><code>{{ u.id }}</code></td>
+                <td>{{ u.display_name }}</td>
+                <td><span class="badge badge-{% if u.status == 'active' %}success{% else %}pending{% endif %}">{{ u.status }}</span></td>
+                <td>{{ u.created_at }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No users yet.</p>
+    {% endif %}
+</section>
+{% endblock %}

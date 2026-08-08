@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Projects — Zero Develop{% endblock %}
+{% block content %}
+<h1>Projects</h1>
+
+<section class="card">
+    <div class="card-header">Create Project</div>
+    <form method="POST" action="/web/projects">
+        <label for="owner_id">Owner User ID</label>
+        <input type="text" id="owner_id" name="owner_id" required
+               pattern="zu_[a-z0-9]+" title="Zero User ID (zu_...)">
+        <br>
+        <label for="name">Project Name</label>
+        <input type="text" id="name" name="name" required maxlength="200">
+        <br><br>
+        <button type="submit">Create Project</button>
+    </form>
+    {% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+    {% if success %}<div class="alert alert-success" role="status">{{ success }}</div>{% endif %}
+</section>
+
+<section class="card">
+    <div class="card-header">All Projects</div>
+    {% if projects %}
+    <table>
+        <thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Created</th></tr></thead>
+        <tbody>
+        {% for p in projects %}
+            <tr>
+                <td><code>{{ p.id }}</code></td>
+                <td><a href="/web/projects/{{ p.id }}">{{ p.name }}</a></td>
+                <td><code>{{ p.owner_user_id }}</code></td>
+                <td>{{ p.created_at }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No projects yet.</p>
+    {% endif %}
+</section>
+{% endblock %}

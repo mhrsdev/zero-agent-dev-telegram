@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} — Zero Develop{% endblock %}
+{% block content %}
+<h1>{{ project.name }}</h1>
+<p><strong>Project ID:</strong> <code>{{ project.id }}</code></p>
+<p><strong>Owner:</strong> <code>{{ project.owner_user_id }}</code></p>
+<p><strong>Created:</strong> {{ project.created_at }}</p>
+
+<nav aria-label="Project sections">
+    <a href="#members" class="btn btn-secondary">Members</a>
+    <a href="#plans" class="btn btn-secondary">Plans</a>
+    <a href="#executions" class="btn btn-secondary">Executions</a>
+    <a href="#agent-types" class="btn btn-secondary">Agent Types</a>
+    <a href="#audit" class="btn btn-secondary">Audit</a>
+</nav>
+
+<section id="members" class="card">
+    <div class="card-header">Members</div>
+    <form method="POST" action="/web/projects/{{ project.id }}/members">
+        <label for="member_id">Member User ID</label>
+        <input type="text" id="member_id" name="member_id" required
+               pattern="zu_[a-z0-9]+" title="Zero User ID (zu_...)">
+        <br>
+        <label for="role">Role</label>
+        <select id="role" name="role">
+            <option value="member">Member</option>
+            <option value="viewer">Viewer</option>
+        </select>
+        <br><br>
+        <button type="submit">Add Member</button>
+    </form>
+    {% if member_error %}<div class="alert alert-error" role="alert">{{ member_error }}</div>{% endif %}
+    {% if member_success %}<div class="alert alert-success" role="status">{{ member_success }}</div>{% endif %}
+
+    {% if members %}
+    <table>
+        <thead><tr><th>User ID</th><th>Role</th><th>Added</th></tr></thead>
+        <tbody>
+        {% for m in members %}
+            <tr>
+                <td><code>{{ m.user_id }}</code></td>
+                <td><span class="badge badge-{% if m.role == 'owner' %}success{% elif m.role == 'member' %}pending{% else %}warning{% endif %}">{{ m.role }}</span></td>
+                <td>{{ m.created_at }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No members yet.</p>
+    {% endif %}
+</section>
+
+<section id="plans" class="card">
+    <div class="card-header">Plans</div>
+    <form method="POST" action="/web/projects/{{ project.id }}/plans">
+        <input type="hidden" name="actor_id" value="{{ project.owner_user_id }}">
+        <button type="submit">Create New Plan</button>
+    </form>
+    {% if plans %}
+    <table>
+        <thead><tr><th>Plan ID</th><th>State</th><th>Revision</th><th>Created</th></tr></thead>
+        <tbody>
+        {% for p in plans %}
+            <tr>
+                <td><a href="/web/projects/{{ project.id }}/plans/{{ p.id }}"><code>{{ p.id }}</code></a></td>
+                <td><span class="badge badge-{% if p.current_state == 'approved' %}success{% elif p.current_state == 'rejected' %}error{% elif p.current_state == 'proposed' %}warning{% else %}pending{% endif %}">{{ p.current_state }}</span></td>
+                <td>{{ p.current_revision_number }}</td>
+                <td>{{ p.created_at }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No plans yet.</p>
+    {% endif %}
+</section>
+
+<section id="executions" class="card">
+    <div class="card-header">Executions</div>
+    {% if executions %}
+    <table>
+        <thead><tr><th>Execution ID</th><th>Plan</th><th>State</th><th>Blocker</th><th>Created</th></tr></thead>
+        <tbody>
+        {% for e in executions %}
+            <tr>
+                <td><a href="/web/projects/{{ project.id }}/executions/{{ e.id }}"><code>{{ e.id }}</code></a></td>
+                <td><code>{{ e.plan_id }}</code></td>
+                <td><span class="badge badge-{% if e.state == 'completed' %}success{% elif e.state == 'failed' or e.state == 'cancelled' %}error{% elif e.state == 'paused' %}warning{% else %}pending{% endif %}">{{ e.state }}</span></td>
+                <td>{{ e.blocker_reason or '—' }}</td>
+                <td>{{ e.created_at }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No executions yet.</p>
+    {% endif %}
+</section>
+
+<section id="agent-types" class="card">
+    <div class="card-header">Agent Types</div>
+    {% if agent_types %}
+    <table>
+        <thead><tr><th>Type ID</th><th>Name</th><th>Responsibility</th><th>State</th><th>Concurrency</th></tr></thead>
+        <tbody>
+        {% for t in agent_types %}
+            <tr>
+                <td><code>{{ t.id }}</code></td>
+                <td>{{ t.name }}</td>
+                <td>{{ t.responsibility }}</td>
+                <td><span class="badge badge-{% if t.state == 'active' %}success{% elif t.state == 'archived' %}pending{% else %}error{% endif %}">{{ t.state }}</span></td>
+                <td>{{ t.max_concurrent_instances }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No agent types yet.</p>
+    {% endif %}
+</section>
+
+<section id="audit" class="card">
+    <div class="card-header">Recent Audit Events</div>
+    {% if audit_events %}
+    <table>
+        <thead><tr><th>Time</th><th>Operation</th><th>Target</th><th>Result</th></tr></thead>
+        <tbody>
+        {% for e in audit_events[:10] %}
+            <tr>
+                <td>{{ e.created_at }}</td>
+                <td><code>{{ e.operation }}</code></td>
+                <td>{{ e.target_id or '—' }}</td>
+                <td><span class="badge badge-{% if e.result == 'success' %}success{% elif e.result == 'denied' or e.result == 'failure' %}error{% else %}warning{% endif %}">{{ e.result }}</span></td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No audit events yet.</p>
+    {% endif %}
+</section>
+{% endblock %}

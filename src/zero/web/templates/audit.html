@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Audit Log — Zero Develop{% endblock %}
+{% block content %}
+<h1>Audit Log</h1>
+
+<section class="card">
+    <div class="card-header">All Audit Events</div>
+    {% if events %}
+    <table>
+        <thead><tr><th>Time</th><th>Project</th><th>Actor</th><th>Source</th><th>Operation</th><th>Target</th><th>Result</th><th>Summary</th></tr></thead>
+        <tbody>
+        {% for e in events %}
+            <tr>
+                <td>{{ e.created_at }}</td>
+                <td><code>{{ e.project_id or '—' }}</code></td>
+                <td><code>{{ e.actor_id or '—' }}</code></td>
+                <td>{{ e.source }}</td>
+                <td><code>{{ e.operation }}</code></td>
+                <td>{{ e.target_id or '—' }}</td>
+                <td><span class="badge badge-{% if e.result == 'success' %}success{% elif e.result == 'denied' or e.result == 'failure' %}error{% else %}warning{% endif %}">{{ e.result }}</span></td>
+                <td>{{ e.redacted_summary or '—' }}</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>No audit events yet.</p>
+    {% endif %}
+</section>
+{% endblock %}
