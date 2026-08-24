@@ -243,6 +243,7 @@ rules remain the canonical center; persistence implements the storage boundary.
 
 ## Documentation
 
+- [Usage & operations guide](docs/USAGE.md) — install, configure, run, and drive the full workflow
 - [Requirement ledger](docs/REQUIREMENT_LEDGER.md) — confirmed behavior, invariants, and evidence
 - [Current-state ledger](docs/CURRENT_STATE_LEDGER.md) — verified, partial, and blocked areas
 - [Dependency map](docs/DEPENDENCY_MAP.md) — safe milestone and capability ordering

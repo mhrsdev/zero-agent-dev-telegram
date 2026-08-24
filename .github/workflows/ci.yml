@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Tests, lint, format, syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project and development tools
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+      - name: Run complete test suite
+        env:
+          ZERO_ENV: test
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: src
+        run: python -m pytest -rA -p no:cacheprovider
+      - name: Run Ruff
+        run: ruff check --no-cache src tests scripts
+      - name: Check formatting
+        run: ruff format --check --no-cache src tests scripts
+      - name: Check Python syntax
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m compileall -q src tests scripts
+
+  release:
+    name: Clean artifact and installed startup
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Require a clean tracked checkout
+        run: |
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Materialize the committed Git tree
+        env:
+          SOURCE: ${{ runner.temp }}/zero-release-source
+        run: |
+          rm -rf "$SOURCE"
+          mkdir -p "$SOURCE"
+          git archive --format=tar HEAD | tar -x -C "$SOURCE"
+      - name: Build wheel and source distribution from committed tree
+        env:
+          SOURCE: ${{ runner.temp }}/zero-release-source
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --outdir dist "$SOURCE"
+      - name: Validate artifact contents
+        env:
+          SOURCE: ${{ runner.temp }}/zero-release-source
+        run: python "$SOURCE/scripts/validate_release_artifacts.py" dist
+      - name: Install wheel outside the checkout
+        env:
+          VENV: ${{ runner.temp }}/zero-release-venv
+        run: |
+          python -m venv "$VENV"
+          "$VENV/bin/pip" install dist/*.whl
+          "$VENV/bin/python" - <<'PY'
+          import tempfile
+          from pathlib import Path
+
+          from zero.persistence.connection import Database
+          from zero.persistence.migrations import _migration_files, apply_migrations
+          from zero.config import Settings
+
+          database_path = Path(tempfile.mkdtemp(prefix="zero-release-db-")) / "zero.db"
+          settings = Settings.load_for_test(database_url=f"sqlite:///{database_path}")
+          database = Database(settings)
+          expected = len(_migration_files())
+          first = apply_migrations(database)
+          second = apply_migrations(database)
+          assert first == expected, (first, expected)
+          assert second == 0, second
+          print(f"installed_migrations={expected} first_apply={first} rerun={second}")
+          PY
+      - name: Smoke installed console entry point
+        env:
+          VENV: ${{ runner.temp }}/zero-release-venv
+          ZERO_ENV: test
+          ZERO_DATABASE_URL: sqlite:///${{ runner.temp }}/zero-release-server.db
+          PYTHONPATH: ""
+        run: |
+          "$VENV/bin/python" -c 'import zero.main; print("installed_import=ok")'
+          set +e
+          env -u ZERO_ENV -u ZERO_DATABASE_URL "$VENV/bin/zero-develop" >/tmp/zero-config-error.log 2>&1
+          config_status=$?
+          set -e
+          test "$config_status" -ne 0
+          grep -F "ZERO_ENV is required" /tmp/zero-config-error.log
+          "$VENV/bin/zero-develop" >/tmp/zero-release-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --silent --fail http://127.0.0.1:8000/healthz >/tmp/zero-health.json; then
+              break
+            fi
+            sleep 1
+          done
+          test "$(curl --silent --output /tmp/zero-root.html --write-out '%{http_code}' http://127.0.0.1:8000/)" = 200
+          test "$(curl --silent --output /tmp/zero-health.json --write-out '%{http_code}' http://127.0.0.1:8000/healthz)" = 200
+          test "$(curl --silent --output /tmp/zero-ready.json --write-out '%{http_code}' http://127.0.0.1:8000/readyz)" = 200
+          printf 'installed_console_root=200 installed_console_healthz=200 installed_console_readyz=200\n'
