@@ -13,9 +13,46 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+)
 
 from zero.manage.core.config import ConfigService, GroupPolicy, ZeroConfig
+from zero.manage.services.wizard_forms import WIZARD_STEPS
+
+
+def _ref_cls():
+    import zero.domain.secrets as s
+
+    return s.SecretReferenceId
+
+
+def cfg_draft_data() -> dict:
+    return _cfgsvc().load_draft()
+
+
+def save_draft(d: dict) -> None:
+    _cfgsvc().save_draft(d)
+
+
+def cfgsvc_exists() -> bool:
+    return _cfgsvc().exists()
+
+
+def cfg_load():
+    return _cfgsvc().load()
+
+
+def cache_put(cfgsvc, report):
+    from zero.manage.core.capabilities import CapabilityCache
+
+    CapabilityCache(Path(_home())).put(report)
+
+
+ORDER_LIST: list = list(WIZARD_STEPS)
+STEP_ORDER_IDX: dict = {s: i for i, s in enumerate(ORDER_LIST)}
 
 _SALT = b"zero-admin-v1"
 _sessions: dict[str, float] = {}  # sid -> expiry (single-process)
@@ -129,8 +166,69 @@ def _login_page(msg: str = "", need_setup: bool = False) -> HTMLResponse:
     return HTMLResponse(_BASE.replace("{csrf}", "").replace("{body}", html))
 
 
-def register_admin(app) -> None:
+def _usage_summary(days: int = 30) -> list:
+    try:
+        from zero.app.services import build_services
+        from zero.config import Settings
+        from zero.persistence.connection import Database
+        from zero.persistence.migrations import apply_migrations
+
+        settings = Settings.load()
+        database = Database(settings)
+        apply_migrations(database)
+        svc = build_services(settings, database)
+
+        since = time.strftime("%Y-%m-%dT00:00:00Z", time.gmtime(time.time() - days * 86400))
+        conn = svc.database.connect()
+        rows = conn.execute(
+            "SELECT substr(created_at,1,10) day, provider, model,"
+            " COUNT(*) requests, SUM(input_tokens) it, SUM(output_tokens) ot,"
+            " SUM(CAST(estimated_cost_usd AS REAL)) cost"
+            " FROM provider_usage WHERE created_at >= ?"
+            " GROUP BY day, provider, model ORDER BY day DESC LIMIT 200",
+            (since,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def register_admin(app, services=None) -> None:
     """Mount /admin routes onto the running engine app."""
+    _svc = services
+
+    def _setup():
+        from zero.manage.services.setup import SetupService
+
+        store = None
+        if _svc is not None:
+
+            def store(name, stype, value):
+                project = _ensure_project(_svc)
+                ref = _svc.secrets.store(
+                    project_id=project.id,
+                    name=name,
+                    secret_type=stype,
+                    value=value,
+                    actor_id=project.owner_user_id,
+                )
+                return ref.id.value
+
+        return SetupService(_cfgsvc(), lambda: None, secret_store=store)
+
+    def _ensure_project(svc):
+        proj = getattr(app.state, "manage_project", None)
+        if proj is not None:
+            return proj
+        for p in svc.identity.list_projects():
+            if p.name == "Zero Management":
+                app.state.manage_project = p
+                return p
+        op = svc.identity.create_user(display_name="Zero Operator")
+        proj = svc.identity.create_project(owner_id=op.id, name="Zero Management")
+        app.state.manage_project = proj
+        return proj
+
     router = APIRouter(prefix="/admin")
 
     @router.get("/login", response_class=HTMLResponse)
@@ -298,6 +396,315 @@ displays them.</p>"""
         data = cfgsvc.load().redacted_dict() if cfgsvc.exists() else {}
         pretty = json.dumps(data, indent=2, ensure_ascii=False)
         body = f"<h3>Configuration (redacted)</h3><pre class=ltr>{pretty}</pre>"
+        return _page(body, sid)
+
+    # ------------------------------------------------------------------
+    # Wizard (drives the shared SetupService state machine)
+    # ------------------------------------------------------------------
+
+    def _field_html(field, value):
+        v = "" if value is None else str(value)
+        checked = " checked" if value is True else ""
+        if field.kind == "password":
+            return (
+                '<input type="password" name="'
+                + field.name
+                + '" value="'
+                + v
+                + '" autocomplete="off">'
+            )
+        if field.kind == "bool":
+            return (
+                '<label><input type="checkbox" name="'
+                + field.name
+                + '" value="true"'
+                + checked
+                + "> enable</label>"
+            )
+        if field.kind == "select":
+            opts = "".join(
+                "<option" + (" selected" if o == v else "") + ">" + o + "</option>"
+                for o in field.options
+            )
+            return '<select name="' + field.name + '">' + opts + "</select>"
+        if field.kind == "int":
+            return (
+                '<input type="number" name="'
+                + field.name
+                + '" value="'
+                + (v or str(field.default or 0))
+                + '">'
+            )
+        req = " required" if field.required else ""
+        return '<input type="text" name="' + field.name + '" value="' + v + '"' + req + ">"
+
+    def _coerce(step_id, form):
+        step = WIZARD_STEPS[step_id]
+        out = {}
+        for fdef in step.fields:
+            raw = (form.get(fdef.name) or "").strip()
+            if fdef.kind == "bool":
+                out[fdef.name] = raw.lower() in ("true", "on", "1")
+            elif fdef.kind == "int":
+                try:
+                    out[fdef.name] = int(raw) if raw else int(fdef.default or 0)
+                except ValueError:
+                    out[fdef.name] = fdef.default
+            elif raw:
+                out[fdef.name] = raw
+            elif fdef.default is not None:
+                out[fdef.name] = fdef.default
+        return out
+
+    @router.get("/wizard", response_class=HTMLResponse)
+    def wizard_page(request: Request):
+        sid = guard(request)
+        svc = _setup()
+        step_id = svc.current()
+        step = WIZARD_STEPS[step_id]
+        saved = cfg_draft_data().get("data", {}).get(step_id, {})
+        fields_html = []
+        for fd in step.fields:
+            val = saved.get(fd.name, fd.default)
+            hh = "<span class=muted>" + fd.help + "</span><br>" if fd.help else ""
+            fields_html.append(
+                "<p><label>"
+                + fd.label
+                + "</label><br>"
+                + _field_html(fd, val)
+                + "<br>"
+                + hh
+                + "</p>"
+            )
+        err_html = ""
+        eq = request.query_params.get("err")
+        if eq:
+            errs = json.loads(eq)
+            err_html = "".join("<p class=bad>! " + e + "</p>" for e in errs)
+        back_btn = ""
+        if STEP_ORDER_IDX.get(step_id, 0) > 0:
+            back_btn = '<button name="action" value="back">Back</button>'
+        skip_btn = '<button name="action" value="skip">Skip</button>' if step.optional else ""
+        commit_btn = ""
+        if step_id in {"final_validation", "backup_policy"}:
+            commit_btn = '<button name="action" value="commit">Write configuration</button>'
+        preview = ""
+        if step_id == "final_validation":
+            try:
+                preview_obj = svc.build_preview().redacted_dict()
+                preview = "<pre class=ltr>" + json.dumps(preview_obj, indent=2)[:4000] + "</pre>"
+            except Exception as exc:  # noqa: BLE001
+                preview = "<p class=bad>preview failed: " + str(exc) + "</p>"
+        body = (
+            "<h3>Wizard - "
+            + step.title
+            + " <span class=muted>(step: "
+            + step_id
+            + ")</span></h3>"
+            + err_html
+            + preview
+            + '<form method="post" action="/admin/wizard/answer">'
+            + '<input type="hidden" name="csrf" value="'
+            + _csrf(sid)
+            + '">'
+            + '<input type="hidden" name="step" value="'
+            + step_id
+            + '">'
+            + "".join(fields_html)
+            + ("<p class=muted>No inputs for this step.</p>" if not fields_html else "")
+            + '<button name="action" value="answer">Continue</button>'
+            + back_btn
+            + skip_btn
+            + commit_btn
+            + "</form><p class=muted>Draft auto-saves; resume anytime.</p>"
+        )
+        return _page(body, sid)
+
+    @router.post("/wizard/answer")
+    async def wizard_answer(request: Request):
+        form = await request.form()
+        csrf = str(form.get("csrf", ""))
+        step_id = str(form.get("step", ""))
+        action = str(form.get("action") or "answer")
+        sid = request.cookies.get("zero_admin") or ""
+        if not _check_csrf(sid, csrf):
+            return HTMLResponse("bad csrf", status_code=400)
+        svc = _setup()
+        if action == "back":
+            idx = STEP_ORDER_IDX.get(step_id, 0)
+            draft = cfg_draft_data()
+            draft["current_step"] = ORDER_LIST[max(0, idx - 1)]
+            save_draft(draft)
+            return RedirectResponse("/admin/wizard", status_code=303)
+        if action == "commit":
+            try:
+                svc.commit()
+            except Exception as exc:  # noqa: BLE001
+                import urllib.parse as up
+
+                return RedirectResponse("/admin/wizard?err=" + up.quote(str(exc)), status_code=303)
+            return RedirectResponse("/admin?msg=config-written", status_code=303)
+        value = _coerce(step_id, dict(form))
+        result = svc.answer(step_id, value)
+        if not result.ok:
+            import urllib.parse as up
+
+            return RedirectResponse(
+                "/admin/wizard?err=" + up.quote(json.dumps(result.errors)), status_code=303
+            )
+        return RedirectResponse("/admin/wizard", status_code=303)
+
+    @router.post("/wizard/reset")
+    def wizard_reset(request: Request, csrf: str = Form("")):
+        sid = guard(request)
+        if not _check_csrf(sid, csrf):
+            return HTMLResponse("bad csrf", status_code=400)
+        _setup().reset()
+        return RedirectResponse("/admin/wizard", status_code=303)
+
+    @router.post("/providers/{provider_id}/test")
+    def provider_test(provider_id: str):
+        cfgsvc = _cfgsvc()
+        cfg = cfg_load() if cfgsvc.exists() else None
+        target = next((p for p in (cfg.providers if cfg else []) if p.id == provider_id), None)
+        if target is None:
+            return JSONResponse({"ok": False, "message": "unknown provider"}, status_code=404)
+        key = ""
+        retry_after = None
+        if _svc is not None and target.api_key_ref:
+            try:
+                project = _ensure_project(_svc)
+                key = _svc.secrets.resolve_value(
+                    project_id=project.id,
+                    secret_id=_ref_cls()(target.api_key_ref),
+                    actor_id=project.owner_user_id,
+                )
+            except Exception:  # noqa: BLE001
+                key = ""
+        from zero.manage.core.capabilities import probe_capabilities
+
+        model = (
+            target.models[0]
+            if target.models
+            else ("claude-sonnet-4" if target.protocol == "anthropic" else "gpt-4o-mini")
+        )
+        report = probe_capabilities(
+            protocol=target.protocol,
+            base_url=target.base_url,
+            api_key=key,
+            model=model,
+            provider_id=target.id,
+        )
+        caps = report.to_dict()
+        message = "tool_calls=" + caps["tool_calls"] + " streaming=" + caps["streaming"]
+        detail = caps.get("detail", {})
+        for v in detail.values():
+            sv = str(v)
+            if "retry_after=" in sv:
+                try:
+                    retry_after = int(sv.split("retry_after=")[-1].split(")")[0])
+                except ValueError:
+                    retry_after = None
+        ok = caps["tool_calls"] != "unsupported"
+        cache_put(cfgsvc, report)
+        return JSONResponse(
+            {
+                "ok": ok and "unavailable" not in (caps["tool_calls"], caps["streaming"]),
+                "capabilities": caps,
+                "retry_after": retry_after,
+                "message": message,
+            }
+        )
+
+    @router.get("/backups", response_class=HTMLResponse)
+    def backups_page(request: Request):
+        sid = guard(request)
+        home = _home()
+        bdir = home / "backups"
+        rows = "".join(
+            "<tr><td class=ltr>" + f.name + "</td><td>" + f"{f.stat().st_size:,}" + "</td></tr>"
+            for f in sorted(
+                bdir.glob("zero-backup-*"), key=lambda x: x.stat().st_mtime, reverse=True
+            )
+        )
+        rows = rows or "<tr><td colspan=2 class=muted>no archives</td></tr>"
+        sched = "-"
+        state = ""
+        if cfgsvc_exists():
+            sched = cfg_load().backups.schedule
+        sp = bdir / "last-backup.json"
+        if sp.exists():
+            state = sp.read_text(encoding="utf-8")[:300]
+        body = (
+            "<h3>Backups - schedule: " + sched + "</h3>"
+            "<table><tr><th>archive</th><th>bytes</th></tr>"
+            + rows
+            + "</table><pre class=ltr>"
+            + state
+            + "</pre>"
+            + '<form method="post" action="/admin/backups/run-now">'
+            + '<input type="hidden" name="csrf" value="'
+            + _csrf(sid)
+            + '">'
+            + "<button>Run backup now</button></form>"
+        )
+        return _page(body, sid)
+
+    @router.post("/backups/run-now")
+    def backups_run_now(request: Request, csrf: str = Form("")):
+        sid = guard(request)
+        if not _check_csrf(sid, csrf):
+            return HTMLResponse("bad csrf", status_code=400)
+        daemon = getattr(app.state, "backup_daemon", None)
+        if daemon is None:
+            import urllib.parse as up
+
+            return RedirectResponse(
+                "/admin/backups?msg="
+                + up.quote("backup daemon disabled (schedule off / test env)"),
+                status_code=303,
+            )
+        res = daemon.run_once(force=True)
+        import urllib.parse as up
+
+        flag = "ok" if res.get("ok") else "failed"
+        return RedirectResponse("/admin/backups?msg=" + up.quote(flag), status_code=303)
+
+    @router.get("/usage", response_class=HTMLResponse)
+    def usage_page(request: Request):
+        sid = guard(request)
+        summary = _usage_summary()
+        rows = "".join(
+            "<tr><td class=ltr>"
+            + str(r.get("day"))
+            + "</td>"
+            + "<td class=ltr>"
+            + str(r.get("provider"))
+            + "</td>"
+            + "<td class=ltr>"
+            + str(r.get("model"))
+            + "</td>"
+            + "<td>"
+            + str(r.get("requests"))
+            + "</td>"
+            + "<td>"
+            + str(r.get("it"))
+            + "</td>"
+            + "<td>"
+            + str(r.get("ot"))
+            + "</td>"
+            + "<td>$"
+            + str(r.get("cost"))
+            + "</td></tr>"
+            for r in summary
+        )
+        rows = rows or ("<tr><td colspan=7 class=muted>no usage recorded yet</td></tr>")
+        body = (
+            "<h3>Usage <span class=muted>(estimates; last 30 days)"
+            "</span></h3>" + "<table><tr><th>day</th><th>provider</th><th>model</th>"
+            "<th>req</th><th>in tok</th><th>out tok</th>"
+            "<th>est cost</th></tr>" + rows + "</table>"
+        )
         return _page(body, sid)
 
     app.include_router(router)

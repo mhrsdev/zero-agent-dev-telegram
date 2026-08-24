@@ -138,7 +138,13 @@ def test_setup_flow_happy_path(cfgsvc, monkeypatch) -> None:
         "zero.manage.core.probes.openai_list_models",
         lambda base, key, timeout=15.0: {"ok": True, "models": ["gpt-4o-mini"]},
     )
-    svc = SetupService(cfgsvc, lambda: None)
+    stored: list[tuple[str, str, str]] = []
+
+    def store(name, stype, value):
+        stored.append((name, stype, value))
+        return "sec_test_ref"
+
+    svc = SetupService(cfgsvc, lambda: None, secret_store=store)
 
     assert svc.answer("telegram_credentials", {"token": "123:abc"}).ok
     assert svc.current() == "provider_add"
@@ -164,6 +170,8 @@ def test_setup_flow_happy_path(cfgsvc, monkeypatch) -> None:
     assert cfg.telegram.bot_username == "mybot"
     assert cfg.routing.primary_model == "gpt-4o-mini"
     assert cfg.access.mode == "owner_only"
+    assert cfg.telegram.bot_token_ref == "sec_test_ref"
+    assert any(n == "telegram-bot-token" for n, _t, _v in stored)
     assert cfgsvc.draft_path.exists() is False  # cleared after commit
 
 

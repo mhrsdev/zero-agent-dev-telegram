@@ -48,9 +48,20 @@ class SetupService:
     files/DBs outside its adapters.
     """
 
-    def __init__(self, cfgsvc: ConfigService, engine_provider: Callable[[], Any]) -> None:
+    def __init__(
+        self,
+        cfgsvc: ConfigService,
+        engine_provider: Callable[[], Any],
+        *,
+        secret_store: Callable[[str, str, str], str] | None = None,
+    ) -> None:
+        """``secret_store(name, secret_type, value) -> ref_id`` persists the
+        value in the engine's encrypted store and returns its ``sec_…``
+        reference. When None, the wizard runs in dry mode (refs stay None)
+        and commit refuses to finish with un-stored secrets."""
         self.cfg = cfgsvc
         self.engine_factory = engine_provider
+        self._store_secret = secret_store
 
     # -- draft ------------------------------------------------------------
     def resume(self) -> dict[str, Any]:
@@ -188,6 +199,30 @@ class SetupService:
     def answer(self, step: str, value: dict[str, Any]) -> StepResult:
         probe_value = dict(value)
         result = self.validate(step, probe_value)
+        if result.ok and self._store_secret is not None:
+            # Persist secrets immediately (real operation), replacing raw
+            # values with durable references before anything is drafted.
+            try:
+                if step == "telegram_credentials" and probe_value.get("token"):
+                    ref = self._store_secret("telegram-bot-token", "token", probe_value["token"])
+                    probe_value["token_ref"] = ref
+                elif step == "provider_add" and probe_value.get("api_key"):
+                    ref = self._store_secret(
+                        f"{probe_value.get('id', 'provider')}-api-key",
+                        "api_key",
+                        probe_value["api_key"],
+                    )
+                    probe_value["api_key_ref"] = ref
+                elif (
+                    step == "websearch"
+                    and probe_value.get("enabled")
+                    and probe_value.get("api_key")
+                ):
+                    ref = self._store_secret("websearch-api-key", "api_key", probe_value["api_key"])
+                    probe_value["api_key_ref"] = ref
+            except Exception as exc:  # noqa: BLE001 - storage failure blocks
+                return StepResult(False, [f"secret store failed: {type(exc).__name__}"])
+            result = StepResult(True, [])
         draft = self._draft()
         if result.ok:
             secret_keys = {"token", "api_key"}
@@ -219,6 +254,20 @@ class SetupService:
         """Validate everything then write config.yaml atomically."""
         data = self._draft()["data"]
         cfg = self._build_config(data)
+        # Dry-mode guard: never write a config pointing at secrets that
+        # were never stored.
+        dangling = []
+        if cfg.telegram.bot_token_ref is None and data.get("telegram_credentials", {}).get("token"):
+            dangling.append("telegram bot token")
+        for p in cfg.providers:
+            if p.api_key_ref is None:
+                dangling.append(f"provider {p.id} key")
+        if cfg.websearch.enabled and cfg.websearch.api_key_ref is None:
+            dangling.append("websearch key")
+        if dangling:
+            raise ConfigError(
+                "secrets not stored (no secret backend wired): " + ", ".join(sorted(set(dangling)))
+            )
         self.cfg.save(cfg)
         self.cfg.clear_draft()
         return cfg

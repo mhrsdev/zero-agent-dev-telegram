@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -295,14 +296,53 @@ def create_app(settings: Settings) -> FastAPI:
     if services.interface_transports is not None:
         app.router.add_event_handler("shutdown", services.interface_transports.close)
 
-    # Optional local admin GUI (loopback-first; off in tests / when disabled).
-    if settings.zero_env != "test" and os.environ.get("ZERO_MANAGE_GUI", "1") != "0":
+    # Management layer: local admin GUI (loopback-first) + backup daemon.
+    manage_enabled = os.environ.get("ZERO_MANAGE_GUI", "1") != "0"
+    if settings.zero_env != "test" and manage_enabled:
         try:
             from zero.manage.web import register_admin
 
-            register_admin(app)
+            register_admin(app, services)
         except ImportError:  # pragma: no cover - manage layer optional
             pass
+        try:
+            from pathlib import Path as _P
+
+            from zero.manage.core.config import ConfigService
+            from zero.manage.services.backup_daemon import BackupDaemon
+
+            home = _P(os.environ.get("ZERO_HOME", Path.home() / ".zero"))
+            cfgsvc = ConfigService(home)
+            mcfg = cfgsvc.load() if cfgsvc.exists() else None
+            if mcfg is not None and mcfg.backups.schedule != "off":
+
+                def _runner() -> str:
+                    ts = time.strftime("%Y%m%d-%H%M%S")
+                    dest = home / "backups"
+                    dest.mkdir(parents=True, exist_ok=True)
+                    archive = dest / f"zero-backup-{ts}.enc"
+                    services.backup.backup_to_file(str(archive))
+                    return str(archive)
+
+                daemon = BackupDaemon(
+                    home=home,
+                    schedule=mcfg.backups.schedule,
+                    retention=mcfg.backups.retention,
+                    backup_runner=_runner,
+                )
+                thread, stop_ev = daemon.start_thread()
+                app.state.backup_daemon = daemon
+
+                @app.router.on_shutdown
+                async def _stop_backup_daemon() -> None:
+                    stop_ev.set()
+                    thread.join(timeout=5)
+        except Exception as exc:  # noqa: BLE001 - management must never break boot
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "management layer init skipped: %s", type(exc).__name__
+            )
 
     return app
 

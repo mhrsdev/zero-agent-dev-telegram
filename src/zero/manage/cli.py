@@ -14,10 +14,11 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from zero import __version__
-from zero.manage.core.config import ConfigError, ConfigService
+from zero.manage.core.config import ConfigError, ConfigService, ZeroConfig
 
 DEFAULT_HOME = Path(os.environ.get("ZERO_HOME", Path.home() / ".zero"))
 SERVICE_NAME = "zero"
@@ -718,6 +719,110 @@ def cmd_tui(ns) -> int:
     return run_tui()
 
 
+def cmd_capabilities(ns) -> int:
+    """Active tool-call/stream probes with cached results."""
+    from zero.manage.core.capabilities import CapabilityCache, probe_capabilities
+
+    cfgsvc = _cfgsvc()
+    cache = CapabilityCache(Path(DEFAULT_HOME))
+    if ns.op == "show":
+        _print(cache._read_all())
+        return 0
+    if ns.op == "probe":
+        cfg = cfgsvc.load() if cfgsvc.exists() else None
+        target_id = ns.provider or (cfg.providers[0].id if cfg and cfg.providers else None)
+        target = next((p for p in (cfg.providers if cfg else []) if p.id == target_id), None)
+        if target is None:
+            _fail("unknown provider (configure one first)", 2)
+        model = ns.model or (
+            target.models[0]
+            if target.models
+            else ("claude-sonnet-4" if target.protocol == "anthropic" else "gpt-4o-mini")
+        )
+        key = ""
+        if target.api_key_ref:
+            try:
+                _settings, services = _engine_services(ns.env_file)
+                project = _management_project(services)
+                key = services.secrets.resolve_value(
+                    project_id=project.id,
+                    secret_id=_secret_ref_cls()(target.api_key_ref),
+                    actor_id=project.owner_user_id,
+                )
+            except Exception:  # noqa: BLE001 - unauthenticated probe allowed
+                key = ""
+        report = probe_capabilities(
+            protocol=target.protocol,
+            base_url=target.base_url,
+            api_key=key,
+            model=model,
+            provider_id=target.id,
+        )
+        cache.put(report)
+        out = report.to_dict()
+        if ns.json:
+            _print(out)
+            return 0
+        print(f"provider={target.id} model={model}")
+        print(f"  tool_calls : {out['tool_calls']} {out['detail'].get('tool_calls', '')}")
+        print(f"  streaming  : {out['streaming']} {out['detail'].get('streaming', '')}")
+        bad = {"unsupported", "unavailable"} & {out["tool_calls"], out["streaming"]}
+        return 1 if bad else 0
+    _fail("unknown capabilities op", 2)
+
+
+def cmd_backup_daemon(ns) -> int:
+    """Foreground scheduled-backup loop (systemd/timer friendly)."""
+    import signal as _signal
+    import threading as _threading
+
+    from zero.manage.services.backup_daemon import BackupDaemon
+
+    cfgsvc = _cfgsvc()
+    cfg = cfgsvc.load() if cfgsvc.exists() else ZeroConfig()
+    if cfg.backups.schedule == "off":
+        print("backup schedule is off in config")
+        return 0
+
+    def runner() -> str:
+        _settings, services = _engine_services(ns.env_file)
+        dest = Path(DEFAULT_HOME) / "backups"
+        dest.mkdir(parents=True, exist_ok=True)
+        archive = dest / f"zero-backup-{time.strftime('%Y%m%d-%H%M%S')}.enc"
+        services.backup.backup_to_file(str(archive))
+        return str(archive)
+
+    daemon = BackupDaemon(
+        home=Path(DEFAULT_HOME),
+        schedule=cfg.backups.schedule,
+        retention=cfg.backups.retention,
+        backup_runner=runner,
+    )
+    stop = _threading.Event()
+
+    def _sig(_s, _f):
+        stop.set()
+
+    _signal.signal(_signal.SIGINT, _sig)
+    _signal.signal(_signal.SIGTERM, _sig)
+    print(f"backup daemon running (schedule={cfg.backups.schedule}); Ctrl+C to stop")
+    daemon.loop(stop)
+    return 0
+
+
+def cmd_backup_status(ns) -> int:
+    sp = Path(DEFAULT_HOME) / "backups" / "last-backup.json"
+    data: dict | None = None
+    if sp.exists():
+        data = json.loads(sp.read_text(encoding="utf-8"))
+    if ns.json or data is None:
+        _print({"last": data})
+        return 0
+    age_h = (time.time() - float(data.get("epoch", 0))) / 3600.0
+    print(f"last backup: {data.get('path')} ({age_h:.1f}h ago)")
+    return 0
+
+
 # ----------------------------------------------------------------------
 # parser
 # ----------------------------------------------------------------------
@@ -850,6 +955,18 @@ def _build_parser() -> argparse.ArgumentParser:
     we.add_argument("--provider-id", required=True)
     wss.add_parser("disable")
     wss.add_parser("status")
+
+    cap = with_env(sub.add_parser("capabilities", help="probe tool/stream capabilities"))
+    caps = cap.add_subparsers(dest="op", required=True)
+    caps.add_parser("show")
+    cprobe = caps.add_parser("probe")
+    cprobe.add_argument("--provider")
+    cprobe.add_argument("--model")
+    cprobe.add_argument("--json", action="store_true")
+
+    with_env(sub.add_parser("backup-daemon", help="run scheduled backup loop"))
+    bst = sub.add_parser("backup-status")
+    bst.add_argument("--json", action="store_true")
 
     sub.add_parser("tui", help="full-screen TUI (requires [tui] extra)")
 
