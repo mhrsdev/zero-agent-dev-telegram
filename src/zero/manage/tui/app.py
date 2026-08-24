@@ -185,6 +185,71 @@ def run() -> int:
             s = report["summary"]
             return f"{body}\n\n{s['total']} checks · {s['fail']} fail · {s['warn']} warn"
 
+    class ChatStreamPanel(Static):
+        """GAP 5: streams one execution's tokens into a scrollable pane."""
+
+        BORDER_TITLE = "Chat / Execution stream"
+
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self._exec_id = ""
+            self._text = ""
+
+        def on_mount(self) -> None:
+            self.update("enter an execution id below and press Enter")
+
+        def start_stream(self, exec_id: str, cookie) -> None:
+            import threading
+
+            self._exec_id = exec_id
+            self._text = ""
+            self._append("[connecting…]")
+            if cookie is None:
+                self._append("\n[admin login failed — check password / GUI running]")
+                return
+
+            def pump():
+                import json
+
+                import httpx
+
+                try:
+                    with (
+                        httpx.Client(timeout=None) as client,
+                        client.stream(
+                            "GET",
+                            f"http://127.0.0.1:8787/admin/executions/{exec_id}/stream",
+                            cookies={"zero_admin": cookie},
+                        ) as response,
+                    ):
+                        if response.status_code != 200:
+                            self._append(f"\n[stream unavailable ({response.status_code})]")
+                            return
+                        for line in response.iter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            try:
+                                ev = json.loads(line[6:])
+                            except ValueError:
+                                continue
+                            kind = ev.get("type")
+                            if kind == "text_delta":
+                                self._append(str(ev.get("text", "")))
+                            elif kind == "tool_call":
+                                self._append(f"[tool:{ev.get('name')}] ")
+                            elif kind == "done":
+                                self._append("\n[done]")
+                                return
+                except Exception as exc:  # noqa: BLE001 - network failures are status
+                    self._append(f"\n[{type(exc).__name__}]")
+
+            threading.Thread(target=pump, daemon=True).start()
+
+        def _append(self, text: str) -> None:
+            self._text += text
+            tail = self._text[-8000:]
+            self.call_later(lambda: self.update(tail))
+
     PANELS = {
         "overview": OverviewPanel,
         "telegram": TelegramPanel,
@@ -195,6 +260,23 @@ def run() -> int:
         "backups": BackupsPanel,
         "diag": DiagnosticsPanel,
     }
+
+    def _admin_login(password: str):
+        """Log into the local admin GUI and return the session cookie."""
+        import httpx
+
+        try:
+            response = httpx.post(
+                "http://127.0.0.1:8787/admin/login",
+                data={"secret": password},
+                follow_redirects=False,
+                timeout=10.0,
+            )
+        except Exception:  # noqa: BLE001 - GUI not running
+            return None
+        if response.status_code != 303:
+            return None
+        return response.cookies.get("zero_admin")
 
     class ZeroTUI(App):
         TITLE = "Zero Dev Telegram"
@@ -207,6 +289,7 @@ def run() -> int:
             ("6", "show_panel('system')", "System"),
             ("7", "show_panel('backups')", "Backups"),
             ("8", "show_panel('diag')", "Doctor"),
+            ("9", "show_panel('chat')", "Chat"),
             ("r", "refresh_panel", "Refresh"),
             ("q", "quit", "Quit"),
         ]
@@ -229,10 +312,43 @@ def run() -> int:
             body = self.query_one("#body", VerticalScroll)
             body.remove_children()
             self.current = key
+            if key == "chat":
+                from textual.containers import Vertical
+                from textual.widgets import Input
+
+                holder = Vertical(id="main")
+                body.mount(holder)
+                stream = ChatStreamPanel(id="chat-stream")
+                pw_input = Input(placeholder="admin password", password=True)
+                holder.mount(Input(placeholder="execution id (exec_…)", id="chat-exec"))
+                holder.mount(pw_input)
+                holder.mount(stream)
+
+                def handle_submitted(message) -> None:
+                    from textual.widgets import Input as _Input
+
+                    if not isinstance(message, _Input.Submitted):
+                        return
+                    if getattr(message.input, "id", "") != "chat-exec":
+                        return
+                    exec_value = message.value.strip()
+                    if not exec_value:
+                        return
+                    cookie = _admin_login(pw_input.value)
+                    stream.start_stream(exec_value, cookie)
+
+                self._chat_handler = handle_submitted
+                body.query_one("#chat-exec").focus()
+                return
             widget_cls = PANELS[key]
             widget = widget_cls(id="main")
             body.mount(widget)
             widget.refresh_data()
+
+        def on_input_submitted(self, event) -> None:
+            handler = getattr(self, "_chat_handler", None)
+            if handler is not None:
+                handler(event)
 
         def action_refresh_panel(self) -> None:
             panel = self.query_one("#main")

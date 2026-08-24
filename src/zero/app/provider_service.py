@@ -253,6 +253,7 @@ class ProviderService:
         cancel_event=None,
         source: AuditSource = "system",
         agent_scope: str | None = None,
+        stream_observer: Callable[[dict], None] | None = None,
     ):
         """Send one request, falling back down the configured chain.
 
@@ -260,6 +261,10 @@ class ProviderService:
         and identity); a fallback never replays an uncertain outcome.
         The response of the first successful attempt wins; the original
         exception surfaces when every attempt fails.
+
+        ``stream_observer`` (GAP 5) receives client-safe event dicts as
+        they arrive when the request streams; durable bookkeeping is
+        unchanged.
         """
         from zero.domain.providers import CanonicalRequest as _CanonicalRequest
 
@@ -305,6 +310,7 @@ class ProviderService:
                     cancel_event=cancel_event,
                     source=source,
                     agent_scope=agent_scope,
+                    stream_observer=stream_observer,
                 )
             except Exception as exc:
                 last_exc = exc
@@ -361,6 +367,7 @@ class ProviderService:
         lease_seconds: int = 300,
         source: AuditSource = "system",
         agent_scope: str | None = None,
+        stream_observer: Callable[[dict], None] | None = None,
     ) -> tuple[ProviderRequest, CanonicalResponse]:
         """Send a canonical request through the provider adapter.
 
@@ -532,8 +539,11 @@ class ProviderService:
                 if cancel_event is not None and cancel_event.is_set():
                     raise ProviderCancelledError("provider request cancelled before dispatch")
                 if request.stream:
+                    events = adapter.send_request_stream(request, cancel_event=cancel_event)
+                    if stream_observer is not None:
+                        events = self._tap_stream(events, stream_observer)
                     response = self._collect_stream(
-                        adapter.send_request_stream(request, cancel_event=cancel_event),
+                        events,
                         cancel_event=cancel_event,
                         heartbeat=lambda: self._repo.heartbeat_provider_request(
                             provider_request.id,
@@ -745,6 +755,46 @@ class ProviderService:
                 (time.monotonic() - provider_started) * 1000,
             )
         return provider_request, response
+
+    @staticmethod
+    def _tap_stream(
+        events: Iterator[CanonicalStreamEvent],
+        observer: Callable[[dict], None],
+    ) -> Iterator[CanonicalStreamEvent]:
+        """Forward client-safe event dicts while passing events through.
+
+        Per GAP 5: usage events stay internal (accounting only); text
+        deltas, resolved tool calls, and the terminal marker are
+        forwarded. Observer failures never break the provider stream.
+        """
+
+        def _safe_observe(payload: dict) -> None:
+            try:
+                observer(payload)
+            except Exception:
+                logger.debug("stream observer raised; event dropped", exc_info=True)
+
+        for event in events:
+            if event.kind == "text_delta":
+                _safe_observe({"type": "text_delta", "text": event.text})
+            elif event.kind == "tool_call_delta" and event.tool_call is not None:
+                call = event.tool_call
+                if call.tool_call_id:
+                    arguments: Any = call.arguments
+                    try:
+                        arguments = json.loads(call.arguments)
+                    except (TypeError, ValueError):
+                        arguments = call.arguments
+                    _safe_observe(
+                        {
+                            "type": "tool_call",
+                            "name": call.tool_name,
+                            "arguments": arguments,
+                        }
+                    )
+            elif event.kind == "message_end":
+                _safe_observe({"type": "done", "finish_reason": event.finish_reason or "stop"})
+            yield event
 
     def _collect_stream(
         self,

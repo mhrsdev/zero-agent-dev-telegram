@@ -17,10 +17,26 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
+    StreamingResponse,
 )
 
 from zero.manage.core.config import ConfigService, GroupPolicy, ZeroConfig
 from zero.manage.services.wizard_forms import WIZARD_STEPS
+
+
+def _stream_hub(app=None):
+    """Process-wide execution stream hub (app.state first, lazy else)."""
+    if app is not None:
+        hub = getattr(app.state, "stream_hub", None)
+        if hub is not None:
+            return hub
+    hub = getattr(register_admin, "_stream_hub", None)
+    if hub is None:
+        from zero.app.stream_hub import ExecutionStreamHub
+
+        hub = ExecutionStreamHub()
+        register_admin._stream_hub = hub  # type: ignore[attr-defined]
+    return hub
 
 
 def _ref_cls():
@@ -144,6 +160,7 @@ form.inline{display:inline}
 </style></head><body><header><strong>Zero Admin</strong>
 <a href="/admin">Overview</a><a href="/admin/groups">Groups</a>
 <a href="/admin/providers">Providers</a><a href="/admin/config">Config</a>
+<a href="/admin/chat">Chat</a>
 <form class="inline" method="post" action="/admin/logout">
 <input type="hidden" name="csrf" value="{csrf}">
 <button>Logout</button></form></header><main>{body}</main></body></html>"""
@@ -315,11 +332,50 @@ def register_admin(app, services=None) -> None:
             f"<td>{'on' if g.enabled else 'off'}</td><td>{cfg.access.mode}</td></tr>"
             for g in (cfg.access.groups if cfg else [])
         )
+        stream_panel = """
+<div class=card><h3>Live execution stream</h3>
+<form onsubmit="return watchExec(this)">
+<input name="exec_id" placeholder="exec_…" required style="min-width:260px">
+<button>Watch</button></form>
+<pre class=ltr id=streamout style="white-space:pre-wrap;max-height:280px;overflow:auto"></pre>
+<script>
+function watchExec(f){
+  const out=document.getElementById('streamout');out.textContent='';
+  fetch('/admin/executions/'+encodeURIComponent(f.exec_id.value)+'/stream')
+    .then(function(res){
+      if(!res.ok||!res.body){out.textContent='stream unavailable ('+res.status+')';return null;}
+      const reader=res.body.getReader();const dec=new TextDecoder();let buf='';
+      function pump(){
+        return reader.read().then(function(r){
+          if(r.done)return;
+          buf+=dec.decode(r.value,{stream:true});
+          let i;
+          while((i=buf.indexOf('\\n\\n'))>=0){
+            const frame=buf.slice(0,i);buf=buf.slice(i+2);
+            const line=frame.split('\\n').find(function(l){return l.indexOf('data: ')===0;});
+            if(line){
+              try{
+                const ev=JSON.parse(line.slice(6));
+                if(ev.type==='text_delta')out.textContent+=ev.text;
+                else if(ev.type==='tool_call')out.textContent+='[tool:'+ev.name+'] ';
+                else if(ev.type==='done')out.textContent+='\\n[done]';
+              }catch(e){}
+            }
+          }
+          return pump();
+        });
+      }
+      return pump();
+    });
+  return false;
+}
+</script></div>"""
         body = f"""
 <div class=card><h3>Service</h3>
 <p class=ok>engine running (this process)</p>
 <p class=muted>GUI binds {cfg.server.host if cfg else "127.0.0.1"} — keep it loopback;
 use SSH tunneling remotely.</p></div>
+{stream_panel}
 <div class=card><h3>Providers</h3><table>
 <tr><th>id</th><th>protocol</th><th>enabled</th><th>models</th></tr>
 {rows or "<tr><td colspan=4 class=muted>none configured — run wizard</td></tr>"}
@@ -706,5 +762,195 @@ displays them.</p>"""
             "<th>est cost</th></tr>" + rows + "</table>"
         )
         return _page(body, sid)
+
+    # ------------------------------------------------------------------
+    # Interactive chat + execution streaming (GAPs 5 & 6)
+    # ------------------------------------------------------------------
+
+    def _chat_service():
+        import os as _os
+
+        svc = getattr(app.state, "chat_service", None)
+        if svc is not None:
+            return svc
+        if _svc is None:
+            raise RuntimeError("services not wired")
+        from zero.app.chat_service import ChatService, TokenBucketRateLimiter
+
+        try:
+            rate_per_min = int(
+                _os.environ.get("ZERO_CHAT_RATE_LIMIT_PER_MIN", "10").strip() or "10"
+            )
+        except ValueError:
+            rate_per_min = 10
+        rate_per_min = max(1, min(rate_per_min, 120))
+        svc = ChatService(
+            providers=_svc.providers,
+            authorization=_svc.authorization,
+            tools=getattr(_svc, "tools", None),
+            rate_limiter=TokenBucketRateLimiter(rate_per_min),
+        )
+        app.state.chat_service = svc
+        return svc
+
+    def _chat_provider_model():
+        """Pick the first registered provider/model pair."""
+        settings = getattr(app.state, "settings", None)
+        names = _svc.providers.registered_provider_names if _svc is not None else []
+        if not names:
+            raise RuntimeError("no provider adapter registered")
+        primary = names[0]
+        if primary == "anthropic":
+            model_name = settings.anthropic_model if settings else "claude-sonnet-4"
+        elif primary == "openai-compatible":
+            model_name = settings.openai_model if settings else "gpt-4o-mini"
+        else:
+            model_name = "fake-standard"
+        return primary, model_name
+
+    @router.get("/chat", response_class=HTMLResponse)
+    def chat_page(request: Request):
+        sid = guard(request)
+        body = """
+<h3>Chat <span class=muted>(ephemeral single-turn; no plan/execution)</span></h3>
+<form method="post" action="/admin/chat">
+<input type="hidden" name="csrf" value="{csrf}">
+<textarea name="message" rows="4" style="width:100%%" required></textarea><br>
+<button>Send</button></form>
+<div class=card id=chatout>{result}</div>"""
+        result_html = ""
+        msg = request.query_params.get("resp")
+        if msg:
+            import urllib.parse as up
+
+            result_html = "<pre class=ltr>" + up.unquote(msg)[:4000] + "</pre>"
+        body = (
+            body.replace("{csrf}", _csrf(sid)).replace("{result}", result_html).replace("%%", "%")
+        )
+        return _page(body, sid)
+
+    @router.post("/chat")
+    async def chat_submit(request: Request):
+        sid_raw = request.cookies.get("zero_admin") or ""
+        form = await request.form()
+        csrf = str(form.get("csrf", ""))
+        if not _valid_session(request) or not _check_csrf(sid_raw, csrf):
+            return HTMLResponse("bad session/csrf", status_code=400)
+        message = str(form.get("message", "")).strip()
+        import urllib.parse as up
+
+        if not message:
+            return RedirectResponse("/admin/chat", status_code=303)
+        try:
+            project = _ensure_project(_svc)
+            provider_name, model_name = _chat_provider_model()
+            turn = _chat_service().complete(
+                project_id=project.id,
+                actor_id=project.owner_user_id,
+                message=message,
+                provider=provider_name,
+                model_name=model_name,
+                source="web",
+            )
+            payload = {
+                "content": turn.content,
+                "tool_calls_executed": list(turn.tool_calls_executed),
+                "usage": turn.usage,
+                "provider_request_id": turn.provider_request_id,
+            }
+            return RedirectResponse(
+                "/admin/chat?resp=" + up.quote(json.dumps(payload)[:3800]), status_code=303
+            )
+        except Exception as exc:  # noqa: BLE001 - surface typed failures in UI
+            return RedirectResponse(
+                "/admin/chat?resp=" + up.quote(f"error: {type(exc).__name__}"), status_code=303
+            )
+
+    @router.post("/chat/{project_id}")
+    async def chat_api(project_id: str, request: Request):
+        """JSON chat endpoint (GAP 6): one ephemeral completion."""
+        guard(request)
+        body = await request.json()
+        message = str(body.get("message", "")).strip()
+        if not message:
+            return JSONResponse({"detail": "message must not be empty"}, status_code=422)
+        agent_scope = str(body.get("agent_scope") or "main_worker")
+        try:
+            max_tool_rounds = int(body.get("max_tool_rounds", 3))
+        except (TypeError, ValueError):
+            return JSONResponse({"detail": "max_tool_rounds must be int"}, status_code=422)
+        project = next(
+            (
+                p
+                for p in _svc.identity.list_projects()
+                if p.id.value == project_id or p.name == project_id
+            ),
+            None,
+        )
+        if project is None:
+            return JSONResponse({"detail": "unknown project"}, status_code=404)
+        try:
+            provider_name, model_name = _chat_provider_model()
+            turn = _chat_service().complete(
+                project_id=project.id,
+                actor_id=project.owner_user_id,
+                message=message,
+                agent_scope=agent_scope,
+                max_tool_rounds=max_tool_rounds,
+                provider=provider_name,
+                model_name=model_name,
+                source="web",
+            )
+        except Exception as exc:  # noqa: BLE001 - typed failures surface in the response
+            name = type(exc).__name__
+            if name == "ChatRateLimitError":
+                return JSONResponse({"detail": "rate limit exceeded"}, status_code=429)
+            return JSONResponse({"detail": f"{name}"}, status_code=502)
+        return JSONResponse(
+            {
+                "content": turn.content,
+                "tool_calls_executed": list(turn.tool_calls_executed),
+                "usage": turn.usage,
+                "provider_request_id": turn.provider_request_id,
+            }
+        )
+
+    @router.get("/executions/{execution_id}/stream")
+    def execution_stream(execution_id: str, request: Request):
+        """SSE stream of runtime events for one execution (GAP 5)."""
+        guard(request)
+        if _svc is None:
+            return JSONResponse({"detail": "services not wired"}, status_code=503)
+        conn = _svc.database.connect()
+        row = conn.execute("SELECT id FROM executions WHERE id = ?", (execution_id,)).fetchone()
+        if row is None:
+            return JSONResponse({"detail": "unknown execution"}, status_code=404)
+        try:
+            q = _stream_hub(app).subscribe(execution_id)
+        except LookupError:
+            return JSONResponse({"detail": "too many subscribers"}, status_code=429)
+
+        import queue as _queue
+
+        def generate():
+            try:
+                yield ": connected\n\n"
+                while True:
+                    try:
+                        payload = q.get(timeout=15.0)
+                    except _queue.Empty:
+                        yield ": keepalive\n\n"
+                        continue
+                    yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+                    if payload.get("type") == "done":
+                        break
+            finally:
+                _stream_hub(app).unsubscribe(execution_id, q)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     app.include_router(router)

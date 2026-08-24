@@ -247,6 +247,7 @@ class AgentRuntime:
         max_tasks: int | None = None,
         source: AuditSource = "system",
         agent_type_id: AgentTypeId | None = None,
+        stream_callback: Any = None,
     ) -> list[RuntimeTaskResult]:
         """Claim and run a bounded snapshot of currently ready tasks."""
         ready = self._worker.list_ready_tasks(
@@ -281,6 +282,7 @@ class AgentRuntime:
                         repository_id=repository_id,
                         source=source,
                         agent_type_id=agent_type_id,
+                        stream_callback=stream_callback,
                     )
                 )
             except BaseException as exc:
@@ -314,8 +316,14 @@ class AgentRuntime:
         max_tool_rounds: int = _DEFAULT_MAX_TOOL_ROUNDS,
         source: AuditSource = "system",
         agent_type_id: AgentTypeId | None = None,
+        stream_callback: Any = None,
     ) -> RuntimeTaskResult:
-        """Run one ready task and complete it only after evidence is stored."""
+        """Run one ready task and complete it only after evidence is stored.
+
+        ``stream_callback`` (GAP 5) receives client-safe event dicts
+        (``text_delta`` / ``tool_call`` / ``done``) as provider events
+        arrive; evidence and usage paths are unchanged.
+        """
         task = self._find_task(
             execution_id,
             task_id,
@@ -564,6 +572,9 @@ class AgentRuntime:
                 messages=messages,
                 tools=self._tool_declarations(effective_tool_names),
                 system_message=system_message,
+                # GAP 5: attach a streaming transport exactly when a
+                # client-facing stream consumer is connected.
+                stream=stream_callback is not None,
             )
         except Exception as exc:
             if worktree is not None:
@@ -596,6 +607,7 @@ class AgentRuntime:
 
         provider_request_id: ProviderRequestId | None = None
         cancel_event = self._worker.get_cancellation_event(execution_id)
+        observer = self._stream_observer(execution_id, stream_callback)
         try:
             provider_request, response = self._providers.send_request_with_fallback(
                 project_id=task.project_id,
@@ -605,6 +617,7 @@ class AgentRuntime:
                 cancel_event=cancel_event,
                 source=source,
                 agent_scope=agent_scope,
+                stream_observer=observer,
             )
             provider_request_id = provider_request.id
             response, provider_request_id, messages_final = self._run_tool_rounds(
@@ -623,6 +636,7 @@ class AgentRuntime:
                 lease_owner=lease_owner,
                 lease_duration_seconds=lease_duration_seconds,
                 source=source,
+                stream_observer=observer,
             )
             if cancel_event.is_set():
                 raise ProviderCancelledError("execution cancelled before evidence acceptance")
@@ -932,6 +946,18 @@ class AgentRuntime:
             f"Task {task_id.value} does not belong to execution {execution_id.value}"
         )
 
+    @staticmethod
+    def _stream_observer(execution_id: ExecutionId, stream_callback: Any):
+        """Bind a run-level callback to the execution id (GAP 5)."""
+        if stream_callback is None:
+            return None
+        execution_value = execution_id.value
+
+        def observer(payload: dict) -> None:
+            stream_callback(execution_value, payload)
+
+        return observer
+
     def _run_tool_rounds(
         self,
         *,
@@ -950,6 +976,7 @@ class AgentRuntime:
         lease_owner: str,
         lease_duration_seconds: int,
         source: AuditSource,
+        stream_observer: Any = None,
     ) -> tuple[CanonicalResponse, ProviderRequestId, list[CanonicalMessage]]:
         """Run a bounded model/tool loop without accepting unresolved calls.
 
@@ -1042,6 +1069,7 @@ class AgentRuntime:
                 cancel_event=cancel_event,
                 source=source,
                 agent_scope=agent_scope,
+                stream_observer=stream_observer,
             )
             current_request_id = next_provider_request.id
             current_response = next_response

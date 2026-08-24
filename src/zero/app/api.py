@@ -253,6 +253,11 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.health_service = health_service
     app.state.worker_host = worker_host
 
+    # GAP 5: process-wide fan-out hub for execution stream events.
+    from zero.app.stream_hub import ExecutionStreamHub
+
+    app.state.stream_hub = ExecutionStreamHub()
+
     @app.exception_handler(AuthorizationError)
     async def authorization_denied(_request: Request, exc: AuthorizationError) -> JSONResponse:
         return JSONResponse(
@@ -1588,6 +1593,12 @@ def _register_execution_routes(app: FastAPI, services: Services) -> None:
                 detail="agent runtime is not configured",
             )
         try:
+            hub = getattr(app.state, "stream_hub", None)
+
+            def _publish_stream(execution_value: str, payload: dict) -> None:
+                if hub is not None:
+                    hub.publish(execution_value, payload)
+
             results = services.runtime.run_ready_tasks(
                 execution_id=execution.id,
                 project_id=ProjectId(project_id),
@@ -1600,6 +1611,7 @@ def _register_execution_routes(app: FastAPI, services: Services) -> None:
                 repository_id=RepositoryId(req.repository_id) if req.repository_id else None,
                 max_tasks=req.max_tasks,
                 source="web",
+                stream_callback=_publish_stream,
             )
         except RuntimeErrorBase as exc:
             raise HTTPException(
