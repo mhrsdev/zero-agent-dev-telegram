@@ -1542,6 +1542,7 @@ def _register_execution_routes(app: FastAPI, services: Services) -> None:
                 "state": t.state,
                 "blocker_reason": t.blocker_reason,
                 "terminal_state_set_at": t.terminal_state_set_at,
+                "next_retry_at": t.next_retry_at,
                 "created_at": t.created_at,
             }
             for t in tasks

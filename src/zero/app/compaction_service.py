@@ -54,7 +54,6 @@ from zero.domain.context import (
     CompactionRecordId,
     ContextVersion,
     ContextVersionId,
-    estimate_tokens,
     exceeds_threshold,
 )
 from zero.domain.execution import ExecutionId
@@ -182,6 +181,7 @@ class CompactionService:
         context_window: int = 200000,
         threshold_percent: int = 85,
         summary: str | None = None,
+        model_name: str | None = None,
     ) -> CompactionRecord:
         """Compact the conversation into a new context version.
 
@@ -195,6 +195,10 @@ class CompactionService:
         6. Creates a new context version.
         7. Atomically activates the new context version.
         8. Records the compaction record.
+
+        ``model_name`` (GAP 11) switches fit/budget arithmetic to exact
+        tiktoken counts when available for the named model; ``None``
+        keeps the historical bytes÷4 estimates unchanged.
 
         Per ``zero-context-memory`` §"A crash at any point must leave
         either the old context active or a fully recoverable new
@@ -301,6 +305,7 @@ class CompactionService:
         fit_rung, fitted_messages = self._fit_messages(
             conversation_messages,
             context_window * 30 // 100,  # 30% of context for summary input
+            model_name=model_name,
         )
         # 6. Produce the summary: prefer the wired LLM summarizer, fall
         # back to the deterministic structured template on failure or
@@ -357,6 +362,11 @@ class CompactionService:
         )
         self._context_repo.insert_compaction_record(record)
         # 8. Create the new context version (not yet active).
+        from zero.manage.core.tokenizer import count_tokens
+
+        def _tokens(text: str) -> int:
+            return count_tokens(text, model_name)
+
         new_cv = ContextVersion(
             id=ContextVersionId(generate_context_version_id()),
             project_id=project_id,
@@ -371,12 +381,12 @@ class CompactionService:
             conversation_tail=json.dumps(fitted_messages[-3:]),
             compaction_summary=summary,
             transcript_artifact_id=transcript_artifact.id,
-            token_count=estimate_tokens(system_message)
-            + estimate_tokens(user_prefix)
-            + estimate_tokens(plan_contract)
-            + estimate_tokens(execution_snapshot)
-            + estimate_tokens(summary)
-            + estimate_tokens(json.dumps(fitted_messages[-3:], ensure_ascii=False)),
+            token_count=_tokens(system_message)
+            + _tokens(user_prefix)
+            + _tokens(plan_contract)
+            + _tokens(execution_snapshot)
+            + _tokens(summary)
+            + _tokens(json.dumps(fitted_messages[-3:], ensure_ascii=False)),
             created_at=_now_utc_iso(),
         )
         self._context_repo.insert_context_version(new_cv)
@@ -392,6 +402,8 @@ class CompactionService:
         self,
         messages: list[dict[str, Any]],
         budget: int,
+        *,
+        model_name: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         """Fit messages into a budget using the degradation ladder.
 
@@ -406,7 +418,12 @@ class CompactionService:
         """
         if not messages:
             return "verbatim", []
-        total_tokens = sum(estimate_tokens(json.dumps(m, ensure_ascii=False)) for m in messages)
+        from zero.manage.core.tokenizer import count_tokens
+
+        def _tokens(text: str) -> int:
+            return count_tokens(text, model_name)
+
+        total_tokens = sum(_tokens(json.dumps(m, ensure_ascii=False)) for m in messages)
         if total_tokens <= budget:
             return "verbatim", list(messages)
         # Rung 2: remove oldest history while protecting the head — the
@@ -416,26 +433,25 @@ class CompactionService:
         kept = list(messages)
         history_omitted = 0
         while (
-            len(kept) > 2
-            and sum(estimate_tokens(json.dumps(m, ensure_ascii=False)) for m in kept) > budget
+            len(kept) > 2 and sum(_tokens(json.dumps(m, ensure_ascii=False)) for m in kept) > budget
         ):
             kept.pop(1)
             history_omitted += 1
-        if kept and sum(estimate_tokens(json.dumps(m, ensure_ascii=False)) for m in kept) <= budget:
+        if kept and sum(_tokens(json.dumps(m, ensure_ascii=False)) for m in kept) <= budget:
             return "history_turn_selected", kept
         # Rung 3: truncate oversized tool results.
         for i, m in enumerate(kept):
             if m.get("role") == "tool":
                 content = str(m.get("content") or "")
-                if estimate_tokens(content) > budget // 2:
+                if _tokens(content) > budget // 2:
                     truncated = content[: budget // 4] + "\n[...truncated...]"
                     kept[i] = {**m, "content": truncated}
-        if kept and sum(estimate_tokens(json.dumps(m, ensure_ascii=False)) for m in kept) <= budget:
+        if kept and sum(_tokens(json.dumps(m, ensure_ascii=False)) for m in kept) <= budget:
             return "tool_truncated", kept
         # Rung 4: remove oldest current-step turns (keep only the last).
         if len(kept) > 1:
             kept = [kept[-1]]
-        if kept and sum(estimate_tokens(json.dumps(m, ensure_ascii=False)) for m in kept) <= budget:
+        if kept and sum(_tokens(json.dumps(m, ensure_ascii=False)) for m in kept) <= budget:
             return "step_turns_selected", kept
         # Rung 5: emergency truncation of the newest item.
         if kept:

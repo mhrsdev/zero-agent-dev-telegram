@@ -64,11 +64,20 @@ DEFAULT_OUTPUT_RESERVE_PERCENT = 15
 def estimate_tokens(text: str) -> int:
     """Cheap provider-independent token estimate for gates, not billing.
 
-    Per ``zero-context-memory`` reference: ``len(text.encode('utf-8')) // 4``.
+    Delegates to the GAP 11 tokenizer seam (``count_tokens`` with no
+    model ⇒ the documented bytes÷4 heuristic), so every counting call
+    site shares one implementation. The lazy import keeps the domain
+    layer independent of the manage package and preserves behavior
+    bit-for-bit when no model is named.
     """
-    if not text:
-        return 0
-    return max(1, len(text.encode("utf-8")) // BYTES_PER_TOKEN)
+    try:
+        from zero.manage.core.tokenizer import count_tokens
+
+        return count_tokens(text, None)
+    except ImportError:  # pragma: no cover - defensive
+        if not text:
+            return 0
+        return max(1, len(text.encode("utf-8")) // BYTES_PER_TOKEN)
 
 
 def exceeds_threshold(

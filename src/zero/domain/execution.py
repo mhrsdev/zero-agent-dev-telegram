@@ -269,6 +269,9 @@ class Task:
     blocker_reason: str | None = None
     agent_type_id: str | None = None
     terminal_state_set_at: str | None = None
+    #: GAP 12: earliest instant the scheduler may requeue this failed
+    #: task (backoff/Retry-After). NULL means immediately eligible.
+    next_retry_at: str | None = None
     created_at: str = ""
     updated_at: str = ""
 

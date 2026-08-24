@@ -58,6 +58,9 @@ def _row_to_execution(row: sqlite3.Row) -> Execution:
 
 
 def _row_to_task(row: sqlite3.Row) -> Task:
+    # sqlite3.Row has no `in`; key presence is checked via keys().
+    row_keys = set(row.keys())
+    next_retry_at = row["next_retry_at"] if "next_retry_at" in row_keys else None
     return Task(
         id=TaskId(row["id"]),
         execution_id=ExecutionId(row["execution_id"]),
@@ -70,6 +73,7 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         blocker_reason=row["blocker_reason"],
         agent_type_id=row["agent_type_id"],
         terminal_state_set_at=row["terminal_state_set_at"],
+        next_retry_at=next_retry_at,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -271,7 +275,8 @@ class ExecutionRepository:
         columns = (
             "SELECT id, execution_id, project_id, objective, permitted_scope, "
             "expected_evidence, state, blocker_reason, agent_type_id, "
-            "terminal_state_set_at, completion_evidence, created_at, updated_at "
+            "terminal_state_set_at, completion_evidence, next_retry_at, "
+            "created_at, updated_at "
         )
         if project_id is None:
             cursor = conn.execute(f"{columns}FROM tasks WHERE id = ?", (task_id.value,))
@@ -295,7 +300,8 @@ class ExecutionRepository:
         query = (
             "SELECT id, execution_id, project_id, objective, permitted_scope, "
             "expected_evidence, state, blocker_reason, agent_type_id, "
-            "terminal_state_set_at, completion_evidence, created_at, updated_at "
+            "terminal_state_set_at, completion_evidence, next_retry_at, "
+            "created_at, updated_at "
             "FROM tasks WHERE execution_id = ?"
         )
         params: list[str] = [execution_id.value]
@@ -362,6 +368,26 @@ class ExecutionRepository:
                     task_id.value,
                 ),
             )
+        if cursor.rowcount == 0:
+            raise TaskNotFoundError(f"Task {task_id} not found")
+        if commit:
+            conn.commit()
+
+    def set_task_next_retry_at(
+        self,
+        task_id: TaskId,
+        next_retry_at: str | None,
+        *,
+        commit: bool = True,
+    ) -> None:
+        """Record the earliest instant a failed task may be requeued (GAP 12)."""
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "UPDATE tasks SET next_retry_at = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE id = ?",
+            (next_retry_at, task_id.value),
+        )
         if cursor.rowcount == 0:
             raise TaskNotFoundError(f"Task {task_id} not found")
         if commit:

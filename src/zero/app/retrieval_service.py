@@ -41,7 +41,6 @@ from zero.domain.context import (
     InjectionLedgerId,
     RetrievalCandidate,
     context_remaining,
-    estimate_tokens,
 )
 from zero.domain.execution import ExecutionId
 from zero.domain.identity import ProjectId, UserId
@@ -112,6 +111,7 @@ class RetrievalRouter:
         query: str,
         budget_tokens: int,
         context_version: int,
+        model_name: str | None = None,
     ) -> tuple[list[RetrievalCandidate], InjectionLedger]:
         """Retrieve candidates within budget.
 
@@ -136,6 +136,13 @@ class RetrievalRouter:
             project_id=project_id,
             permission="project.view",
         )
+        # GAP 11: model-aware counting when a model name is supplied;
+        # None keeps the historical bytes÷4 estimate exactly.
+        from zero.manage.core.tokenizer import count_tokens
+
+        def _tokens(text: str) -> int:
+            return count_tokens(text, model_name)
+
         # 1+2. Generate candidates from RAG and agent memory.
         candidates: list[RetrievalCandidate] = []
         # RAG candidates.
@@ -148,7 +155,7 @@ class RetrievalRouter:
                         record_id=doc.id.value,
                         title=doc.title,
                         content=doc.content,
-                        token_count=estimate_tokens(doc.content),
+                        token_count=_tokens(doc.content),
                         score=score,
                     )
                 )
@@ -172,7 +179,7 @@ class RetrievalRouter:
                         record_id=record.id.value,
                         title=f"{record.kind}: {record.content[:50]}",
                         content=record.content,
-                        token_count=estimate_tokens(record.content),
+                        token_count=_tokens(record.content),
                         score=score,
                     )
                 )
@@ -254,23 +261,34 @@ class ContextBuilder:
         context_window: int = 200000,
         output_reserve_percent: int = 15,
         retrieval_budget_percent: int = 30,
+        model_name: str | None = None,
     ) -> tuple[str, InjectionLedger]:
         """Build a context string from named regions.
 
         Returns the rendered context text and the injection ledger.
+
+        ``model_name`` (GAP 11) switches budget arithmetic to exact
+        tiktoken counts when available for the named model; ``None``
+        keeps the historical heuristic unchanged.
         """
+        # GAP 11 seam.
+        from zero.manage.core.tokenizer import count_tokens
+
+        def _tokens(text: str) -> int:
+            return count_tokens(text, model_name)
+
         # 1. Compute the output reserve.
         output_reserve = context_window * output_reserve_percent // 100
         # 2. Compute fixed regions (system + prefix + plan + snapshot).
         fixed_tokens = (
-            estimate_tokens(system_message)
-            + estimate_tokens(user_prefix)
-            + estimate_tokens(plan_contract)
-            + estimate_tokens(execution_snapshot)
+            _tokens(system_message)
+            + _tokens(user_prefix)
+            + _tokens(plan_contract)
+            + _tokens(execution_snapshot)
         )
         # 3. Compute the conversation tail tokens.
         conv_text = json.dumps(conversation_tail, ensure_ascii=False)
-        conv_tokens = estimate_tokens(conv_text)
+        conv_tokens = _tokens(conv_text)
         # 4. Compute the retrieval budget.
         remaining = context_remaining(
             context_window=context_window,
@@ -293,6 +311,7 @@ class ContextBuilder:
             query=query,
             budget_tokens=max(0, retrieval_budget),
             context_version=context_version,
+            model_name=model_name,
         )
         # 6. Render the context.
         parts: list[str] = []

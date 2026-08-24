@@ -93,6 +93,7 @@ from zero.domain.providers import (
     ToolCallResult,
     UsageRecord,
     UsageRecordId,
+    coerce_tool_declarations,
 )
 from zero.persistence.repositories.audit_repository import AuditRepository
 from zero.persistence.repositories.provider_repository import (
@@ -150,6 +151,26 @@ def estimate_cost(
     )
     total = input_cost + output_cost + cache_create_cost + cache_read_cost
     return str(total.quantize(Decimal("0.000001")))
+
+
+def estimate_request_tokens(request: CanonicalRequest) -> int:
+    """Pre-flight input token estimate for a canonical request (GAP 11).
+
+    Uses the real tokenizer seam with the request's model name so GPT
+    family models get exact tiktoken counts when available; other
+    models keep the documented bytes÷4 approximation. Server-reported
+    usage remains the only billing truth.
+    """
+    from zero.manage.core.tokenizer import count_tokens
+
+    total = count_tokens(request.system_message or "", request.model_name)
+    for message in request.messages:
+        total += count_tokens(message.content, request.model_name)
+        for _name, _call_id, arguments in message.tool_calls:
+            total += count_tokens(arguments, request.model_name)
+    for declaration in coerce_tool_declarations(request.tools):
+        total += count_tokens(json.dumps(declaration.normalized_parameters()), request.model_name)
+    return total
 
 
 class ProviderService:

@@ -1306,6 +1306,46 @@ class WorkerService:
             )
         return self._execution_repo.get_task(task_id, project_id=project_id)
 
+    def schedule_task_retry(
+        self,
+        *,
+        task_id: TaskId,
+        next_retry_at: str,
+        project_id: ProjectId | None = None,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> Task:
+        """Stamp the earliest requeue instant on a failed task (GAP 12).
+
+        The scheduler calls this after requeueing so subsequent ticks
+        skip the task until backoff (or a provider Retry-After) has
+        elapsed. The summary is redacted and carries no error content.
+        """
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
+        task = self._execution_repo.get_task(task_id, project_id=project_id)
+        self._execution_repo.set_task_next_retry_at(task.id, next_retry_at)
+        self._audit_repo.insert(
+            AuditEvent(
+                id=AuditEventId(generate_audit_event_id()),
+                project_id=task.project_id,
+                actor_id=actor_id,
+                source=source,
+                operation="task.retry_scheduled",
+                target_type="task",
+                target_id=task.id.value,
+                result="success",
+                redacted_summary=(f"Task {task.id.value} retry scheduled after {next_retry_at}"),
+                correlation_id=task.execution_id.value,
+                created_at=_now_utc_iso(),
+            )
+        )
+        return self._execution_repo.get_task(task_id, project_id=project_id)
+
     def cancel_task(
         self,
         *,

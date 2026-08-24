@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from threading import Event
 
 from zero.app.agent_runtime import AgentRuntime, RuntimeTaskResult
@@ -16,13 +17,30 @@ from zero.app.authorization_service import AuthorizationService
 from zero.app.integration_service import IntegrationService
 from zero.app.plan_service import PlanService
 from zero.app.result_delivery_service import ResultDeliveryService
+from zero.app.retry_backoff import compute_retry_delay
 from zero.app.worker_service import TaskSpec, WorkerService
 from zero.domain.audit import AuditSource, redact_sensitive_text
-from zero.domain.execution import TaskId
+from zero.domain.execution import Task, TaskId
 from zero.domain.identity import ProjectId, UserId
 from zero.domain.worktrees import RepositoryId
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_iso_utc(value: str) -> datetime | None:
+    """Parse an ISO-8601 UTC timestamp leniently; None when invalid."""
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -81,6 +99,18 @@ class SchedulerService:
         except Exception:
             logger.warning("could not resolve default agent type", exc_info=True)
         return None
+
+    @staticmethod
+    def _retry_delay_elapsed(task: Task, *, now: datetime | None = None) -> bool:
+        """GAP 12: True when a failed task's backoff window has passed."""
+        if task.next_retry_at is None:
+            return True
+        scheduled = _parse_iso_utc(task.next_retry_at)
+        if scheduled is None:
+            # An unparsable stamp must never wedge a task forever.
+            return True
+        current = now or datetime.now(UTC)
+        return current >= scheduled
 
     @staticmethod
     def _format_execution_result(execution, task_results: list[RuntimeTaskResult]) -> str:
@@ -197,7 +227,10 @@ class SchedulerService:
                 errors.append(f"execution {execution.id.value}: {type(exc).__name__}")
         # Bounded auto-retry: requeue failed tasks while the task has
         # not yet consumed its configured attempt budget. Disabled by
-        # default (ZERO_TASK_MAX_ATTEMPTS=0).
+        # default (ZERO_TASK_MAX_ATTEMPTS=0). GAP 12: each requeue is
+        # stamped with a computed next_retry_at (exponential backoff,
+        # jitter, provider Retry-After honored) and later ticks skip
+        # tasks whose delay has not elapsed.
         if self._task_max_attempts > 0:
             for execution in runnable:
                 try:
@@ -210,6 +243,8 @@ class SchedulerService:
                     for task in tasks:
                         if task.state != "failed":
                             continue
+                        if not self._retry_delay_elapsed(task):
+                            continue
                         attempts = self._worker.list_attempts(
                             task.id,
                             project_id=project_id,
@@ -217,10 +252,28 @@ class SchedulerService:
                             source=source,
                         )
                         if len(attempts) < self._task_max_attempts:
+                            error_text = ""
+                            last_attempt = max(
+                                attempts, key=lambda a: a.attempt_number, default=None
+                            )
+                            if last_attempt is not None and last_attempt.error_message:
+                                error_text = redact_sensitive_text(last_attempt.error_message)
                             self._worker.requeue_failed_task(
                                 execution_id=execution.id,
                                 project_id=project_id,
                                 task_id=task.id,
+                                actor_id=actor_id,
+                                source=source,
+                            )
+                            delay_seconds = compute_retry_delay(len(attempts) + 1, error_text)
+                            next_retry_at = (
+                                datetime.now(UTC).replace(microsecond=0)
+                                + timedelta(seconds=delay_seconds)
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                            self._worker.schedule_task_retry(
+                                task_id=task.id,
+                                next_retry_at=next_retry_at,
+                                project_id=project_id,
                                 actor_id=actor_id,
                                 source=source,
                             )
