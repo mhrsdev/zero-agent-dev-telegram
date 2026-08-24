@@ -111,12 +111,20 @@ class InterfaceAdapterService:
         planner: PlannerService | None = None,
         planner_provider: str = "openai-compatible",
         planner_model: str = "gpt-4o-mini",
+        identity_service=None,
+        auto_verify_linked: bool = True,
+        policy_gate=None,
     ) -> None:
         self._repo = interface_repo
         self._audit_repo = audit_repo
         self._plan_service = plan_service
         self._authz = authorization_service
         self._identity_repo = identity_repo
+        self._identity_service = identity_service
+        self._auto_verify_linked = auto_verify_linked
+        # Optional access-policy gate (management layer injection).
+        # Callable(platform, external_actor_id, chat_id) -> Decision|None
+        self.policy_gate = policy_gate
         self._secret_service = secret_service
         self._planner = planner
         self._planner_provider = planner_provider
@@ -446,6 +454,29 @@ class InterfaceAdapterService:
             self._record_event(entry)
             return entry
 
+        # 2.5 Access-policy gate (management layer; default off).
+        gate = getattr(self, "policy_gate", None)
+        if gate is not None:
+            decision = gate(event.platform, event.external_actor_id, event.chat_id)
+            if decision is not None and not decision.allowed:
+                entry = InterfaceEventLogEntry(
+                    id=InterfaceEventId(generate_interface_event_id()),
+                    project_id=binding.project_id,
+                    platform=event.platform,
+                    external_event_id=event.external_event_id,
+                    external_actor_id=event.external_actor_id,
+                    resolved_user_id=None,
+                    chat_id=event.chat_id,
+                    topic_id=event.topic_id,
+                    event_kind=event.event_kind,
+                    event_content="[policy denied]",
+                    processing_result="denied",
+                    processing_detail=f"policy: {decision.reason}",
+                    created_at=_now_utc_iso(),
+                )
+                self._record_event(entry)
+                return entry
+
         # 3. Resolve the external identity to a Zero User.
         try:
             identity = self._identity_repo.require_verified_external_identity(
@@ -454,24 +485,44 @@ class InterfaceAdapterService:
             )
             resolved_user_id = identity.user_id
         except IdentityError:
-            # Unlinked user: cannot act.
-            entry = InterfaceEventLogEntry(
-                id=InterfaceEventId(generate_interface_event_id()),
-                project_id=binding.project_id,
-                platform=event.platform,
-                external_event_id=event.external_event_id,
-                external_actor_id=event.external_actor_id,
-                resolved_user_id=None,
-                chat_id=event.chat_id,
-                topic_id=event.topic_id,
-                event_kind=event.event_kind,
-                event_content=_event_content(event.content),
-                processing_result="ignored_unlinked",
-                processing_detail="external identity not linked or not verified",
-                created_at=_now_utc_iso(),
-            )
-            self._record_event(entry)
-            return entry
+            # Auto-verify on first contact (opt-out via policy): a linked
+            # but unverified identity proving possession of the chat closes
+            # the onboarding loop without operator HTTP calls. Unlinked
+            # senders stay denied.
+            auto_verified = False
+            getter = getattr(self._identity_repo, "get_external_identity", None)
+            if callable(getter) and self._auto_verify_linked:
+                candidate = getter(event.platform, event.external_actor_id)
+                if candidate is not None and candidate.verified_at is None:
+                    self._identity_service.verify_external_identity(
+                        platform=event.platform,
+                        external_id=event.external_actor_id,
+                        source="telegram",
+                    )
+                    identity = self._identity_repo.require_verified_external_identity(
+                        event.platform,
+                        event.external_actor_id,
+                    )
+                    resolved_user_id = identity.user_id
+                    auto_verified = True
+            if not auto_verified:
+                entry = InterfaceEventLogEntry(
+                    id=InterfaceEventId(generate_interface_event_id()),
+                    project_id=binding.project_id,
+                    platform=event.platform,
+                    external_event_id=event.external_event_id,
+                    external_actor_id=event.external_actor_id,
+                    resolved_user_id=None,
+                    chat_id=event.chat_id,
+                    topic_id=event.topic_id,
+                    event_kind=event.event_kind,
+                    event_content=_event_content(event.content),
+                    processing_result="ignored_unlinked",
+                    processing_detail="external identity not linked or not verified",
+                    created_at=_now_utc_iso(),
+                )
+                self._record_event(entry)
+                return entry
 
         # Verified external identity is not sufficient for project access;
         # messaging scopes still require project membership.

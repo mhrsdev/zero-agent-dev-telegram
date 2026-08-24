@@ -9,7 +9,9 @@ app) and by tests.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 
@@ -113,6 +115,82 @@ class Services:
     scheduler: SchedulerService | None = None
     runtime: AgentRuntime | None = None
     interface_transports: InterfaceTransportService | None = None
+
+
+def _build_policy_gate(identity_repo, settings):
+    """Optional access-policy gate from the management config file.
+
+    Returns None when no managed config exists, keeping legacy env-only
+    behavior untouched. Live-reloads on every call (cheap YAML read).
+    """
+    home = Path(os.environ.get("ZERO_HOME", Path.home() / ".zero"))
+    cfg_path = home / "config.yaml"
+    if not cfg_path.exists():
+        return None
+    try:
+        from zero.manage.core.policy import build_gate as _build
+    except ImportError:  # pragma: no cover - manage layer optional
+        return None
+
+    def _load_access():
+        import yaml
+
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        return raw.get("access")
+
+    def _owner_external(project_id_value: str | None) -> str | None:
+        if not project_id_value:
+            return None
+        try:
+            from zero.domain.identity import ProjectId
+
+            project = identity_repo.get_project(ProjectId(str(project_id_value)))
+            owner_id = project.owner_user_id
+            links = identity_repo.list_external_identities(owner_id)
+            for link in links:
+                if link.platform == "telegram" and link.verified_at:
+                    return link.external_id
+        except Exception:  # noqa: BLE001 - gate must never crash intake
+            return None
+        return None
+
+    class _CfgView:  # tiny adapter matching build_gate's expectations
+        def __init__(self, access: dict):
+            self.mode = access.get("mode", "owner_only")
+            self.owner_project_id = access.get("owner_project_id") or (raw_root := None)
+            self.allow_users = access.get("allow_users", [])
+            self.groups = [
+                type(
+                    "G",
+                    (),
+                    {
+                        "chat_id": g.get("chat_id"),
+                        "enabled": g.get("enabled", True),
+                        "allowed_features": g.get("allowed_features", ["chat"]),
+                        "model_dump": lambda g=g: g,
+                    },
+                )()
+                for g in access.get("groups", [])
+            ]
+            del raw_root
+
+    def _cfg_getter():
+        data = _load_access()
+        if not data:
+            return None
+        view = _CfgView(data)
+        # resolve owner project lazily from telegram section if unset
+        if getattr(view, "owner_project_id", None) is None:
+            root = yaml_safe(cfg_path)
+            view.owner_project_id = (root or {}).get("owner_project_id")
+        return view
+
+    def yaml_safe(path):  # local helper to avoid double-read complexity
+        import yaml
+
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+    return _build(_cfg_getter, _owner_external)
 
 
 def build_services(
@@ -278,6 +356,9 @@ def build_services(
         planner=planner_service,
         planner_provider="openai-compatible",
         planner_model=settings.openai_model,
+        identity_service=identity_service,
+        auto_verify_linked=True,
+        policy_gate=_build_policy_gate(identity_repo, settings),
     )
     interface_transport = (
         messaging_transport

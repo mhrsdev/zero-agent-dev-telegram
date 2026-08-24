@@ -19,6 +19,7 @@ actor, project, revision, and transition.
 
 from __future__ import annotations
 
+import os
 import re
 from contextlib import asynccontextmanager
 from typing import Any
@@ -293,6 +294,15 @@ def create_app(settings: Settings) -> FastAPI:
 
     if services.interface_transports is not None:
         app.router.add_event_handler("shutdown", services.interface_transports.close)
+
+    # Optional local admin GUI (loopback-first; off in tests / when disabled).
+    if settings.zero_env != "test" and os.environ.get("ZERO_MANAGE_GUI", "1") != "0":
+        try:
+            from zero.manage.web import register_admin
+
+            register_admin(app)
+        except ImportError:  # pragma: no cover - manage layer optional
+            pass
 
     return app
 
@@ -660,6 +670,45 @@ def _register_identity_routes(app: FastAPI, services: Services) -> None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request failed")
         except ValueError:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="request failed")
+
+    @app.post(
+        "/users/{user_id}/external-identities/verify",
+        tags=["identity"],
+    )
+    def verify_external_identity(
+        request: Request, user_id: str, req: LinkExternalIdentityRequest
+    ) -> dict[str, Any]:
+        """Verify a linked platform identity (onboarding R5 fix).
+
+        Links are created ``verified=False``; without a verification path
+        no live Telegram message could ever pass the identity gate. The
+        authenticated principal must own the identity.
+        """
+        from zero.app.auth_service import request_actor
+
+        actor = request_actor(request, user_id)
+        if str(actor) != user_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
+        try:
+            identity = services.identity.verify_external_identity(
+                platform=req.platform,  # type: ignore[arg-type]
+                external_id=req.external_id,
+                source="web",
+            )
+        except Exception as exc:
+            from zero.domain.secrets import SecretError  # noqa: F401
+
+            if isinstance(exc, (IdentityError, ValueError)):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="request failed"
+                ) from exc
+            raise
+        return {
+            "id": identity.id.value,
+            "platform": identity.platform,
+            "external_id": identity.external_id,
+            "verified": True,
+        }
 
     @app.post(
         "/users/{user_id}/external-identities",
