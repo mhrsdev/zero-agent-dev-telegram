@@ -531,7 +531,9 @@ class AgentRuntime:
             # fatal.
             if self._context_builder is not None and self._compaction is not None:
                 try:
-                    if self._compaction.should_compact(execution_id, context_window):
+                    if self._compaction.should_compact(
+                        execution_id, context_window, max_output_tokens=model.max_output_tokens
+                    ):
                         conversation_messages = [_message_to_record(m) for m in messages]
                         self._compaction.compact(
                             project_id=project_id,
@@ -627,7 +629,9 @@ class AgentRuntime:
             # full transcript (linkage preserved via _message_to_record).
             if self._context_builder is not None and self._compaction is not None:
                 try:
-                    if self._compaction.should_compact(execution_id, context_window):
+                    if self._compaction.should_compact(
+                        execution_id, context_window, max_output_tokens=model.max_output_tokens
+                    ):
                         self._compaction.compact(
                             project_id=project_id,
                             execution_id=execution_id,

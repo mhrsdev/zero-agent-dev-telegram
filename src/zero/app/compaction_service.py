@@ -147,13 +147,26 @@ class CompactionService:
         execution_id: ExecutionId,
         context_window: int,
         threshold_percent: int = 85,
+        *,
+        max_output_tokens: int = 0,
     ) -> bool:
         """Check whether the active context exceeds the compaction
-        threshold."""
+        threshold.
+
+        When ``max_output_tokens`` is provided, the threshold applies to
+        the *usable* window (window minus reserved output) so pressure
+        accounting can never ignore the space the response needs
+        (reference parity). With ``0`` the raw window is used.
+        """
         cv = self._context_repo.get_active_context_version(execution_id)
         if cv is None:
             return False
-        return exceeds_threshold(cv.token_count, context_window, threshold_percent)
+        effective_window = context_window - max(0, int(max_output_tokens))
+        if effective_window <= 0:
+            # Degenerate window: trigger at a conservative fixed ratio
+            # of the nominal window rather than never/always.
+            return cv.token_count >= context_window * 85 // 100
+        return exceeds_threshold(cv.token_count, effective_window, threshold_percent)
 
     def compact(
         self,
@@ -396,14 +409,17 @@ class CompactionService:
         total_tokens = sum(estimate_tokens(json.dumps(m, ensure_ascii=False)) for m in messages)
         if total_tokens <= budget:
             return "verbatim", list(messages)
-        # Rung 2: remove oldest history.
+        # Rung 2: remove oldest history while protecting the head — the
+        # FIRST message (task objective / user seed) always survives so
+        # the summarizer and tail keep the original intent (reference
+        # parity).
         kept = list(messages)
         history_omitted = 0
         while (
-            len(kept) > 1
+            len(kept) > 2
             and sum(estimate_tokens(json.dumps(m, ensure_ascii=False)) for m in kept) > budget
         ):
-            kept.pop(0)
+            kept.pop(1)
             history_omitted += 1
         if kept and sum(estimate_tokens(json.dumps(m, ensure_ascii=False)) for m in kept) <= budget:
             return "history_turn_selected", kept

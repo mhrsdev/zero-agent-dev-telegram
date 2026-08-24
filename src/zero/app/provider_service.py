@@ -23,6 +23,9 @@ Per ``zero-claude-token-economics`` SKILL.md:
 from __future__ import annotations
 
 import json
+import logging
+import random
+import re
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
@@ -31,6 +34,30 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from threading import Event
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+#: Error classes eligible for same-provider in-process retry before the
+#: fallback chain is consulted. Both classes provably produced no
+#: completed response, so redelivery cannot double-spend a result.
+_SAME_PROVIDER_RETRYABLE_CLASSES = frozenset({"transient", "rate_limit"})
+
+
+def _same_provider_backoff_seconds(exc: Exception, attempt: int) -> float:
+    """Jittered exponential backoff honoring Retry-After (Hermes parity).
+
+    Reference semantics: exponential base with uniform jitter, and an
+    explicit provider ``Retry-After`` (surfaced by adapters as
+    ``(retry_after=N)``) overrides the curve, capped well under the
+    request lease window.
+    """
+    match = re.search(r"\(retry_after=(\d+)", str(exc))
+    if match:
+        base = min(60.0, float(match.group(1)))
+    else:
+        base = min(20.0, 1.0 * (2 ** max(0, attempt - 1)))
+    return base + random.uniform(0.0, base * 0.5)
+
 
 from zero.app.artifact_service import ArtifactService
 from zero.app.authorization_service import AuthorizationService
@@ -147,12 +174,16 @@ class ProviderService:
         *,
         include_fake: bool = False,
         metrics: Any | None = None,
+        provider_max_attempts: int = 2,
     ) -> None:
         self._repo = provider_repo
         self._artifact_service = artifact_service
         self._audit_repo = audit_repo
         self._authorization = authorization
         self._metrics = metrics
+        # Total dispatch attempts per request (>=1). Retries apply only
+        # to provably-unanswered transient/rate-limit failures.
+        self._provider_max_attempts = max(1, min(8, int(provider_max_attempts)))
         self._adapters: dict[str, ProviderAdapter] = {}
         self._fallback_chain: tuple[str, ...] = ()
         self._register_default_adapters(include_fake=include_fake)
@@ -473,76 +504,102 @@ class ProviderService:
             raise ValueError(f"No adapter registered for provider {request.provider!r}")
 
         provider_started = time.monotonic()
-        try:
-            if cancel_event is not None and cancel_event.is_set():
-                raise ProviderCancelledError("provider request cancelled before dispatch")
-            if request.stream:
-                response = self._collect_stream(
-                    adapter.send_request_stream(request, cancel_event=cancel_event),
-                    cancel_event=cancel_event,
-                    heartbeat=lambda: self._repo.heartbeat_provider_request(
-                        provider_request.id,
-                        claim_token=claim_token,
-                        lease_seconds=lease_seconds,
-                    ),
-                )
-            else:
-                response = (
-                    adapter.send_request(request, cancel_event=cancel_event)
-                    if cancel_event is not None
-                    else adapter.send_request(request)
-                )
-        except Exception as exc:
-            # Classify the error.
-            error_class = self._classify_error(exc)
-            terminal_state = (
-                "unknown"
-                if error_class == "unknown_outcome"
-                else "cancelled"
-                if error_class == "cancelled"
-                else "failed"
-            )
-            self._repo.update_provider_request_state(
-                provider_request.id,
-                terminal_state,
-                error_class=error_class,
-                error_message="provider request failed",
-                claim_token=claim_token,
-            )
-            self._audit_repo.insert(
-                AuditEvent(
-                    id=AuditEventId(generate_audit_event_id()),
-                    project_id=project_id,
-                    actor_id=actor_id,
-                    source=source,
-                    operation="provider.request",
-                    target_type="provider_request",
-                    target_id=provider_request.id.value,
-                    result="failure",
-                    redacted_summary=(
-                        f"Provider {request.provider}:{request.model_name} "
-                        f"request failed: {error_class}"
-                    ),
-                    correlation_id=execution_id.value if execution_id else None,
-                    created_at=_now_utc_iso(),
-                )
-            )
-            if self._metrics is not None:
-                metric_result = (
-                    "cancelled"
-                    if error_class == "cancelled"
-                    else "error"
+        attempts_allowed = max(1, int(self._provider_max_attempts))
+        attempts_used = 0
+        while True:
+            try:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ProviderCancelledError("provider request cancelled before dispatch")
+                if request.stream:
+                    response = self._collect_stream(
+                        adapter.send_request_stream(request, cancel_event=cancel_event),
+                        cancel_event=cancel_event,
+                        heartbeat=lambda: self._repo.heartbeat_provider_request(
+                            provider_request.id,
+                            claim_token=claim_token,
+                            lease_seconds=lease_seconds,
+                        ),
+                    )
+                else:
+                    response = (
+                        adapter.send_request(request, cancel_event=cancel_event)
+                        if cancel_event is not None
+                        else adapter.send_request(request)
+                    )
+                break
+            except Exception as exc:
+                error_class = self._classify_error(exc)
+                # Same-provider bounded retry for transient/rate-limit
+                # failures (Hermes conversation_loop parity): these
+                # classes never reached a completed response, so an
+                # in-process redelivery cannot double-spend a result.
+                if (
+                    error_class in _SAME_PROVIDER_RETRYABLE_CLASSES
+                    and attempts_used + 1 < attempts_allowed
+                    and not (cancel_event is not None and cancel_event.is_set())
+                ):
+                    attempts_used += 1
+                    delay = _same_provider_backoff_seconds(exc, attempts_used)
+                    logger.debug(
+                        "provider %s transient failure (%s); retry %d/%d in %.2fs",
+                        request.provider,
+                        error_class,
+                        attempts_used + 1,
+                        attempts_allowed,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                # Classify the error.
+                error_class = self._classify_error(exc)
+                terminal_state = (
+                    "unknown"
                     if error_class == "unknown_outcome"
-                    else "failure"
+                    else "cancelled"
+                    if error_class == "cancelled"
+                    else "failed"
                 )
-                self._metrics.increment(
-                    "provider_requests_total", result=metric_result, source=source
+                self._repo.update_provider_request_state(
+                    provider_request.id,
+                    terminal_state,
+                    error_class=error_class,
+                    error_message="provider request failed",
+                    claim_token=claim_token,
                 )
-                self._metrics.observe_duration(
-                    "provider_request_duration_ms",
-                    (time.monotonic() - provider_started) * 1000,
+                self._audit_repo.insert(
+                    AuditEvent(
+                        id=AuditEventId(generate_audit_event_id()),
+                        project_id=project_id,
+                        actor_id=actor_id,
+                        source=source,
+                        operation="provider.request",
+                        target_type="provider_request",
+                        target_id=provider_request.id.value,
+                        result="failure",
+                        redacted_summary=(
+                            f"Provider {request.provider}:{request.model_name} "
+                            f"request failed: {error_class}"
+                        ),
+                        correlation_id=execution_id.value if execution_id else None,
+                        created_at=_now_utc_iso(),
+                    )
                 )
-            raise
+                if self._metrics is not None:
+                    metric_result = (
+                        "cancelled"
+                        if error_class == "cancelled"
+                        else "error"
+                        if error_class == "unknown_outcome"
+                        else "failure"
+                    )
+                    self._metrics.increment(
+                        "provider_requests_total", result=metric_result, source=source
+                    )
+                    self._metrics.observe_duration(
+                        "provider_request_duration_ms",
+                        (time.monotonic() - provider_started) * 1000,
+                    )
+                raise
 
         # Store the response as an artifact.
         response_text = json.dumps(

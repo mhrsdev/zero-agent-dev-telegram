@@ -21,11 +21,11 @@ readiness or live external integration.
 | 12 | Primary website vertical slices | PARTIAL | ASGI tests; no browser/mobile/accessibility audit |
 | 13 | Telegram/Discord secondary adapters | PARTIAL | Canonical event and deterministic adapter tests; no live platform run |
 | 14 | Observability, recovery, security hardening | PARTIAL | Recovery, redaction, migration, and database-lineage tests; backup requires configured encryption authority |
-| 15 | End-to-end verification and controlled rollout | PARTIAL | Post-audit remediation suite (553 tests) and release gates; no production rollout rehearsal |
+| 15 | End-to-end verification and controlled rollout | PARTIAL | Post-audit remediation suite (563 tests) and release gates; no production rollout rehearsal |
 
 ## Current verification evidence
 
-- **553 tests passed, 16 platform-skipped** under `ZERO_ENV=test`. Reference-grounded additions (Anthropic adapter, LLM compaction summarizer, tool-round nudge) plus coherent retry lifecycle: retry-aware execution pausing, blocked-dependency revival, expired-lease terminal recording, worktree cleanup wired into recovery.
+- **563 tests passed, 16 platform-skipped** under `ZERO_ENV=test`. Reference-grounded additions (Anthropic adapter, LLM compaction summarizer, tool-round nudge) plus coherent retry lifecycle: retry-aware execution pausing, blocked-dependency revival, expired-lease terminal recording, worktree cleanup wired into recovery.
 - Python compilation, full scoped Ruff, and Ruff formatting checks pass for `src`, `tests`, and
   `scripts`.
 - The effective schema contains **30** migration files (including `0027_remaining_project_lineage` and `0028_secret_key_versioning`). Migration IDs use complete filename stems;

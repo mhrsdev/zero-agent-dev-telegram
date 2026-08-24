@@ -573,7 +573,12 @@ def test_provider_finalization_marks_unknown_on_usage_failure(
     )
 
 
-def test_transient_provider_failure_can_be_retried(services, project_with_owner, monkeypatch):
+def test_transient_provider_failure_is_retried_in_process(
+    services, project_with_owner, monkeypatch
+):
+    """Hermes parity: a transient failure is retried in-process before
+    surfacing; the second attempt succeeds and the durable request
+    completes on the first logical send."""
     owner, project = project_with_owner
     request = CanonicalRequest(
         provider="fake",
@@ -592,20 +597,13 @@ def test_transient_provider_failure_can_be_retried(services, project_with_owner,
         return original_send(req)
 
     monkeypatch.setattr(adapter, "send_request", flaky_send)
-    with pytest.raises(ProviderError):
-        services.providers.send_request(
-            project_id=project.id,
-            actor_id=owner.id,
-            request=request,
-        )
-
-    retried_request, response = services.providers.send_request(
+    monkeypatch.setattr("zero.app.provider_service.time.sleep", lambda _s: None)
+    _provider_request, response = services.providers.send_request(
         project_id=project.id,
         actor_id=owner.id,
         request=request,
     )
-    assert calls == 2
-    assert retried_request.state == "completed"
+    assert calls == 2  # one transient rejection + one successful redelivery
     assert "Fake response" in response.content
 
 

@@ -75,12 +75,17 @@ def _render_tools(
 
     Declarations carry the registry's real input schema so the model can
     emit well-typed arguments; a bare name falls back to an empty object
-    schema rather than being dropped.
+    schema rather than being dropped. Duplicate names are dropped (some
+    gateways hard-fail on duplicates).
     """
     rendered: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
     for declaration in coerce_tool_declarations(tools):
         if not declaration.name:
             raise ProviderError("tool declaration requires a name")
+        if declaration.name in seen_names:
+            continue
+        seen_names.add(declaration.name)
         rendered.append(
             {
                 "type": "function",
@@ -92,6 +97,12 @@ def _render_tools(
             }
         )
     return rendered
+
+
+def _rate_limit_detail(response: httpx.Response) -> str:
+    """Surface Retry-After from a 429 so the retry layer can honor it."""
+    retry_after = response.headers.get("retry-after")
+    return f" (retry_after={retry_after})" if retry_after else ""
 
 
 def compute_request_hash(
@@ -418,7 +429,10 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
         if response.status_code >= 400:
             # Do not include the provider body: error bodies commonly echo
             # credential fragments or request content.
-            raise ProviderError(f"provider HTTP request failed with status {response.status_code}")
+            detail = _rate_limit_detail(response) if response.status_code == 429 else ""
+            raise ProviderError(
+                f"provider HTTP request failed with status {response.status_code}{detail}"
+            )
 
         try:
             data = response.json()
@@ -1024,7 +1038,9 @@ class AnthropicMessagesProviderAdapter(ProviderAdapter):
             if status_code == 401 or status_code == 403:
                 raise ProviderError(f"provider auth failed with status {status_code}")
             if status_code == 429:
-                raise ProviderError(f"provider rate limit hit with status {status_code}")
+                retry_after = response.headers.get("retry-after")
+                detail = f" (retry_after={retry_after})" if retry_after else ""
+                raise ProviderError(f"provider rate limit hit with status {status_code}{detail}")
             if status_code in {503, 529}:
                 raise ProviderError(f"provider temporarily unavailable ({status_code})")
             raise ProviderError(f"provider HTTP request failed with status {status_code}")

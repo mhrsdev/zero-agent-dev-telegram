@@ -89,6 +89,10 @@ class Settings(BaseModel):
     anthropic_timeout_seconds: float = 60.0
     #: Automatic requeue budget for failed tasks (0 disables auto-retry).
     task_max_attempts: int = 0
+    #: Total dispatch attempts per provider request (first call +
+    #: in-process retries of transient/rate-limit failures). Reference
+    #: parity: Hermes defaults to retrying before failing over.
+    provider_max_attempts: int = 2
     telegram_webhook_secret: SecretStr | None = None
     discord_application_public_key: SecretStr | None = None
     # Host-bounded execution is deliberately test/development-only. Production
@@ -280,6 +284,14 @@ class Settings(BaseModel):
         if task_max_attempts < 0 or task_max_attempts > 16:
             raise ConfigError("ZERO_TASK_MAX_ATTEMPTS must be between 0 and 16.")
 
+        provider_attempts_raw = raw.get("ZERO_PROVIDER_MAX_ATTEMPTS", "2")
+        try:
+            provider_max_attempts = int(provider_attempts_raw)
+        except ValueError as exc:
+            raise ConfigError("ZERO_PROVIDER_MAX_ATTEMPTS must be an integer.") from exc
+        if provider_max_attempts < 1 or provider_max_attempts > 8:
+            raise ConfigError("ZERO_PROVIDER_MAX_ATTEMPTS must be between 1 and 8.")
+
         telegram_webhook_secret_raw = raw.get("ZERO_TELEGRAM_WEBHOOK_SECRET")
         telegram_webhook_secret = (
             SecretStr(telegram_webhook_secret_raw) if telegram_webhook_secret_raw else None
@@ -326,6 +338,7 @@ class Settings(BaseModel):
             anthropic_model=anthropic_model,
             anthropic_timeout_seconds=anthropic_timeout_seconds,
             task_max_attempts=task_max_attempts,
+            provider_max_attempts=provider_max_attempts,
             telegram_webhook_secret=telegram_webhook_secret,
             discord_application_public_key=discord_application_public_key,
             worktree_isolation_mode=isolation_mode,  # type: ignore[arg-type]

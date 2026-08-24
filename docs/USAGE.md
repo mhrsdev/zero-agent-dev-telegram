@@ -112,6 +112,7 @@ to the next provider instead of aborting.
 | `ZERO_WORKTREE_ALLOWED_COMMANDS` | *(empty = deny all)* | Comma list of bare command names agents may run, e.g. `pytest,python,git` |
 | `ZERO_WORKTREE_ROOT` | `<temp>/zero-worktrees` | Parent dir for task worktrees |
 | `ZERO_TASK_MAX_ATTEMPTS` | `0` (off) | Total attempts per task (first run + auto-requeues). Max 16. |
+| `ZERO_PROVIDER_MAX_ATTEMPTS` | `2` | Dispatch attempts per provider request for transient/rate-limit failures (jittered backoff, Retry-After honored). 1 disables; max 8. |
 
 ### 3.4 Background workers
 

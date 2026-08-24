@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -37,7 +38,7 @@ import subprocess
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import ClassVar, Literal
 
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
@@ -391,6 +392,29 @@ class WorktreeService:
                 f"worktree {worktree_id} has a non-terminal command run; refusing cleanup"
             )
 
+    #: Hardline floor (Hermes ``approval.py`` parity): commands and
+    #: argument shapes that are ALWAYS refused, even when the command
+    #: name itself is allowlisted. Zero's runner passes argv directly
+    #: (no shell), so shell-injection patterns are structurally
+    #: impossible; this floor targets host-damaging operations.
+    _HARDLINE_COMMANDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "mkfs",
+            "mkfs.ext2",
+            "mkfs.ext4",
+            "mkfs.xfs",
+            "shutdown",
+            "reboot",
+            "halt",
+            "poweroff",
+            "diskpart",
+        }
+    )
+    _DEVICE_TARGET_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"of=/dev/(?:sd|nvme|hd|mmcblk|vd|xvd)", re.IGNORECASE
+    )
+    _FORK_BOMB_RE: ClassVar[re.Pattern[str]] = re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;")
+
     def _validate_command(
         self,
         command: str,
@@ -398,6 +422,21 @@ class WorktreeService:
         timeout_seconds: int,
     ) -> None:
         """Apply the fail-closed command policy before touching a worktree."""
+        lowered = command.lower() if isinstance(command, str) else ""
+        # Hardline floor FIRST: unconditional refusals apply even when
+        # an operator has (ill-advisedly) allowlisted the name.
+        if lowered in self._HARDLINE_COMMANDS or lowered.startswith("mkfs"):
+            raise CommandPolicyError(f"command {command!r} is unconditionally refused")
+        for arg in args or ():
+            if isinstance(arg, str) and (
+                self._DEVICE_TARGET_RE.search(arg) or self._FORK_BOMB_RE.search(arg)
+            ):
+                raise CommandPolicyError(
+                    "command arguments target host-destructive operations and are refused"
+                )
+            stripped = arg.strip() if isinstance(arg, str) else ""
+            if lowered == "rm" and stripped in {"/", "/*"}:
+                raise CommandPolicyError("rm of filesystem root is refused")
         if (
             not command
             or not isinstance(command, str)

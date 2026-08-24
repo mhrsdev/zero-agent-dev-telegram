@@ -182,6 +182,7 @@ def build_services(
         authorization_service,
         include_fake=settings.is_test,
         metrics=metrics_service,
+        provider_max_attempts=settings.provider_max_attempts,
     )
     if settings.openai_api_key is not None:
         provider_service.register_adapter(
