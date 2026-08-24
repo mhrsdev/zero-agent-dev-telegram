@@ -48,8 +48,10 @@ COMPACTION_RECORD_ID_PREFIX = "comp_"
 # ----------------------------------------------------------------------
 
 #: Bytes per token for the conservative deterministic fallback.
-#: Per zero-context-memory reference: this is a cheap estimate for gates,
-#: not billing. The real provider tokenizer is used when available.
+#: Per zero-context-memory reference: this is a cheap deterministic
+#: estimate for compaction/budget GATES, not billing. No provider
+#: tokenizer is wired in this release; ASCII prose underestimates and
+#: multi-byte scripts overestimate by design margins.
 BYTES_PER_TOKEN = 4
 
 #: Default compaction threshold as a percentage of the context window.
@@ -113,12 +115,12 @@ def context_remaining(
 # ----------------------------------------------------------------------
 
 ContextRegionName = Literal[
-    "system_policy",       # immutable security/system policy
-    "project_identity",    # project and agent identity
-    "plan_contract",       # approved plan and current task contract
+    "system_policy",  # immutable security/system policy
+    "project_identity",  # project and agent identity
+    "plan_contract",  # approved plan and current task contract
     "execution_snapshot",  # typed execution state (survives compaction)
-    "retrieved_context",   # Project RAG + agent memory
-    "conversation_tail",   # recent valid exchange messages
+    "retrieved_context",  # Project RAG + agent memory
+    "conversation_tail",  # recent valid exchange messages
     "compaction_summary",  # compaction summary + recovery pointers
 ]
 
@@ -344,8 +346,13 @@ class CompactionRecord:
         execution_id: the execution.
         source_context_version: the context version before compaction.
         target_context_version: the new context version after compaction.
-        source_event_range: JSON {start_event_id, end_event_id}.
-        memory_delta_artifact_id: artifact with accepted memory deltas.
+        source_event_range: JSON descriptor of the compacted message
+            span: ``{message_count, first_message_role,
+            last_message_role}``. (Event-ID ranges are a future
+            refinement; the transcript artifact remains the full-fidelity
+            reference.)
+        memory_delta_artifact_id: reserved for accepted memory deltas;
+            not yet written by this release's compaction path.
         transcript_artifact_id: artifact with the full transcript.
         summary: the compaction summary text.
         fit_rung: which rung of the degradation ladder was used.

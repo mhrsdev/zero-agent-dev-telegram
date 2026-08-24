@@ -44,12 +44,8 @@ def two_lookalike_projects(services):
     owner_a = services.identity.create_user(display_name="Alice")
     owner_b = services.identity.create_user(display_name="Alice")
     # Two projects with the same name.
-    project_a = services.identity.create_project(
-        owner_id=owner_a.id, name="Lookalike Project"
-    )
-    project_b = services.identity.create_project(
-        owner_id=owner_b.id, name="Lookalike Project"
-    )
+    project_a = services.identity.create_project(owner_id=owner_a.id, name="Lookalike Project")
+    project_b = services.identity.create_project(owner_id=owner_b.id, name="Lookalike Project")
     # Two members with the same display name, each in their own project.
     member_a = services.identity.create_user(display_name="Bob")
     member_b = services.identity.create_user(display_name="Bob")
@@ -90,18 +86,14 @@ def test_owner_a_cannot_access_project_b(services, two_lookalike_projects) -> No
     assert not scope.is_member
 
 
-def test_member_a_cannot_resolve_scope_in_project_b(
-    services, two_lookalike_projects
-) -> None:
+def test_member_a_cannot_resolve_scope_in_project_b(services, two_lookalike_projects) -> None:
     member_a = two_lookalike_projects["member_a"]
     project_b = two_lookalike_projects["project_b"]
     scope = services.identity.resolve_scope(project_b.id, member_a.id)
     assert not scope.is_member
 
 
-def test_list_members_does_not_leak_across_projects(
-    services, two_lookalike_projects
-) -> None:
+def test_list_members_does_not_leak_across_projects(services, two_lookalike_projects) -> None:
     """Per zero-project-isolation-evidence §"Scope begins before
     access": listing members of project A must not return any member
     of project B."""
@@ -118,9 +110,7 @@ def test_list_members_does_not_leak_across_projects(
 # ----------------------------------------------------------------------
 
 
-def test_audit_events_do_not_leak_across_projects(
-    services, two_lookalike_projects
-) -> None:
+def test_audit_events_do_not_leak_across_projects(services, two_lookalike_projects) -> None:
     """Per zero-project-isolation-evidence: audit events are
     project-scoped. Listing project A's audit events must not return
     any event from project B."""
@@ -136,7 +126,9 @@ def test_audit_events_do_not_leak_across_projects(
         role="viewer",
     )
     # List project A's audit events.
-    events_a = services.audit.list_for_project(project_id=project_a.id, actor_id=project_a.owner_user_id, limit=100)
+    events_a = services.audit.list_for_project(
+        project_id=project_a.id, actor_id=project_a.owner_user_id, limit=100
+    )
     # No event in project A should mention project_b's ID.
     for event in events_a:
         assert event.project_id != project_b.id
@@ -145,9 +137,7 @@ def test_audit_events_do_not_leak_across_projects(
     leaked = [
         e
         for e in events_a
-        if e.operation == "member.add"
-        and e.target_id
-        and new_member_b.id.value in e.target_id
+        if e.operation == "member.add" and e.target_id and new_member_b.id.value in e.target_id
     ]
     assert len(leaked) == 0
 
@@ -172,13 +162,9 @@ def test_secret_in_project_a_not_visible_in_project_b(
     secured_services = build_services(settings, database)
 
     owner_a = secured_services.identity.create_user(display_name="Owner A")
-    project_a = secured_services.identity.create_project(
-        owner_id=owner_a.id, name="Project A"
-    )
+    project_a = secured_services.identity.create_project(owner_id=owner_a.id, name="Project A")
     owner_b = secured_services.identity.create_user(display_name="Owner B")
-    project_b = secured_services.identity.create_project(
-        owner_id=owner_b.id, name="Project B"
-    )
+    project_b = secured_services.identity.create_project(owner_id=owner_b.id, name="Project B")
     # Store a secret in project A.
     secret_ref = secured_services.secrets.store(
         project_id=project_a.id,
@@ -192,12 +178,16 @@ def test_secret_in_project_a_not_visible_in_project_b(
 
     with pytest.raises(SecretNotFoundError):
         secured_services.secrets.get_reference(
-            project_id=project_b.id, secret_id=secret_ref.id
+            project_id=project_b.id,
+            secret_id=secret_ref.id,
+            actor_id=owner_b.id,
         )
     # And by the resolve_value path.
     with pytest.raises(SecretNotFoundError):
         secured_services.secrets.resolve_value(
-            project_id=project_b.id, secret_id=secret_ref.id
+            project_id=project_b.id,
+            secret_id=secret_ref.id,
+            actor_id=owner_b.id,
         )
     # List secrets in project B — should be empty.
     secrets_b = secured_services.secrets.list_for_project(
@@ -224,7 +214,8 @@ def test_tool_grant_in_project_a_not_usable_in_project_b(
     owner_a = two_lookalike_projects["owner_a"]
     # Grant echo to main_worker in project A only.
     services.tools.grant_tool(
-        project_id=project_a.id, actor_id=project_a.owner_user_id,
+        project_id=project_a.id,
+        actor_id=project_a.owner_user_id,
         tool_id=echo_tool.id,
         agent_scope="main_worker",
     )
@@ -255,9 +246,7 @@ def test_tool_grant_in_project_a_not_usable_in_project_b(
 # ----------------------------------------------------------------------
 
 
-def test_external_identity_cannot_be_linked_to_two_users(
-    services, two_lookalike_projects
-) -> None:
+def test_external_identity_cannot_be_linked_to_two_users(services, two_lookalike_projects) -> None:
     """Per zero-control-plane-trust §"Identity is a link, not a name":
     the same external identity (platform + external_id) may be linked
     to at most one Zero User."""

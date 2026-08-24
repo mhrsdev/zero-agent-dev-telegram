@@ -10,6 +10,7 @@ database).
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
 
 from zero.domain.health import HealthReport, HealthStatus, aggregate_status
@@ -46,7 +47,7 @@ class HealthService:
         db_status = self._ping_database()
         try:
             migration_count = self._migration_counter(self._database)
-        except Exception:
+        except (OSError, RuntimeError, sqlite3.Error):
             migration_count = None
         overall = aggregate_status(db_status)
         if migration_count is None:
@@ -62,6 +63,6 @@ class HealthService:
     def _ping_database(self) -> HealthStatus:
         try:
             ok = self._database.ping()
-        except Exception:
+        except (OSError, RuntimeError, sqlite3.Error):
             return "down"
         return "ok" if ok else "down"

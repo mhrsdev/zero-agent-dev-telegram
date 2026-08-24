@@ -55,13 +55,14 @@ AgentTypeState = Literal["active", "archived", "retired"]
 AGENT_TYPE_TRANSITIONS: dict[AgentTypeState, frozenset[AgentTypeState]] = {
     "active": frozenset({"archived", "retired"}),
     "archived": frozenset({"active", "retired"}),  # active = rollback
-    "retired": frozenset(),  # terminal
+    # retired -> archived is the explicit governance escape hatch that
+    # lets a topology rollback restore a type that was retired after
+    # the snapshot was taken (rollback then uses archived -> active).
+    "retired": frozenset({"archived"}),
 }
 
 
-def is_valid_agent_type_transition(
-    from_state: AgentTypeState, to_state: AgentTypeState
-) -> bool:
+def is_valid_agent_type_transition(from_state: AgentTypeState, to_state: AgentTypeState) -> bool:
     return to_state in AGENT_TYPE_TRANSITIONS.get(from_state, frozenset())
 
 
@@ -69,9 +70,7 @@ def is_valid_agent_type_transition(
 # Instance state machine
 # ----------------------------------------------------------------------
 
-AgentInstanceState = Literal[
-    "idle", "running", "completed", "failed", "cancelled"
-]
+AgentInstanceState = Literal["idle", "running", "completed", "failed", "cancelled"]
 
 INSTANCE_TRANSITIONS: dict[AgentInstanceState, frozenset[AgentInstanceState]] = {
     "idle": frozenset({"running", "cancelled"}),
@@ -86,9 +85,7 @@ INSTANCE_TRANSITIONS: dict[AgentInstanceState, frozenset[AgentInstanceState]] = 
 # Knowledge record state
 # ----------------------------------------------------------------------
 
-KnowledgeKind = Literal[
-    "decision", "fact", "constraint", "contract", "failure", "other"
-]
+KnowledgeKind = Literal["decision", "fact", "constraint", "contract", "failure", "other"]
 
 KnowledgeState = Literal["candidate", "approved", "superseded", "archived"]
 
@@ -114,8 +111,7 @@ class AgentTypeId:
             raise ValueError("AgentTypeId must be a non-empty string")
         if not self.value.startswith(AGENT_TYPE_ID_PREFIX):
             raise ValueError(
-                f"AgentTypeId must start with "
-                f"{AGENT_TYPE_ID_PREFIX!r}; got {self.value!r}"
+                f"AgentTypeId must start with {AGENT_TYPE_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -131,8 +127,7 @@ class AgentInstanceId:
             raise ValueError("AgentInstanceId must be a non-empty string")
         if not self.value.startswith(AGENT_INSTANCE_ID_PREFIX):
             raise ValueError(
-                f"AgentInstanceId must start with "
-                f"{AGENT_INSTANCE_ID_PREFIX!r}; got {self.value!r}"
+                f"AgentInstanceId must start with {AGENT_INSTANCE_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -372,9 +367,7 @@ class KnowledgeReconciliationError(AgentTypeError):
     reconciliation passes."
     """
 
-    def __init__(
-        self, message: str, *, unaccounted_records: list[str] | None = None
-    ) -> None:
+    def __init__(self, message: str, *, unaccounted_records: list[str] | None = None) -> None:
         super().__init__(message)
         self.unaccounted_records = unaccounted_records or []
 

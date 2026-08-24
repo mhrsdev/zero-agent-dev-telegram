@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pydantic import SecretStr
 
 from zero.app.api import create_app
 from zero.config import Settings
@@ -16,20 +17,14 @@ from zero.config import Settings
 
 async def _setup_project(client: AsyncClient) -> tuple[str, str]:
     """Create a user and project; return (user_id, project_id)."""
-    user_resp = await client.post(
-        "/users", json={"display_name": "Owner"}
-    )
+    user_resp = await client.post("/users", json={"display_name": "Owner"})
     user_id = user_resp.json()["id"]
-    proj_resp = await client.post(
-        "/projects", json={"owner_id": user_id, "name": "Project A"}
-    )
+    proj_resp = await client.post("/projects", json={"owner_id": user_id, "name": "Project A"})
     project_id = proj_resp.json()["id"]
     return user_id, project_id
 
 
-async def _create_approved_plan(
-    client: AsyncClient, user_id: str, project_id: str
-) -> str:
+async def _create_approved_plan(client: AsyncClient, user_id: str, project_id: str) -> str:
     """Create a plan, propose a revision, approve it, and return the
     handoff_id."""
     # Ingest a conversation event.
@@ -86,6 +81,23 @@ async def test_plan_lifecycle_end_to_end() -> None:
         user_id, project_id = await _setup_project(ac)
         handoff_id = await _create_approved_plan(ac, user_id, project_id)
     assert handoff_id.startswith("ph_")
+
+
+@pytest.mark.asyncio
+async def test_artifact_list_route_passes_authorized_actor() -> None:
+    settings = Settings.load_for_test()
+    app = create_app(settings)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        _user_id, project_id = await _setup_project(ac)
+        stored = await ac.post(
+            f"/projects/{project_id}/artifacts",
+            json={"kind": "stdout", "content": "artifact"},
+        )
+        assert stored.status_code == 201, stored.text
+        listed = await ac.get(f"/projects/{project_id}/artifacts")
+        assert listed.status_code == 200, listed.text
+        assert listed.json()[0]["content_hash"]
 
 
 @pytest.mark.asyncio
@@ -171,9 +183,7 @@ async def test_unauthorized_approval_returns_403() -> None:
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         user_id, project_id = await _setup_project(ac)
         # Add a viewer (read-only).
-        viewer_resp = await ac.post(
-            "/users", json={"display_name": "Viewer"}
-        )
+        viewer_resp = await ac.post("/users", json={"display_name": "Viewer"})
         viewer_id = viewer_resp.json()["id"]
         await ac.post(
             f"/projects/{project_id}/members",
@@ -215,6 +225,36 @@ async def test_unauthorized_approval_returns_403() -> None:
 
 
 @pytest.mark.asyncio
+async def test_authenticated_member_mutation_uses_request_principal() -> None:
+    settings = Settings.load_for_test(
+        auth_required=True,
+        secret_key=SecretStr("test-only-auth-key-material-0123456789"),
+    )
+    app = create_app(settings)
+    services = app.state.services
+    owner = services.identity.create_user(display_name="Authenticated owner")
+    project = services.identity.create_project(owner_id=owner.id, name="Protected project")
+    viewer = services.identity.create_user(display_name="Authenticated viewer")
+    services.identity.add_member(
+        project_id=project.id,
+        actor_id=owner.id,
+        member_id=viewer.id,
+        role="viewer",
+    )
+    viewer_token, _ = services.auth.issue_access_token(viewer.id)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        response = await ac.post(
+            f"/projects/{project.id.value}/members",
+            headers={"Authorization": f"Bearer {viewer_token}"},
+            json={"member_id": viewer.id.value, "role": "viewer"},
+        )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_execution_creation_end_to_end() -> None:
     """Create an execution from an approved handoff via HTTP."""
     settings = Settings.load_for_test()
@@ -241,12 +281,51 @@ async def test_execution_creation_end_to_end() -> None:
     execution_id = body["id"]
     # List ready tasks: both should be ready (no dependencies).
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        ready_resp = await ac.get(
-            f"/projects/{project_id}/executions/{execution_id}/ready-tasks"
-        )
+        ready_resp = await ac.get(f"/projects/{project_id}/executions/{execution_id}/ready-tasks")
     assert ready_resp.status_code == 200
     ready = ready_resp.json()
     assert len(ready) == 2
+
+
+@pytest.mark.asyncio
+async def test_execution_run_ready_reaches_agent_runtime() -> None:
+    settings = Settings.load_for_test()
+    app = create_app(settings)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        user_id, project_id = await _setup_project(ac)
+        handoff_id = await _create_approved_plan(ac, user_id, project_id)
+        exec_resp = await ac.post(
+            f"/projects/{project_id}/handoffs/{handoff_id}/executions",
+            json={
+                "actor_id": user_id,
+                "task_specs": [
+                    {
+                        "key": "A",
+                        "objective": "Run through the agent runtime",
+                        "expected_evidence": ["provider_response"],
+                    }
+                ],
+            },
+        )
+        execution_id = exec_resp.json()["id"]
+
+        run_resp = await ac.post(
+            f"/projects/{project_id}/executions/{execution_id}/run-ready",
+            json={
+                "actor_id": user_id,
+                "lease_owner": "http-runtime-worker",
+                "provider": "fake",
+                "model_name": "fake-standard",
+                "max_tasks": 1,
+            },
+        )
+
+    assert run_resp.status_code == 200
+    result = run_resp.json()["results"][0]
+    assert result["task_state"] == "completed"
+    assert result["attempt_state"] == "succeeded"
+    assert result["evidence_artifact_id"].startswith("art_")
 
 
 @pytest.mark.asyncio
@@ -295,16 +374,13 @@ async def test_execution_cancellation_end_to_end() -> None:
         execution_id = exec_resp.json()["id"]
         # Cancel.
         cancel_resp = await ac.post(
-            f"/projects/{project_id}/executions/{execution_id}/cancel"
-            f"?actor_id={user_id}"
+            f"/projects/{project_id}/executions/{execution_id}/cancel?actor_id={user_id}"
         )
     assert cancel_resp.status_code == 200
     assert cancel_resp.json()["state"] == "cancelled"
     # Verify tasks are cancelled.
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        tasks_resp = await ac.get(
-            f"/projects/{project_id}/executions/{execution_id}/tasks"
-        )
+        tasks_resp = await ac.get(f"/projects/{project_id}/executions/{execution_id}/tasks")
     tasks = tasks_resp.json()
     assert all(t["state"] == "cancelled" for t in tasks)
 
@@ -328,11 +404,9 @@ async def test_execution_recovery_end_to_end() -> None:
         execution_id = exec_resp.json()["id"]
         # Recover.
         recover_resp = await ac.post(
-            f"/projects/{project_id}/executions/{execution_id}/recover"
-            f"?actor_id={user_id}"
+            f"/projects/{project_id}/executions/{execution_id}/recover?actor_id={user_id}"
         )
     assert recover_resp.status_code == 200
     body = recover_resp.json()
-    # With no running tasks, the execution should be paused after
-    # recovery (or pending if no tasks were ever claimed).
-    assert body["state"] in ("pending", "paused")
+    # A recovered execution with ready work is schedulable immediately.
+    assert body["state"] == "running"

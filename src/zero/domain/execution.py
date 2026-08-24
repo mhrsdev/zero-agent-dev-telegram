@@ -50,9 +50,9 @@ EXECUTION_SNAPSHOT_ID_PREFIX = "snap_"
 ExecutionState = Literal[
     "pending",  # created, not started
     "running",  # at least one task is running
-    "paused",   # waiting for a human decision
+    "paused",  # waiting for a human decision
     "completed",  # all tasks completed successfully
-    "failed",   # at least one task failed and cannot proceed
+    "failed",  # at least one task failed and cannot proceed
     "cancelled",  # cancelled by an authorized user
 ]
 
@@ -67,9 +67,7 @@ EXECUTION_TRANSITIONS: dict[ExecutionState, frozenset[ExecutionState]] = {
 }
 
 
-def is_valid_execution_transition(
-    from_state: ExecutionState, to_state: ExecutionState
-) -> bool:
+def is_valid_execution_transition(from_state: ExecutionState, to_state: ExecutionState) -> bool:
     return to_state in EXECUTION_TRANSITIONS.get(from_state, frozenset())
 
 
@@ -78,12 +76,12 @@ def is_valid_execution_transition(
 # ----------------------------------------------------------------------
 
 TaskState = Literal[
-    "pending",   # waiting for dependencies
-    "ready",     # dependencies met, not started
-    "running",   # an attempt is in progress
+    "pending",  # waiting for dependencies
+    "ready",  # dependencies met, not started
+    "running",  # an attempt is in progress
     "completed",
     "failed",
-    "blocked",   # waiting for a human decision
+    "blocked",  # waiting for a human decision
     "cancelled",
 ]
 
@@ -99,20 +97,14 @@ TASK_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
 }
 
 #: Terminal task states (no further transitions possible).
-TERMINAL_TASK_STATES: frozenset[TaskState] = frozenset(
-    {"completed", "cancelled"}
-)
+TERMINAL_TASK_STATES: frozenset[TaskState] = frozenset({"completed", "cancelled"})
 
 #: States that block dependents (per PLAN.md M5: "Failed prerequisites
 #: block dependents safely").
-BLOCKING_TASK_STATES: frozenset[TaskState] = frozenset(
-    {"failed", "blocked", "cancelled"}
-)
+BLOCKING_TASK_STATES: frozenset[TaskState] = frozenset({"failed", "blocked", "cancelled"})
 
 
-def is_valid_task_transition(
-    from_state: TaskState, to_state: TaskState
-) -> bool:
+def is_valid_task_transition(from_state: TaskState, to_state: TaskState) -> bool:
     return to_state in TASK_TRANSITIONS.get(from_state, frozenset())
 
 
@@ -147,8 +139,7 @@ class ExecutionId:
             raise ValueError("ExecutionId must be a non-empty string")
         if not self.value.startswith(EXECUTION_ID_PREFIX):
             raise ValueError(
-                f"ExecutionId must start with "
-                f"{EXECUTION_ID_PREFIX!r}; got {self.value!r}"
+                f"ExecutionId must start with {EXECUTION_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -163,10 +154,7 @@ class TaskId:
         if not self.value or not isinstance(self.value, str):
             raise ValueError("TaskId must be a non-empty string")
         if not self.value.startswith(TASK_ID_PREFIX):
-            raise ValueError(
-                f"TaskId must start with {TASK_ID_PREFIX!r}; "
-                f"got {self.value!r}"
-            )
+            raise ValueError(f"TaskId must start with {TASK_ID_PREFIX!r}; got {self.value!r}")
 
     def __str__(self) -> str:
         return self.value
@@ -181,8 +169,7 @@ class TaskAttemptId:
             raise ValueError("TaskAttemptId must be a non-empty string")
         if not self.value.startswith(TASK_ATTEMPT_ID_PREFIX):
             raise ValueError(
-                f"TaskAttemptId must start with "
-                f"{TASK_ATTEMPT_ID_PREFIX!r}; got {self.value!r}"
+                f"TaskAttemptId must start with {TASK_ATTEMPT_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -278,6 +265,7 @@ class Task:
     permitted_scope: tuple[str, ...]
     expected_evidence: tuple[str, ...]
     state: TaskState
+    completion_evidence: tuple[str, ...] = ()
     blocker_reason: str | None = None
     agent_type_id: str | None = None
     terminal_state_set_at: str | None = None
@@ -394,6 +382,18 @@ class TaskNotFoundError(ExecutionError):
     pass
 
 
+class AttemptIdentityError(ExecutionError):
+    """An attempt does not belong to the task being mutated."""
+
+
+class LeaseOwnershipError(ExecutionError):
+    """The caller does not hold the current attempt lease."""
+
+
+class MissingEvidenceError(ExecutionError):
+    """A task cannot complete without its expected evidence."""
+
+
 class InvalidExecutionTransitionError(ExecutionError):
     """A state transition was attempted that is not allowed."""
 
@@ -418,21 +418,9 @@ class MissingDependencyError(ExecutionError):
     """A task depends on a task that does not exist."""
 
 
-class ExecutionAlreadyExistsError(ExecutionError):
-    """An execution already exists for this plan revision.
-
-    Per ``zero-planner-worker-contract`` §"Idempotency is part of
-    normal operation": "one execution per approved plan revision".
-    """
-
-
 class PlanNotApprovedError(ExecutionError):
     """The Worker was asked to create an execution from a plan revision
     that has not been approved."""
-
-
-class TaskBlockedError(ExecutionError):
-    """The task is blocked waiting for a human decision."""
 
 
 class DuplicateAttemptError(ExecutionError):

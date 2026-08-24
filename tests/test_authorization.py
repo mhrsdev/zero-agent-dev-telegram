@@ -49,9 +49,7 @@ def services(test_settings: Settings):
 def project_with_members(services):
     """Create a project with an owner, a member, and a viewer."""
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Project A"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="Project A")
     member = services.identity.create_user(display_name="Member")
     viewer = services.identity.create_user(display_name="Viewer")
     services.identity.add_member(
@@ -129,9 +127,7 @@ def test_owner_is_allowed_all_permissions(services, project_with_members) -> Non
         assert decision.allowed, f"Owner should be allowed {permission}"
 
 
-def test_member_is_allowed_operational_permissions(
-    services, project_with_members
-) -> None:
+def test_member_is_allowed_operational_permissions(services, project_with_members) -> None:
     member = project_with_members["member"]
     project = project_with_members["project"]
     for permission in permissions_for_role("member"):
@@ -143,9 +139,7 @@ def test_member_is_allowed_operational_permissions(
         assert decision.allowed, f"Member should be allowed {permission}"
 
 
-def test_viewer_is_allowed_read_permissions(
-    services, project_with_members
-) -> None:
+def test_viewer_is_allowed_read_permissions(services, project_with_members) -> None:
     viewer = project_with_members["viewer"]
     project = project_with_members["project"]
     decision = services.authorization.authorize(
@@ -193,9 +187,7 @@ def test_member_denied_audit_view(services, project_with_members) -> None:
     assert decision.reason == "permission_denied"
 
 
-def test_non_member_denied_all_permissions(
-    services, project_with_members
-) -> None:
+def test_non_member_denied_all_permissions(services, project_with_members) -> None:
     """Per zero-project-isolation-evidence: cross-project access is
     prevented at more than one appropriate layer. A non-member is
     denied at the authorization layer."""
@@ -241,9 +233,7 @@ def test_require_permission_raises_on_deny(services, project_with_members) -> No
     assert exc_info.value.decision.reason == "permission_denied"
 
 
-def test_require_permission_returns_decision_on_allow(
-    services, project_with_members
-) -> None:
+def test_require_permission_returns_decision_on_allow(services, project_with_members) -> None:
     owner = project_with_members["owner"]
     project = project_with_members["project"]
     decision = services.authorization.require_permission(
@@ -259,9 +249,7 @@ def test_require_permission_returns_decision_on_allow(
 # ----------------------------------------------------------------------
 
 
-def test_revocation_takes_effect_immediately(
-    services, project_with_members
-) -> None:
+def test_revocation_takes_effect_immediately(services, project_with_members) -> None:
     """Per PLAN.md M3: 'Revocation takes effect through all implemented
     interfaces.' Removing a member's membership immediately denies
     all permissions."""
@@ -304,11 +292,11 @@ def test_denied_decision_is_audited(services, project_with_members) -> None:
     services.authorization.authorize(
         actor_id=viewer.id, project_id=project.id, permission="plan.approve"
     )
-    events = services.audit.list_for_project(project_id=project.id, actor_id=project.owner_user_id, limit=50)
+    events = services.audit.list_for_project(
+        project_id=project.id, actor_id=project.owner_user_id, limit=50
+    )
     denial_events = [
-        e
-        for e in events
-        if e.operation == "authz.plan.approve" and e.result == "denied"
+        e for e in events if e.operation == "authz.plan.approve" and e.result == "denied"
     ]
     assert len(denial_events) >= 1
     event = denial_events[0]
@@ -331,11 +319,10 @@ def test_cross_project_access_denied(services) -> None:
     # Create two projects with overlapping member names.
     owner_a = services.identity.create_user(display_name="Alice")
     owner_b = services.identity.create_user(display_name="Alice")  # same name
-    services.identity.create_project(
-        owner_id=owner_a.id, name="Project Alpha"
-    )
+    services.identity.create_project(owner_id=owner_a.id, name="Project Alpha")
     project_b = services.identity.create_project(
-        owner_id=owner_b.id, name="Project Alpha"  # same name
+        owner_id=owner_b.id,
+        name="Project Alpha",  # same name
     )
     # owner_a is NOT a member of project_b.
     decision = services.authorization.authorize(

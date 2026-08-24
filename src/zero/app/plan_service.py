@@ -28,7 +28,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from zero.app.authorization_service import AuthorizationService
-from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
+from zero.domain.audit import AuditEvent, AuditEventId, AuditSource, redact_sensitive_text
 from zero.domain.identity import ProjectId, UserId
 from zero.domain.ids import (
     generate_audit_event_id,
@@ -86,6 +86,20 @@ class PlanService:
         self._audit_repo = audit_repo
         self._authz = authorization_service
 
+    def _authorize_project_read(
+        self,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        source: AuditSource,
+    ) -> None:
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="project.view",
+            source=source,
+        )
+
     # ------------------------------------------------------------------
     # Conversation intake
     # ------------------------------------------------------------------
@@ -117,6 +131,12 @@ class PlanService:
         """
         if not content or not content.strip():
             raise PlanContentValidationError("content must not be empty")
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="project.view",
+            source=source,
+        )
         event = ConversationEvent(
             id=ConversationEventId(generate_conversation_event_id()),
             project_id=project_id,
@@ -124,7 +144,7 @@ class PlanService:
             source=source,
             external_event_id=external_event_id,
             origin_kind=origin_kind,
-            content=content.strip(),
+            content=redact_sensitive_text(content.strip()),
             created_at=_now_utc_iso(),
         )
         # The repository's UNIQUE(source, external_event_id) constraint
@@ -139,16 +159,40 @@ class PlanService:
         self,
         *,
         project_id: ProjectId,
+        actor_id: UserId,
         limit: int = 100,
         offset: int = 0,
+        source: AuditSource = "system",
     ) -> list[ConversationEvent]:
+        self._authorize_project_read(
+            project_id=project_id,
+            actor_id=actor_id,
+            source=source,
+        )
         return self._plan_repo.list_conversation_events_for_project(
             project_id, limit=limit, offset=offset
         )
 
-    # ------------------------------------------------------------------
-    # Plan creation and proposal
-    # ------------------------------------------------------------------
+    def get_revision(
+        self,
+        revision_id: PlanRevisionId,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> PlanRevision:
+        self._authorize_project_read(project_id=project_id, actor_id=actor_id, source=source)
+        return self._plan_repo.get_revision(revision_id, project_id=project_id)
+
+    def list_plans(
+        self,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> list[Plan]:
+        self._authorize_project_read(project_id=project_id, actor_id=actor_id, source=source)
+        return self._plan_repo.list_plans_for_project(project_id)
 
     def create_plan(
         self,
@@ -201,6 +245,7 @@ class PlanService:
         self,
         *,
         plan_id: PlanId,
+        project_id: ProjectId,
         actor_id: UserId,
         content: PlanRevisionContent,
         source: AuditSource = "web",
@@ -220,14 +265,16 @@ class PlanService:
         contain at least one ``authenticated_human`` event; otherwise
         the proposal has no human provenance and is rejected.
         """
-        # Authorize.
-        plan = self._plan_repo.get_plan(plan_id)
+        # Authorize the supplied project before touching the plan row. The
+        # caller-provided scope is the lookup boundary; never infer it from
+        # a globally addressable plan ID.
         self._authz.require_permission(
             actor_id=actor_id,
-            project_id=plan.project_id,
+            project_id=project_id,
             permission="plan.propose",
             source=source,
         )
+        plan = self._plan_repo.get_plan(plan_id, project_id=project_id)
 
         # Validate content.
         self._validate_revision_content(content, plan.project_id)
@@ -242,8 +289,7 @@ class PlanService:
             new_plan_state = "proposed"  # edit creates a new proposed revision
         else:
             raise InvalidPlanTransitionError(
-                f"Cannot propose a revision on a plan in state "
-                f"{plan.current_state!r}"
+                f"Cannot propose a revision on a plan in state {plan.current_state!r}"
             )
 
         # Create the revision.
@@ -274,8 +320,7 @@ class PlanService:
                     target_id=revision.id.value,
                     result="success",
                     redacted_summary=(
-                        f"Proposed revision {new_revision_number} for plan "
-                        f"{plan.id.value}"
+                        f"Proposed revision {new_revision_number} for plan {plan.id.value}"
                     ),
                     correlation_id=plan.id.value,
                     created_at=_now_utc_iso(),
@@ -308,13 +353,9 @@ class PlanService:
                 try:
                     event = self._plan_repo.get_conversation_event(eid)
                     if event.project_id != project_id:
-                        errors.append(
-                            f"source event {eid} belongs to a different project"
-                        )
+                        errors.append(f"source event {eid} belongs to a different project")
                     if not event.is_authenticated_human:
-                        errors.append(
-                            f"source event {eid} is not authenticated_human"
-                        )
+                        errors.append(f"source event {eid} is not authenticated_human")
                 except ConversationEventNotFoundError:
                     errors.append(f"source event {eid} not found")
         if errors:
@@ -330,6 +371,7 @@ class PlanService:
         self,
         *,
         plan_id: PlanId,
+        project_id: ProjectId,
         actor_id: UserId,
         expected_revision_number: int,
         idempotency_key: str,
@@ -357,14 +399,14 @@ class PlanService:
         be a human (UserId), not a system identity. We additionally
         require the actor to have the ``plan.approve`` permission.
         """
-        plan = self._plan_repo.get_plan(plan_id)
         # Authorize.
         self._authz.require_permission(
             actor_id=actor_id,
-            project_id=plan.project_id,
+            project_id=project_id,
             permission="plan.approve",
             source=source,
         )
+        plan = self._plan_repo.get_plan(plan_id, project_id=project_id)
 
         # Stale revision check.
         if expected_revision_number != plan.current_revision_number:
@@ -379,13 +421,9 @@ class PlanService:
         revision = self._plan_repo.get_current_revision(plan_id)
 
         # Check for an existing approval (idempotency).
-        existing_approval = self._plan_repo.get_approval_for_revision(
-            revision.id, "approved"
-        )
+        existing_approval = self._plan_repo.get_approval_for_revision(revision.id, "approved")
         if existing_approval is not None:
-            existing_handoff = self._plan_repo.get_handoff_for_revision(
-                revision.id
-            )
+            existing_handoff = self._plan_repo.get_handoff_for_revision(revision.id)
             assert existing_handoff is not None  # invariant
             return existing_approval, existing_handoff
 
@@ -419,13 +457,17 @@ class PlanService:
             created_at=_now_utc_iso(),
         )
         with self._plan_repo._database.transaction():
+            # Re-read under BEGIN IMMEDIATE. The pre-check above is only an
+            # optimization; this read is the exactly-once claim boundary.
+            persisted_approval = self._plan_repo.get_approval_for_revision(revision.id, "approved")
+            if persisted_approval is not None:
+                persisted_handoff = self._plan_repo.get_handoff_for_revision(revision.id)
+                if persisted_handoff is None:
+                    raise RuntimeError("approved revision has no durable handoff")
+                return persisted_approval, persisted_handoff
             self._plan_repo.insert_approval(approval, commit=False)
-            self._plan_repo.update_revision_state(
-                revision.id, "approved", commit=False
-            )
-            self._plan_repo.update_plan_state(
-                plan.id, "approved", commit=False
-            )
+            self._plan_repo.update_revision_state(revision.id, "approved", commit=False)
+            self._plan_repo.update_plan_state(plan.id, "approved", commit=False)
             self._plan_repo.insert_handoff(handoff, commit=False)
             self._audit_repo.insert(
                 AuditEvent(
@@ -438,8 +480,7 @@ class PlanService:
                     target_id=revision.id.value,
                     result="success",
                     redacted_summary=(
-                        f"Approved revision {revision.revision_number} "
-                        f"of plan {plan.id.value}"
+                        f"Approved revision {revision.revision_number} of plan {plan.id.value}"
                     ),
                     correlation_id=plan.id.value,
                     created_at=_now_utc_iso(),
@@ -452,6 +493,7 @@ class PlanService:
         self,
         *,
         plan_id: PlanId,
+        project_id: ProjectId,
         actor_id: UserId,
         expected_revision_number: int,
         idempotency_key: str,
@@ -467,13 +509,13 @@ class PlanService:
         Per PLAN.md M4: "Rejection leaves no runnable execution
         request."
         """
-        plan = self._plan_repo.get_plan(plan_id)
         self._authz.require_permission(
             actor_id=actor_id,
-            project_id=plan.project_id,
+            project_id=project_id,
             permission="plan.reject",
             source=source,
         )
+        plan = self._plan_repo.get_plan(plan_id, project_id=project_id)
 
         if expected_revision_number != plan.current_revision_number:
             raise StaleRevisionError(
@@ -485,9 +527,7 @@ class PlanService:
 
         revision = self._plan_repo.get_current_revision(plan_id)
 
-        existing_rejection = self._plan_repo.get_approval_for_revision(
-            revision.id, "rejected"
-        )
+        existing_rejection = self._plan_repo.get_approval_for_revision(revision.id, "rejected")
         if existing_rejection is not None:
             return existing_rejection
 
@@ -510,12 +550,8 @@ class PlanService:
         )
         with self._plan_repo._database.transaction():
             self._plan_repo.insert_approval(approval, commit=False)
-            self._plan_repo.update_revision_state(
-                revision.id, "rejected", commit=False
-            )
-            self._plan_repo.update_plan_state(
-                plan.id, "rejected", commit=False
-            )
+            self._plan_repo.update_revision_state(revision.id, "rejected", commit=False)
+            self._plan_repo.update_plan_state(plan.id, "rejected", commit=False)
             self._audit_repo.insert(
                 AuditEvent(
                     id=AuditEventId(generate_audit_event_id()),
@@ -527,8 +563,7 @@ class PlanService:
                     target_id=revision.id.value,
                     result="success",
                     redacted_summary=(
-                        f"Rejected revision {revision.revision_number} "
-                        f"of plan {plan.id.value}"
+                        f"Rejected revision {revision.revision_number} of plan {plan.id.value}"
                     ),
                     correlation_id=plan.id.value,
                     created_at=_now_utc_iso(),
@@ -541,27 +576,145 @@ class PlanService:
     # Read operations
     # ------------------------------------------------------------------
 
-    def get_plan(self, plan_id: PlanId) -> Plan:
-        return self._plan_repo.get_plan(plan_id)
+    def get_plan(
+        self,
+        plan_id: PlanId,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> Plan:
+        self._authorize_project_read(project_id=project_id, actor_id=actor_id, source=source)
+        return self._plan_repo.get_plan(plan_id, project_id=project_id)
 
-    def get_current_revision(self, plan_id: PlanId) -> PlanRevision:
-        return self._plan_repo.get_current_revision(plan_id)
+    def get_current_revision(
+        self,
+        plan_id: PlanId,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> PlanRevision:
+        self._authorize_project_read(project_id=project_id, actor_id=actor_id, source=source)
+        return self._plan_repo.get_current_revision(plan_id, project_id=project_id)
 
-    def list_revisions(self, plan_id: PlanId) -> list[PlanRevision]:
-        return self._plan_repo.list_revisions_for_plan(plan_id)
+    def list_revisions(
+        self,
+        plan_id: PlanId,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> list[PlanRevision]:
+        self._authorize_project_read(project_id=project_id, actor_id=actor_id, source=source)
+        return self._plan_repo.list_revisions_for_plan(plan_id, project_id=project_id)
 
-    def list_plans_for_project(self, project_id: ProjectId) -> list[Plan]:
+    def list_plans_for_project(
+        self,
+        project_id: ProjectId,
+        *,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> list[Plan]:
+        self._authorize_project_read(project_id=project_id, actor_id=actor_id, source=source)
         return self._plan_repo.list_plans_for_project(project_id)
 
-    def get_handoff(self, handoff_id: PlanHandoffId) -> PlanHandoff:
-        return self._plan_repo.get_handoff(handoff_id)
+    def get_handoff(
+        self,
+        handoff_id: PlanHandoffId,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> PlanHandoff:
+        self._authorize_project_read(project_id=project_id, actor_id=actor_id, source=source)
+        return self._plan_repo.get_handoff(handoff_id, project_id=project_id)
 
     def get_handoff_for_revision(
-        self, revision_id: PlanRevisionId
+        self,
+        revision_id: PlanRevisionId,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> PlanHandoff | None:
-        return self._plan_repo.get_handoff_for_revision(revision_id)
+        self._authorize_project_read(project_id=project_id, actor_id=actor_id, source=source)
+        return self._plan_repo.get_handoff_for_revision(revision_id, project_id=project_id)
 
     def list_handoffs_for_project(
-        self, project_id: ProjectId
+        self,
+        project_id: ProjectId,
+        *,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> list[PlanHandoff]:
+        self._authorize_project_read(project_id=project_id, actor_id=actor_id, source=source)
         return self._plan_repo.list_handoffs_for_project(project_id)
+
+    def list_unclaimed_handoffs(
+        self,
+        project_id: ProjectId,
+        *,
+        limit: int = 8,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> list[PlanHandoff]:
+        """Authorized listing of approved handoffs without executions."""
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.start",
+            source=source,
+        )
+        return self._plan_repo.list_unclaimed_handoffs(project_id, limit=limit)
+
+    def get_conversation_event_scoped(
+        self,
+        event_id: ConversationEventId,
+        *,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> ConversationEvent:
+        """Load one conversation event and authorize the caller's scope.
+
+        The event itself carries its project, so the authorization check
+        runs against that project after the row is loaded.
+        """
+        event = self._plan_repo.get_conversation_event(event_id)
+        self._authorize_project_read(
+            project_id=event.project_id,
+            actor_id=actor_id,
+            source=source,
+        )
+        return event
+
+    def find_revision_by_source_event(
+        self,
+        *,
+        project_id: ProjectId,
+        event_id: ConversationEventId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> PlanRevision | None:
+        """Idempotency probe: an existing revision sourced from ``event_id``."""
+        self._authorize_project_read(project_id=project_id, actor_id=actor_id, source=source)
+        return self._plan_repo.find_revision_by_source_event(
+            project_id=project_id,
+            event_id=event_id,
+        )
+
+    def get_conversation_event_by_external(
+        self,
+        *,
+        project_id: ProjectId,
+        source: str,
+        external_event_id: str,
+        actor_id: UserId,
+    ) -> ConversationEvent | None:
+        """Authorized idempotency lookup by transport event identity."""
+        self._authorize_project_read(project_id=project_id, actor_id=actor_id, source="system")
+        return self._plan_repo.get_conversation_event_by_external(
+            project_id=project_id,
+            source=source,
+            external_event_id=external_event_id,
+        )

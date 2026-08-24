@@ -1,11 +1,11 @@
-"""Adapters — external transports and SDKs.
+"""External transport adapters.
 
-This package depends on :mod:`zero.domain` and :mod:`zero.app`. It is
-the outermost layer and is never imported by ``domain/``, ``app/``, or
-``persistence/``.
-
-Phase 1 has no real adapters yet. The HTTP boundary in
-:mod:`zero.app.api` is technically an adapter, but it lives in ``app/``
-because FastAPI's router is the application's primary entry surface.
-Future external adapters (Telegram, Discord, providers) will live here.
+Adapters depend on the canonical domain event envelope and an injected
+transport.  They do not own project state or credentials.
 """
+
+from .discord import DiscordAdapter
+from .messaging import RetryPolicy, safe_render_text
+from .telegram import TelegramAdapter
+
+__all__ = ["DiscordAdapter", "RetryPolicy", "TelegramAdapter", "safe_render_text"]

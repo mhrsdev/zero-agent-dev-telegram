@@ -36,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from zero.domain.identity import ProjectId
+from zero.domain.identity import ProjectId, UserId
 
 #: Prefix for Artifact IDs.
 ARTIFACT_ID_PREFIX = "art_"
@@ -71,8 +71,7 @@ class ArtifactId:
             raise ValueError("ArtifactId must be a non-empty string")
         if not self.value.startswith(ARTIFACT_ID_PREFIX):
             raise ValueError(
-                f"ArtifactId must start with "
-                f"{ARTIFACT_ID_PREFIX!r}; got {self.value!r}"
+                f"ArtifactId must start with {ARTIFACT_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -114,6 +113,30 @@ class Artifact:
 
 
 @dataclass(frozen=True)
+class ArtifactProvenanceId:
+    """Stable identity for one provenance occurrence of an artifact."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if not self.value.startswith("ap_"):
+            raise ValueError("ArtifactProvenanceId must start with 'ap_'")
+
+
+@dataclass(frozen=True)
+class ArtifactProvenance:
+    """Immutable producer/provenance occurrence for deduplicated bytes."""
+
+    id: ArtifactProvenanceId
+    project_id: ProjectId
+    artifact_id: ArtifactId
+    actor_id: UserId
+    producer: str | None
+    provenance: str | None
+    created_at: str = ""
+
+
+@dataclass(frozen=True)
 class ArtifactHandle:
     """A bounded, read-only model-facing handle to an artifact.
 
@@ -151,13 +174,9 @@ class ArtifactHandle:
 # RAG document types
 # ----------------------------------------------------------------------
 
-RagSourceType = Literal[
-    "plan_revision", "task_result", "knowledge_record", "artifact", "manual"
-]
+RagSourceType = Literal["plan_revision", "task_result", "knowledge_record", "artifact", "manual"]
 
-RagDocumentState = Literal[
-    "candidate", "approved", "superseded", "archived"
-]
+RagDocumentState = Literal["candidate", "approved", "superseded", "archived"]
 
 
 @dataclass(frozen=True)
@@ -171,8 +190,7 @@ class RagDocumentId:
             raise ValueError("RagDocumentId must be a non-empty string")
         if not self.value.startswith(RAG_DOCUMENT_ID_PREFIX):
             raise ValueError(
-                f"RagDocumentId must start with "
-                f"{RAG_DOCUMENT_ID_PREFIX!r}; got {self.value!r}"
+                f"RagDocumentId must start with {RAG_DOCUMENT_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:

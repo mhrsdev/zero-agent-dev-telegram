@@ -27,9 +27,7 @@ class BootstrapError(RuntimeError):
     """The one-time bootstrap boundary rejected the request."""
 
 
-_current_actor: ContextVar[UserId | None] = ContextVar(
-    "zero_current_actor", default=None
-)
+_current_actor: ContextVar[UserId | None] = ContextVar("zero_current_actor", default=None)
 
 
 def _now() -> datetime:
@@ -86,9 +84,7 @@ class AuthService:
                 )
             else:
                 if existing_user_id is None:
-                    raise BootstrapError(
-                        "existing_user_id is required for an upgraded database"
-                    )
+                    raise BootstrapError("existing_user_id is required for an upgraded database")
                 user = self._identity.get_user(existing_user_id)
             token, expires_at = self._issue(user.id)
         return user, token, expires_at
@@ -106,8 +102,7 @@ class AuthService:
         token_id = f"tok_{secrets.token_urlsafe(18)}"
         conn = self._database.connect()
         conn.execute(
-            "INSERT INTO access_tokens "
-            "(id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO access_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
             (token_id, user_id.value, _token_hash(token), expires_at),
         )
         self._audit_repo.insert(

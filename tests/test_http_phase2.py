@@ -24,9 +24,7 @@ async def test_create_user_endpoint() -> None:
     app = create_app(settings)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        response = await ac.post(
-            "/users", json={"display_name": "HTTP Alice"}
-        )
+        response = await ac.post("/users", json={"display_name": "HTTP Alice"})
     assert response.status_code == 201
     body = response.json()
     assert body["id"].startswith("zu_")
@@ -40,9 +38,7 @@ async def test_create_project_endpoint() -> None:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         # Create a user first.
-        user_resp = await ac.post(
-            "/users", json={"display_name": "Owner"}
-        )
+        user_resp = await ac.post("/users", json={"display_name": "Owner"})
         user_id = user_resp.json()["id"]
         # Create a project.
         proj_resp = await ac.post(
@@ -64,9 +60,7 @@ async def test_authorize_endpoint_returns_decision() -> None:
         # Create user and project.
         user_resp = await ac.post("/users", json={"display_name": "Owner"})
         user_id = user_resp.json()["id"]
-        proj_resp = await ac.post(
-            "/projects", json={"owner_id": user_id, "name": "Project A"}
-        )
+        proj_resp = await ac.post("/projects", json={"owner_id": user_id, "name": "Project A"})
         project_id = proj_resp.json()["id"]
         # Check authorization: owner should be allowed project.view.
         authz_resp = await ac.post(
@@ -88,14 +82,10 @@ async def test_authorize_endpoint_denies_non_member() -> None:
         # Create owner and project.
         owner_resp = await ac.post("/users", json={"display_name": "Owner"})
         owner_id = owner_resp.json()["id"]
-        proj_resp = await ac.post(
-            "/projects", json={"owner_id": owner_id, "name": "Project A"}
-        )
+        proj_resp = await ac.post("/projects", json={"owner_id": owner_id, "name": "Project A"})
         project_id = proj_resp.json()["id"]
         # Create a non-member.
-        non_member_resp = await ac.post(
-            "/users", json={"display_name": "Outsider"}
-        )
+        non_member_resp = await ac.post("/users", json={"display_name": "Outsider"})
         non_member_id = non_member_resp.json()["id"]
         # Check authorization: non-member should be denied.
         authz_resp = await ac.post(
@@ -115,9 +105,7 @@ async def test_audit_endpoint_returns_events() -> None:
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         user_resp = await ac.post("/users", json={"display_name": "Owner"})
         user_id = user_resp.json()["id"]
-        proj_resp = await ac.post(
-            "/projects", json={"owner_id": user_id, "name": "Project A"}
-        )
+        proj_resp = await ac.post("/projects", json={"owner_id": user_id, "name": "Project A"})
         project_id = proj_resp.json()["id"]
         # List audit events for the project.
         audit_resp = await ac.get(f"/projects/{project_id}/audit")
@@ -136,9 +124,7 @@ async def test_tool_invocation_endpoint() -> None:
         # Setup: user, project.
         user_resp = await ac.post("/users", json={"display_name": "Owner"})
         user_id = user_resp.json()["id"]
-        proj_resp = await ac.post(
-            "/projects", json={"owner_id": user_id, "name": "Project A"}
-        )
+        proj_resp = await ac.post("/projects", json={"owner_id": user_id, "name": "Project A"})
         project_id = proj_resp.json()["id"]
         # Register the echo tool. We need to do this through the service
         # because the API doesn't expose tool registration (only
@@ -179,9 +165,7 @@ async def test_tool_invocation_without_grant_returns_403() -> None:
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         user_resp = await ac.post("/users", json={"display_name": "Owner"})
         user_id = user_resp.json()["id"]
-        proj_resp = await ac.post(
-            "/projects", json={"owner_id": user_id, "name": "Project A"}
-        )
+        proj_resp = await ac.post("/projects", json={"owner_id": user_id, "name": "Project A"})
         project_id = proj_resp.json()["id"]
         app.state.services.tools.register_echo_tool()
         # No grant created.
@@ -207,9 +191,7 @@ async def test_secret_storage_endpoint_never_returns_value() -> None:
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         user_resp = await ac.post("/users", json={"display_name": "Owner"})
         user_id = user_resp.json()["id"]
-        proj_resp = await ac.post(
-            "/projects", json={"owner_id": user_id, "name": "Project A"}
-        )
+        proj_resp = await ac.post("/projects", json={"owner_id": user_id, "name": "Project A"})
         project_id = proj_resp.json()["id"]
         secret_value = "sk-never-leak-me-http-12345"
         store_resp = await ac.post(

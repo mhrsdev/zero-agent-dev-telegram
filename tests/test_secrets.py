@@ -52,9 +52,7 @@ def services(secret_settings: Settings):
 @pytest.fixture
 def project_with_owner(services):
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Secret Test Project"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="Secret Test Project")
     return owner, project
 
 
@@ -91,14 +89,14 @@ def test_resolve_value_returns_raw_value(services, project_with_owner) -> None:
         actor_id=owner.id,
     )
     raw = services.secrets.resolve_value(
-        project_id=project.id, secret_id=secret_ref.id
+        project_id=project.id,
+        secret_id=secret_ref.id,
+        actor_id=owner.id,
     )
     assert raw == "sk-super-secret-12345"
 
 
-def test_stored_secret_is_encrypted_at_rest(
-    secret_settings: Settings, project_with_owner
-) -> None:
+def test_stored_secret_is_encrypted_at_rest(secret_settings: Settings, project_with_owner) -> None:
     """Per zero-control-plane-trust §"Secrets are usable without being
     visible": the raw value is NEVER stored. The database contains
     only the encrypted ciphertext.
@@ -107,9 +105,7 @@ def test_stored_secret_is_encrypted_at_rest(
     apply_migrations(database)
     services = build_services(secret_settings, database)
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Project A"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="Project A")
     raw_value = "sk-never-store-me-plaintext-12345"
     services.secrets.store(
         project_id=project.id,
@@ -138,9 +134,7 @@ def test_stored_secret_is_encrypted_at_rest(
 # ----------------------------------------------------------------------
 
 
-def test_revoked_secret_cannot_be_resolved(
-    services, project_with_owner
-) -> None:
+def test_revoked_secret_cannot_be_resolved(services, project_with_owner) -> None:
     owner, project = project_with_owner
     secret_ref = services.secrets.store(
         project_id=project.id,
@@ -156,11 +150,15 @@ def test_revoked_secret_cannot_be_resolved(
     )
     with pytest.raises(SecretRevokedError):
         services.secrets.resolve_value(
-            project_id=project.id, secret_id=secret_ref.id
+            project_id=project.id,
+            secret_id=secret_ref.id,
+            actor_id=owner.id,
         )
     # The reference metadata shows revoked_at is set.
     ref = services.secrets.get_reference(
-        project_id=project.id, secret_id=secret_ref.id
+        project_id=project.id,
+        secret_id=secret_ref.id,
+        actor_id=owner.id,
     )
     assert ref.is_revoked
 
@@ -171,22 +169,22 @@ def test_revoked_secret_cannot_be_resolved(
 
 
 def test_get_reference_raises_for_nonexistent(services, project_with_owner) -> None:
-    _, project = project_with_owner
+    owner, project = project_with_owner
     with pytest.raises(SecretNotFoundError):
         services.secrets.get_reference(
             project_id=project.id,
             secret_id=SecretReferenceId("sec_nonexistent"),
+            actor_id=owner.id,
         )
 
 
-def test_resolve_value_raises_for_nonexistent(
-    services, project_with_owner
-) -> None:
-    _, project = project_with_owner
+def test_resolve_value_raises_for_nonexistent(services, project_with_owner) -> None:
+    owner, project = project_with_owner
     with pytest.raises(SecretNotFoundError):
         services.secrets.resolve_value(
             project_id=project.id,
             secret_id=SecretReferenceId("sec_nonexistent"),
+            actor_id=owner.id,
         )
 
 
@@ -228,9 +226,7 @@ def test_store_without_secret_key_raises(test_settings: Settings) -> None:
     apply_migrations(database)
     services = build_services(test_settings, database)
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Project A"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="Project A")
     with pytest.raises(SecretResolutionError, match="ZERO_SECRET_KEY"):
         services.secrets.store(
             project_id=project.id,
@@ -246,9 +242,7 @@ def test_store_without_secret_key_raises(test_settings: Settings) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_secret_store_audited_without_value(
-    services, project_with_owner
-) -> None:
+def test_secret_store_audited_without_value(services, project_with_owner) -> None:
     """Per zero-control-plane-trust §"Audit is evidence, not a
     transcript dump": the audit event for storing a secret must
     contain the secret ID but NOT the value, the name, or any
@@ -262,10 +256,10 @@ def test_secret_store_audited_without_value(
         value=raw_value,
         actor_id=owner.id,
     )
-    events = services.audit.list_for_project(project_id=project.id, actor_id=project.owner_user_id, limit=50)
-    secret_events = [
-        e for e in events if e.operation == "secret.store"
-    ]
+    events = services.audit.list_for_project(
+        project_id=project.id, actor_id=project.owner_user_id, limit=50
+    )
+    secret_events = [e for e in events if e.operation == "secret.store"]
     assert len(secret_events) >= 1
     event = secret_events[0]
     assert event.target_id == secret_ref.id.value
@@ -283,13 +277,9 @@ def test_secret_cannot_be_resolved_from_other_project(services) -> None:
     """Per zero-project-isolation-evidence: a secret stored in project
     A must not be resolvable from project B."""
     owner_a = services.identity.create_user(display_name="Owner A")
-    project_a = services.identity.create_project(
-        owner_id=owner_a.id, name="Project A"
-    )
+    project_a = services.identity.create_project(owner_id=owner_a.id, name="Project A")
     owner_b = services.identity.create_user(display_name="Owner B")
-    project_b = services.identity.create_project(
-        owner_id=owner_b.id, name="Project B"
-    )
+    project_b = services.identity.create_project(owner_id=owner_b.id, name="Project B")
     secret_ref = services.secrets.store(
         project_id=project_a.id,
         name="api_key",
@@ -299,7 +289,9 @@ def test_secret_cannot_be_resolved_from_other_project(services) -> None:
     )
     with pytest.raises(SecretNotFoundError):
         services.secrets.resolve_value(
-            project_id=project_b.id, secret_id=secret_ref.id
+            project_id=project_b.id,
+            secret_id=secret_ref.id,
+            actor_id=owner_b.id,
         )
 
 
@@ -308,9 +300,7 @@ def test_secret_cannot_be_resolved_from_other_project(services) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_list_secrets_returns_metadata_only(
-    services, project_with_owner
-) -> None:
+def test_list_secrets_returns_metadata_only(services, project_with_owner) -> None:
     owner, project = project_with_owner
     services.secrets.store(
         project_id=project.id,

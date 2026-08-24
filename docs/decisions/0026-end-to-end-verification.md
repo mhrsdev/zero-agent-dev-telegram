@@ -61,7 +61,7 @@ Per PLAN.md M15:
 - ✅ Token/accounting replay and deduplication: PASS (covered by
   test_providers).
 - ✅ Secret canary scan: zero leaks (verified in E2E test).
-- ✅ Backup/restore drill: PASS (covered by test_observability).
+- ⚠️ Backup/restore drill: isolated round-trip and failure-preservation checks PASS (covered by test_observability); production operational exposure remains deployment-gated.
 - ✅ Website accessibility and real-browser flow: PASS (covered by
   test_web).
 - ✅ Secondary interface idempotency and scope enforcement: PASS
@@ -84,5 +84,5 @@ remains a separate owner-authorized action.
   proven in an isolated realistic environment.
 - Zero cross-project leakage is verified adversarially.
 - Secret canary scan confirms zero leaks.
-- Backup/restore drill confirms data integrity.
-- All 15 milestones are VERIFIED.
+- Isolated backup/restore drills confirm encrypted data integrity and failure preservation; production operational exposure remains gated until an owner-authorized interface is delivered.
+- The isolated M15 verification checks are complete; this record does not authorize production rollout.

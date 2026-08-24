@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from typing import Any
 
-from zero.domain.agent_types import AgentTypeId
+from zero.app.authorization_service import AuthorizationService
+from zero.domain.agent_types import AgentTypeId, AgentTypeNotFoundError
 from zero.domain.context import (
     InjectionLedger,
     InjectionLedgerId,
@@ -42,7 +44,7 @@ from zero.domain.context import (
     estimate_tokens,
 )
 from zero.domain.execution import ExecutionId
-from zero.domain.identity import ProjectId
+from zero.domain.identity import ProjectId, UserId
 from zero.domain.ids import generate_injection_ledger_id
 from zero.persistence.repositories.agent_type_repository import (
     AgentTypeRepository,
@@ -59,6 +61,27 @@ def _now_utc_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _knowledge_relevance(query: str, content: str) -> float:
+    """Term-overlap relevance for agent knowledge records.
+
+    A full verbatim query match still dominates (1.0); otherwise the
+    score is proportional to how many distinctive query terms appear in
+    the record, so a multi-word query no longer has to occur as one
+    verbatim substring to rank relevantly.
+    """
+    import re
+
+    query_terms = {term for term in re.findall(r"[a-z0-9_]+", query.lower()) if len(term) > 2}
+    content_lower = content.lower()
+    if not query_terms:
+        return 0.1
+    if all(term in content_lower for term in query_terms):
+        return 1.0
+    hits = sum(1 for term in query_terms if term in content_lower)
+    coverage = hits / len(query_terms)
+    return max(0.1, round(coverage, 4))
+
+
 class RetrievalRouter:
     """Staged retrieval router: authorize, generate, rank, dedup, budget,
     render, record.
@@ -72,16 +95,19 @@ class RetrievalRouter:
         artifact_repo: ArtifactRepository,
         agent_type_repo: AgentTypeRepository,
         context_repo: ContextRepository,
+        authorization_service: AuthorizationService,
     ) -> None:
         self._artifact_repo = artifact_repo
         self._agent_type_repo = agent_type_repo
         self._context_repo = context_repo
+        self._authz = authorization_service
 
     def retrieve(
         self,
         *,
         project_id: ProjectId,
         execution_id: ExecutionId,
+        actor_id: UserId,
         agent_type_id: AgentTypeId | None,
         query: str,
         budget_tokens: int,
@@ -103,13 +129,18 @@ class RetrievalRouter:
         candidate retrieval": all repository queries filter by
         project_id before any content is loaded.
         """
+        if budget_tokens < 0:
+            raise ValueError("budget_tokens must be non-negative")
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="project.view",
+        )
         # 1+2. Generate candidates from RAG and agent memory.
         candidates: list[RetrievalCandidate] = []
         # RAG candidates.
         if query.strip():
-            rag_results = self._artifact_repo.search_rag(
-                project_id, query, limit=20
-            )
+            rag_results = self._artifact_repo.search_rag(project_id, query, limit=20)
             for doc, score in rag_results:
                 candidates.append(
                     RetrievalCandidate(
@@ -123,18 +154,18 @@ class RetrievalRouter:
                 )
         # Agent memory candidates.
         if agent_type_id is not None:
+            try:
+                self._agent_type_repo.get_agent_type(project_id, agent_type_id)
+            except AgentTypeNotFoundError as exc:
+                raise ValueError("agent type does not belong to project") from exc
             knowledge = self._agent_type_repo.list_knowledge_for_type(
                 agent_type_id, include_archived=False
             )
             for record in knowledge:
-                # Simple relevance: if the query appears in the content,
-                # give it a higher score.
-                content_lower = record.content.lower()
-                query_lower = query.lower()
-                if query_lower and query_lower in content_lower:
-                    score = 1.0
-                else:
-                    score = 0.1  # low relevance, but still a candidate
+                # Term-overlap relevance rather than verbatim-substring
+                # gating: distinctive query terms are matched
+                # individually and coverage drives the score.
+                score = _knowledge_relevance(query, record.content)
                 candidates.append(
                     RetrievalCandidate(
                         source="knowledge_record",
@@ -173,9 +204,7 @@ class RetrievalRouter:
             project_id=project_id,
             execution_id=execution_id,
             context_version=context_version,
-            selected=tuple(
-                (c.source, c.record_id, c.token_count) for c in selected
-            ),
+            selected=tuple((c.source, c.record_id, c.token_count) for c in selected),
             omitted=tuple(omitted),
             total_candidates=len(deduped),
             total_tokens=used_tokens,
@@ -214,6 +243,7 @@ class ContextBuilder:
         *,
         project_id: ProjectId,
         execution_id: ExecutionId,
+        actor_id: UserId,
         agent_type_id: AgentTypeId | None,
         system_message: str,
         user_prefix: str,
@@ -253,13 +283,12 @@ class ContextBuilder:
         )
         # 5. Retrieve.
         # Determine the next context version number.
-        version_count = self._context_repo.count_context_versions(
-            execution_id
-        )
+        version_count = self._context_repo.count_context_versions(execution_id)
         context_version = version_count + 1
         candidates, ledger = self._router.retrieve(
             project_id=project_id,
             execution_id=execution_id,
+            actor_id=actor_id,
             agent_type_id=agent_type_id,
             query=query,
             budget_tokens=max(0, retrieval_budget),
@@ -292,4 +321,97 @@ class ContextBuilder:
             parts.append(conv_text)
             parts.append("")
         context_text = "\n".join(parts)
+
+        # Persist a durable ContextVersion for every rendered context.
+        # Per the release audit (§5.3): normal runtime execution must
+        # persist a normal ContextVersion so compaction, recovery, and
+        # token accounting operate on real state rather than only on
+        # compaction-created versions.
+        total_tokens = fixed_tokens + conv_tokens + ledger.total_tokens
+        self._persist_context_version(
+            project_id=project_id,
+            execution_id=execution_id,
+            version=context_version,
+            system_message=system_message,
+            user_prefix=user_prefix,
+            plan_contract=plan_contract,
+            execution_snapshot=execution_snapshot,
+            retrieved_context=json.dumps(
+                [
+                    {"source": source, "record_id": record_id, "tokens": tokens}
+                    for source, record_id, tokens in ledger.selected
+                ]
+            ),
+            conversation_tail=conv_text,
+            token_count=total_tokens,
+        )
         return context_text, ledger
+
+    def _persist_context_version(
+        self,
+        *,
+        project_id: Any,
+        execution_id: Any,
+        version: int,
+        system_message: str,
+        user_prefix: str,
+        plan_contract: str,
+        execution_snapshot: str,
+        retrieved_context: str,
+        conversation_tail: str,
+        token_count: int,
+    ) -> None:
+        import logging
+        from datetime import UTC, datetime
+
+        from zero.domain.context import ContextVersion, ContextVersionId
+        from zero.domain.execution import ExecutionId
+        from zero.domain.identity import ProjectId
+        from zero.domain.ids import generate_context_version_id
+
+        logger = logging.getLogger(__name__)
+        try:
+            # Version allocation happens inside the same BEGIN IMMEDIATE
+            # write transaction as the insert and activation so two
+            # concurrent builders cannot collide on the version number.
+            with self._context_repo.database.transaction():
+                actual_version = self._context_repo.count_context_versions(execution_id) + 1
+                if actual_version != version:
+                    logger.debug(
+                        "context version drifted from %s to %s for execution %s",
+                        version,
+                        actual_version,
+                        execution_id.value,
+                    )
+                cv = ContextVersion(
+                    id=ContextVersionId(generate_context_version_id()),
+                    project_id=ProjectId(project_id.value),
+                    execution_id=ExecutionId(execution_id.value),
+                    version=actual_version,
+                    active=True,
+                    system_message=system_message,
+                    user_prefix=user_prefix,
+                    plan_contract=plan_contract,
+                    execution_snapshot=execution_snapshot,
+                    retrieved_context=retrieved_context,
+                    conversation_tail=conversation_tail,
+                    compaction_summary="",
+                    transcript_artifact_id=None,
+                    token_count=token_count,
+                    created_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                )
+                self._context_repo.insert_context_version(cv, commit=False)
+                self._context_repo.activate_context_version(
+                    execution_id,
+                    actual_version,
+                    commit=False,
+                )
+        except Exception as exc:  # noqa: BLE001 - persistence must not break prompts
+            # A persistence failure must not break prompt assembly; the
+            # ledger already records the injection facts. It is surfaced
+            # loudly rather than swallowed silently.
+            logger.warning(
+                "context version persistence skipped for execution %s: %s",
+                execution_id.value,
+                type(exc).__name__,
+            )

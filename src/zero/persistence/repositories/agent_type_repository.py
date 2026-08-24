@@ -21,6 +21,8 @@ from zero.domain.agent_types import (
     AgentTypeId,
     AgentTypeNotFoundError,
     AgentTypeState,
+    ConcurrencyLimitExceededError,
+    InvalidAgentTypeTransitionError,
     KnowledgeRecord,
     KnowledgeRecordId,
     KnowledgeRecordNotFoundError,
@@ -30,6 +32,7 @@ from zero.domain.agent_types import (
 )
 from zero.domain.execution import TaskId
 from zero.domain.identity import ProjectId
+from zero.domain.ids import generate_agent_instance_id
 from zero.persistence.connection import Database
 
 
@@ -46,9 +49,7 @@ def _row_to_agent_type(row: sqlite3.Row) -> AgentType:
         max_concurrent_instances=row["max_concurrent_instances"],
         state=row["state"],  # type: ignore[arg-type]
         version=row["version"],
-        superseded_by=AgentTypeId(row["superseded_by"])
-        if row["superseded_by"]
-        else None,
+        superseded_by=AgentTypeId(row["superseded_by"]) if row["superseded_by"] else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -70,20 +71,14 @@ def _row_to_knowledge(row: sqlite3.Row) -> KnowledgeRecord:
     return KnowledgeRecord(
         id=KnowledgeRecordId(row["id"]),
         project_id=ProjectId(row["project_id"]),
-        agent_type_id=AgentTypeId(row["agent_type_id"])
-        if row["agent_type_id"]
-        else None,
+        agent_type_id=AgentTypeId(row["agent_type_id"]) if row["agent_type_id"] else None,
         kind=row["kind"],  # type: ignore[arg-type]
         content=row["content"],
         content_hash=row["content_hash"],
         provenance=row["provenance"],
         state=row["state"],  # type: ignore[arg-type]
-        superseded_by=KnowledgeRecordId(row["superseded_by"])
-        if row["superseded_by"]
-        else None,
-        migrated_from=KnowledgeRecordId(row["migrated_from"])
-        if row["migrated_from"]
-        else None,
+        superseded_by=KnowledgeRecordId(row["superseded_by"]) if row["superseded_by"] else None,
+        migrated_from=KnowledgeRecordId(row["migrated_from"]) if row["migrated_from"] else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -107,13 +102,16 @@ class AgentTypeRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
 
+    @property
+    def database(self) -> Database:
+        """The underlying database (public transaction boundary)."""
+        return self._database
+
     # ------------------------------------------------------------------
     # Agent types
     # ------------------------------------------------------------------
 
-    def insert_agent_type(
-        self, agent_type: AgentType, *, commit: bool = True
-    ) -> None:
+    def insert_agent_type(self, agent_type: AgentType, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -150,9 +148,7 @@ class AgentTypeRepository:
                 ) from exc
             raise
 
-    def get_agent_type(
-        self, project_id: ProjectId, type_id: AgentTypeId
-    ) -> AgentType:
+    def get_agent_type(self, project_id: ProjectId, type_id: AgentTypeId) -> AgentType:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, name, responsibility, memory_scope, "
@@ -164,9 +160,7 @@ class AgentTypeRepository:
         )
         row = cursor.fetchone()
         if row is None:
-            raise AgentTypeNotFoundError(
-                f"Agent type {type_id} not found in project {project_id}"
-            )
+            raise AgentTypeNotFoundError(f"Agent type {type_id} not found in project {project_id}")
         return _row_to_agent_type(row)
 
     def list_agent_types_for_project(
@@ -263,9 +257,7 @@ class AgentTypeRepository:
     # Agent instances
     # ------------------------------------------------------------------
 
-    def insert_instance(
-        self, instance: AgentInstance, *, commit: bool = True
-    ) -> None:
+    def insert_instance(self, instance: AgentInstance, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -287,9 +279,7 @@ class AgentTypeRepository:
                 conn.rollback()
             raise
 
-    def get_instance(
-        self, instance_id: AgentInstanceId
-    ) -> AgentInstance:
+    def get_instance(self, instance_id: AgentInstanceId) -> AgentInstance:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, agent_type_id, task_id, state, "
@@ -298,14 +288,10 @@ class AgentTypeRepository:
         )
         row = cursor.fetchone()
         if row is None:
-            raise AgentInstanceNotFoundError(
-                f"Agent instance {instance_id} not found"
-            )
+            raise AgentInstanceNotFoundError(f"Agent instance {instance_id} not found")
         return _row_to_instance(row)
 
-    def list_instances_for_type(
-        self, type_id: AgentTypeId
-    ) -> list[AgentInstance]:
+    def list_instances_for_type(self, type_id: AgentTypeId) -> list[AgentInstance]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, agent_type_id, task_id, state, "
@@ -318,11 +304,75 @@ class AgentTypeRepository:
     def count_running_instances(self, type_id: AgentTypeId) -> int:
         conn = self._database.connect()
         cursor = conn.execute(
-            "SELECT COUNT(*) FROM agent_instances "
-            "WHERE agent_type_id = ? AND state = 'running'",
+            "SELECT COUNT(*) FROM agent_instances WHERE agent_type_id = ? AND state = 'running'",
             (type_id.value,),
         )
         return int(cursor.fetchone()[0])
+
+    def lease_instance_for_task(
+        self,
+        *,
+        project_id: ProjectId,
+        type_id: AgentTypeId,
+        task_id: TaskId,
+    ) -> AgentInstance:
+        """Create one ``running`` instance of ``type_id`` bound to a task.
+
+        The concurrency check and the insert happen inside one
+        ``BEGIN IMMEDIATE`` transaction so two schedulers on the same
+        database cannot both observe free capacity and exceed the
+        type's ``max_concurrent_instances`` limit (the read-then-write
+        race called out in the release audit).
+        """
+        with self._database.transaction() as conn:
+            agent_type = self.get_agent_type(project_id, type_id)
+            if agent_type.state != "active":
+                raise InvalidAgentTypeTransitionError(
+                    f"Agent type {type_id.value} is {agent_type.state!r}; "
+                    "only active types can lease instances"
+                )
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM agent_instances "
+                "WHERE agent_type_id = ? AND state = 'running'",
+                (type_id.value,),
+            )
+            running = int(cursor.fetchone()[0])
+            if running >= agent_type.max_concurrent_instances:
+                raise ConcurrencyLimitExceededError(
+                    f"Agent type {type_id.value} already has {running} running "
+                    f"instance(s); max_concurrent_instances="
+                    f"{agent_type.max_concurrent_instances}"
+                )
+            instance = AgentInstance(
+                id=AgentInstanceId(generate_agent_instance_id()),
+                project_id=project_id,
+                agent_type_id=type_id,
+                task_id=task_id,
+                state="running",
+                created_at="",
+                updated_at="",
+            )
+            conn.execute(
+                "INSERT INTO agent_instances "
+                "(id, project_id, agent_type_id, task_id, state) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    instance.id.value,
+                    instance.project_id.value,
+                    instance.agent_type_id.value,
+                    instance.task_id.value if instance.task_id else None,
+                    instance.state,
+                ),
+            )
+        return instance
+
+    def finish_instance(
+        self,
+        instance_id: AgentInstanceId,
+        new_state: AgentInstanceState,
+    ) -> None:
+        """Move a leased instance to a terminal/reusable state."""
+        self.update_instance_state(instance_id, new_state)
 
     def update_instance_state(
         self,
@@ -348,9 +398,7 @@ class AgentTypeRepository:
                 (new_state, instance_id.value),
             )
         if cursor.rowcount == 0:
-            raise AgentInstanceNotFoundError(
-                f"Agent instance {instance_id} not found"
-            )
+            raise AgentInstanceNotFoundError(f"Agent instance {instance_id} not found")
         if commit:
             conn.commit()
 
@@ -358,9 +406,7 @@ class AgentTypeRepository:
     # Knowledge records
     # ------------------------------------------------------------------
 
-    def insert_knowledge(
-        self, record: KnowledgeRecord, *, commit: bool = True
-    ) -> None:
+    def insert_knowledge(self, record: KnowledgeRecord, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -372,20 +418,14 @@ class AgentTypeRepository:
                 (
                     record.id.value,
                     record.project_id.value,
-                    record.agent_type_id.value
-                    if record.agent_type_id
-                    else None,
+                    record.agent_type_id.value if record.agent_type_id else None,
                     record.kind,
                     record.content,
                     record.content_hash,
                     record.provenance,
                     record.state,
-                    record.superseded_by.value
-                    if record.superseded_by
-                    else None,
-                    record.migrated_from.value
-                    if record.migrated_from
-                    else None,
+                    record.superseded_by.value if record.superseded_by else None,
+                    record.migrated_from.value if record.migrated_from else None,
                 ),
             )
             if commit:
@@ -395,9 +435,7 @@ class AgentTypeRepository:
                 conn.rollback()
             raise
 
-    def get_knowledge(
-        self, record_id: KnowledgeRecordId
-    ) -> KnowledgeRecord:
+    def get_knowledge(self, record_id: KnowledgeRecordId) -> KnowledgeRecord:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, agent_type_id, kind, content, "
@@ -408,9 +446,7 @@ class AgentTypeRepository:
         )
         row = cursor.fetchone()
         if row is None:
-            raise KnowledgeRecordNotFoundError(
-                f"Knowledge record {record_id} not found"
-            )
+            raise KnowledgeRecordNotFoundError(f"Knowledge record {record_id} not found")
         return _row_to_knowledge(row)
 
     def list_knowledge_for_type(
@@ -500,9 +536,7 @@ class AgentTypeRepository:
                 (new_state, record_id.value),
             )
         if cursor.rowcount == 0:
-            raise KnowledgeRecordNotFoundError(
-                f"Knowledge record {record_id} not found"
-            )
+            raise KnowledgeRecordNotFoundError(f"Knowledge record {record_id} not found")
         if commit:
             conn.commit()
 
@@ -533,9 +567,7 @@ class AgentTypeRepository:
             ),
         )
         if cursor.rowcount == 0:
-            raise KnowledgeRecordNotFoundError(
-                f"Knowledge record {record_id} not found"
-            )
+            raise KnowledgeRecordNotFoundError(f"Knowledge record {record_id} not found")
         if commit:
             conn.commit()
 
@@ -551,9 +583,7 @@ class AgentTypeRepository:
     # Topology snapshots
     # ------------------------------------------------------------------
 
-    def insert_snapshot(
-        self, snapshot: TopologySnapshot, *, commit: bool = True
-    ) -> None:
+    def insert_snapshot(self, snapshot: TopologySnapshot, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -575,9 +605,7 @@ class AgentTypeRepository:
                 conn.rollback()
             raise
 
-    def get_latest_snapshot(
-        self, project_id: ProjectId
-    ) -> TopologySnapshot | None:
+    def get_latest_snapshot(self, project_id: ProjectId) -> TopologySnapshot | None:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, snapshot_version, reason, "
@@ -590,9 +618,7 @@ class AgentTypeRepository:
             return None
         return _row_to_snapshot(row)
 
-    def list_snapshots(
-        self, project_id: ProjectId
-    ) -> list[TopologySnapshot]:
+    def list_snapshots(self, project_id: ProjectId) -> list[TopologySnapshot]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, snapshot_version, reason, "

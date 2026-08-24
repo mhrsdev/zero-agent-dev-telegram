@@ -27,4 +27,8 @@ echo "  docs:     http://127.0.0.1:8000/docs"
 echo "  health:   http://127.0.0.1:8000/healthz"
 echo ""
 
+# Keep the checkout runnable without requiring an editable install.  The
+# package's console entry point still exercises the installed-artifact path.
+export PYTHONPATH="${PWD}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
 exec uvicorn zero.main:app --reload --host 127.0.0.1 --port 8000

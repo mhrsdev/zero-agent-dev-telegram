@@ -29,6 +29,7 @@ Implementation:
 from __future__ import annotations
 
 import base64
+import hashlib
 from datetime import UTC, datetime
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -80,6 +81,17 @@ def _derive_fernet_key(secret_key_material: str) -> bytes:
     return base64.urlsafe_b64encode(key)
 
 
+def derive_key_id(secret_key_material: str) -> str:
+    """A short, non-secret identifier of the current encryption key.
+
+    Stored alongside each ciphertext so a key rotation produces a
+    precise "wrong key version" error instead of an opaque decrypt
+    failure. The identifier is a truncated hash and does not disclose
+    the key material.
+    """
+    return hashlib.sha256(secret_key_material.encode("utf-8")).hexdigest()[:16]
+
+
 class SecretService:
     """Server-side secret storage and resolution.
 
@@ -109,18 +121,30 @@ class SecretService:
         self._settings = settings
         self._authorization = authorization
         self._fernet: Fernet | None = None
+        self._key_id: str | None = None
 
-    def _get_fernet(self) -> Fernet:
-        if self._fernet is not None:
-            return self._fernet
+    def _key_material(self) -> str:
         if self._settings.secret_key is None:
             raise SecretResolutionError(
                 "Cannot encrypt/decrypt secrets: ZERO_SECRET_KEY is not set"
             )
         key_material = self._settings.secret_key.get_secret_value()
+        if not key_material.strip():
+            raise SecretResolutionError("Cannot encrypt/decrypt secrets: ZERO_SECRET_KEY is blank")
+        return key_material
+
+    def _get_fernet(self) -> Fernet:
+        if self._fernet is not None:
+            return self._fernet
+        key_material = self._key_material()
         key = _derive_fernet_key(key_material)
         self._fernet = Fernet(key)
         return self._fernet
+
+    def _current_key_id(self) -> str:
+        if self._key_id is None:
+            self._key_id = derive_key_id(self._key_material())
+        return self._key_id
 
     def store(
         self,
@@ -156,7 +180,7 @@ class SecretService:
             secret_type=secret_type,
             created_at=_now_utc_iso(),
         )
-        self._secret_repo.insert(secret_ref, encrypted)
+        self._secret_repo.insert(secret_ref, encrypted, key_id=self._current_key_id())
         self._audit_repo.insert(
             AuditEvent(
                 id=AuditEventId(generate_audit_event_id()),
@@ -181,6 +205,8 @@ class SecretService:
         *,
         project_id: ProjectId,
         secret_id: SecretReferenceId,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> str:
         """Decrypt and return the raw secret value.
 
@@ -196,23 +222,34 @@ class SecretService:
         credential immediately before the external call and excludes
         it from request summaries, errors, logs, and artifacts.
         """
+        self._authorization.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="secret.manage",
+            source=source,
+        )
         secret_ref = self._secret_repo.get_by_id(project_id, secret_id)
         if secret_ref.is_revoked:
-            raise SecretRevokedError(
-                f"Secret {secret_id} has been revoked"
+            raise SecretRevokedError(f"Secret {secret_id} has been revoked")
+        encrypted, stored_key_id = self._secret_repo.get_encrypted_record(project_id, secret_id)
+        current_key_id = self._current_key_id()
+        if stored_key_id is not None and stored_key_id != current_key_id:
+            # The key rotated after this secret was written; the stored
+            # key-id makes the failure precise and actionable instead of
+            # an opaque InvalidToken.
+            raise SecretResolutionError(
+                f"Secret {secret_id} was encrypted with key version {stored_key_id!r}, "
+                f"but the configured ZERO_SECRET_KEY resolves to {current_key_id!r}; "
+                "restore the original key or re-store the secret"
             )
-        encrypted = self._secret_repo.get_encrypted_value(
-            project_id, secret_id
-        )
         fernet = self._get_fernet()
         try:
             raw = fernet.decrypt(encrypted.encode("ascii"))
         except InvalidToken as exc:
-            # The ciphertext is corrupt or the key has changed. We
-            # MUST NOT include the ciphertext in the error message.
-            raise SecretResolutionError(
-                f"Failed to decrypt secret {secret_id}"
-            ) from exc
+            # The ciphertext is corrupt or (for legacy rows without a
+            # stamped key id) the key has changed. We MUST NOT include
+            # the ciphertext in the error message.
+            raise SecretResolutionError(f"Failed to decrypt secret {secret_id}") from exc
         return raw.decode("utf-8")
 
     def get_reference(
@@ -220,8 +257,16 @@ class SecretService:
         *,
         project_id: ProjectId,
         secret_id: SecretReferenceId,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> SecretReference:
         """Return metadata for a secret. Never returns the raw value."""
+        self._authorization.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="secret.manage",
+            source=source,
+        )
         return self._secret_repo.get_by_id(project_id, secret_id)
 
     def get_reference_by_name(
@@ -229,7 +274,15 @@ class SecretService:
         *,
         project_id: ProjectId,
         name: str,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> SecretReference:
+        self._authorization.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="secret.manage",
+            source=source,
+        )
         return self._secret_repo.get_by_name(project_id, name)
 
     def revoke(

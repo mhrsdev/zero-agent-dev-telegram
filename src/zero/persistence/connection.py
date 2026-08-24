@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -86,6 +87,7 @@ class Database:
         # and data. For file databases we open a fresh connection each
         # time, which lets SQLite handle file-level locking.
         self._memory_conn: sqlite3.Connection | None = None
+        self._connections: set[sqlite3.Connection] = set()
         self._lock = threading.RLock()
         self._local = threading.local()
 
@@ -94,21 +96,40 @@ class Database:
         return self._path == ":memory:"
 
     def connect(self) -> sqlite3.Connection | _TransactionConnection:
-        """Return a connection. See class docstring for caching rules."""
+        """Return a connection and reassert foreign-key enforcement."""
         transaction_conn = getattr(self._local, "transaction_conn", None)
         if transaction_conn is not None:
             return transaction_conn
         if self.is_in_memory:
-            return self._connect_memory()
-        return self._connect_file()
+            conn = self._connect_memory()
+        else:
+            conn = self._connect_file()
+        self._ensure_foreign_keys(conn)
+        return conn
+
+    def _ensure_foreign_keys(self, conn: sqlite3.Connection) -> None:
+        """Ensure a reusable connection cannot silently disable SQLite FKs."""
+        if not conn.in_transaction:
+            conn.execute("PRAGMA foreign_keys = ON")
+        enabled = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        if enabled != 1:
+            raise DatabaseError("SQLite foreign-key enforcement is disabled")
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection | _TransactionConnection]:
+    def transaction(
+        self,
+        *,
+        enforce_foreign_keys: bool = True,
+    ) -> Iterator[sqlite3.Connection | _TransactionConnection]:
         """Share one connection across a business transaction.
 
         Repositories call :meth:`connect` independently. Binding the
         transaction connection to the current thread keeps those calls
         atomic on both in-memory and file-backed SQLite databases.
+
+        ``enforce_foreign_keys=False`` is reserved for an explicitly marked
+        SQLite table-rebuild migration.  Normal application transactions
+        remain fail-closed with foreign-key enforcement enabled.
         """
         existing = getattr(self._local, "transaction_conn", None)
         if existing is not None:
@@ -129,6 +150,16 @@ class Database:
 
         with self._lock:
             conn = self._connect_memory() if self.is_in_memory else self._connect_file()
+            if enforce_foreign_keys:
+                self._ensure_foreign_keys(conn)
+            else:
+                if conn.in_transaction:
+                    raise DatabaseError(
+                        "foreign-key-disabled transactions must begin before any write"
+                    )
+                conn.execute("PRAGMA foreign_keys = OFF")
+                if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+                    raise DatabaseError("SQLite foreign-key enforcement could not be disabled")
             transaction_conn = _TransactionConnection(conn)
             self._local.transaction_conn = transaction_conn
             self._local.transaction_depth = 0
@@ -141,38 +172,80 @@ class Database:
                 conn.rollback()
                 raise
             finally:
+                if not enforce_foreign_keys:
+                    # PRAGMA foreign_keys is connection-scoped and may only
+                    # change outside a transaction.
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    self._ensure_foreign_keys(conn)
                 del self._local.transaction_conn
                 del self._local.transaction_depth
                 if not self.is_in_memory:
                     conn.close()
+                    self._connections.discard(conn)
+                    if getattr(self._local, "file_conn", None) is conn:
+                        self._local.file_conn = None
+
+    def _configure_connection(self, conn: sqlite3.Connection, *, wal: bool) -> sqlite3.Connection:
+        conn.row_factory = sqlite3.Row
+        # A busy timeout prevents transient writer contention from becoming
+        # an opaque ``database is locked`` failure in request handlers.
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA foreign_keys = ON")
+        if wal:
+            for attempt in range(6):
+                try:
+                    conn.execute("PRAGMA journal_mode = WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower() or attempt == 5:
+                        raise
+                    time.sleep(0.05 * (2**attempt))
+            conn.execute("PRAGMA synchronous = NORMAL")
+        self._connections.add(conn)
+        return conn
 
     def _connect_memory(self) -> sqlite3.Connection:
         with self._lock:
             if self._memory_conn is None:
                 conn = sqlite3.connect(":memory:", check_same_thread=False)
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA foreign_keys = ON")
-                self._memory_conn = conn
+                self._memory_conn = self._configure_connection(conn, wal=False)
             return self._memory_conn
 
-    def _connect_file(self) -> sqlite3.Connection:
+    def _open_file_connection(self) -> sqlite3.Connection:
         # Ensure the parent directory exists for file databases.
         if self._path not in ("", ":memory:"):
             parent = Path(self._path).parent
             if str(parent) not in ("", "."):
                 parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self._path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
+        conn = sqlite3.connect(
+            self._path,
+            check_same_thread=False,
+            timeout=5.0,
+        )
+        return self._configure_connection(conn, wal=True)
+
+    def _connect_file(self) -> sqlite3.Connection:
+        """Return one lifecycle-managed connection per worker thread."""
+        conn = getattr(self._local, "file_conn", None)
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+                return conn
+            except sqlite3.Error:
+                try:
+                    conn.close()
+                finally:
+                    self._connections.discard(conn)
+                self._local.file_conn = None
+        conn = self._open_file_connection()
+        self._local.file_conn = conn
         return conn
 
     # ------------------------------------------------------------------
     # Convenience helpers used by application code
     # ------------------------------------------------------------------
 
-    def execute(
-        self, sql: str, params: tuple[Any, ...] = ()
-    ) -> sqlite3.Cursor:
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
         """Execute a single statement and return the cursor.
 
         Caller is responsible for committing write transactions. We do
@@ -193,24 +266,22 @@ class Database:
                 pass
 
     def commit(self) -> None:
-        """Commit the current in-memory connection (if any).
-
-        For file databases, callers should commit on the connection
-        they obtained from ``connect()``.
-        """
-        if self.is_in_memory and self._memory_conn is not None:
-            self._memory_conn.commit()
+        """Commit the current worker connection."""
+        conn = self.connect()
+        conn.commit()
 
     def close(self) -> None:
-        """Close the cached in-memory connection, if any.
-
-        Used by tests to reset state between test functions. For file
-        databases, each caller closes its own connection.
-        """
+        """Close all lifecycle-managed connections owned by this database."""
         with self._lock:
-            if self._memory_conn is not None:
-                self._memory_conn.close()
-                self._memory_conn = None
+            for conn in tuple(self._connections):
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self._connections.clear()
+            self._memory_conn = None
+            if hasattr(self._local, "file_conn"):
+                self._local.file_conn = None
 
     # ------------------------------------------------------------------
     # Health probe

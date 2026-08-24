@@ -48,14 +48,14 @@ TASK_ARTIFACT_ID_PREFIX = "art_"
 # ----------------------------------------------------------------------
 
 WorktreeState = Literal[
-    "allocated",        # worktree created, not yet active
-    "active",           # command(s) running
-    "interrupted",      # process died or was interrupted; needs recovery
-    "succeeded",        # task completed successfully; worktree preserved until integration
-    "failed",           # task failed; worktree preserved for evidence
-    "cancelled",        # task cancelled; worktree preserved for evidence
-    "cleanup_eligible", # integration resolved; safe to clean up
-    "removed",          # worktree directory deleted; record retained for audit
+    "allocated",  # worktree created, not yet active
+    "active",  # command(s) running
+    "interrupted",  # process died or was interrupted; needs recovery
+    "succeeded",  # task completed successfully; worktree preserved until integration
+    "failed",  # task failed; worktree preserved for evidence
+    "cancelled",  # task cancelled; worktree preserved for evidence
+    "cleanup_eligible",  # integration resolved; safe to clean up
+    "removed",  # worktree directory deleted; record retained for audit
 ]
 
 #: Allowed worktree state transitions.
@@ -77,9 +77,7 @@ WORKTREE_DISK_RESIDENT_STATES: frozenset[WorktreeState] = frozenset(
 )
 
 
-def is_valid_worktree_transition(
-    from_state: WorktreeState, to_state: WorktreeState
-) -> bool:
+def is_valid_worktree_transition(from_state: WorktreeState, to_state: WorktreeState) -> bool:
     return to_state in WORKTREE_TRANSITIONS.get(from_state, frozenset())
 
 
@@ -110,8 +108,7 @@ class RepositoryId:
             raise ValueError("RepositoryId must be a non-empty string")
         if not self.value.startswith(REPOSITORY_ID_PREFIX):
             raise ValueError(
-                f"RepositoryId must start with "
-                f"{REPOSITORY_ID_PREFIX!r}; got {self.value!r}"
+                f"RepositoryId must start with {REPOSITORY_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -127,8 +124,7 @@ class WorktreeId:
             raise ValueError("WorktreeId must be a non-empty string")
         if not self.value.startswith(WORKTREE_ID_PREFIX):
             raise ValueError(
-                f"WorktreeId must start with "
-                f"{WORKTREE_ID_PREFIX!r}; got {self.value!r}"
+                f"WorktreeId must start with {WORKTREE_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -144,8 +140,7 @@ class CommandRunId:
             raise ValueError("CommandRunId must be a non-empty string")
         if not self.value.startswith(COMMAND_RUN_ID_PREFIX):
             raise ValueError(
-                f"CommandRunId must start with "
-                f"{COMMAND_RUN_ID_PREFIX!r}; got {self.value!r}"
+                f"CommandRunId must start with {COMMAND_RUN_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -161,8 +156,7 @@ class TaskArtifactId:
             raise ValueError("TaskArtifactId must be a non-empty string")
         if not self.value.startswith(TASK_ARTIFACT_ID_PREFIX):
             raise ValueError(
-                f"TaskArtifactId must start with "
-                f"{TASK_ARTIFACT_ID_PREFIX!r}; got {self.value!r}"
+                f"TaskArtifactId must start with {TASK_ARTIFACT_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -290,9 +284,7 @@ class CommandRun:
 # Task artifact
 # ----------------------------------------------------------------------
 
-ArtifactKind = Literal[
-    "stdout", "stderr", "diff", "test_report", "exit_status", "other"
-]
+ArtifactKind = Literal["stdout", "stderr", "diff", "test_report", "exit_status", "other"]
 
 
 @dataclass(frozen=True)
@@ -374,6 +366,10 @@ class WorktreeAlreadyExistsError(WorktreeError):
 class WorktreeCleanupError(WorktreeError):
     """Cleanup cannot proceed because the worktree is not eligible,
     has active processes, or has uncommitted human work."""
+
+
+class CommandPolicyError(WorktreeError):
+    """A command is not permitted by the configured execution policy."""
 
 
 class CommandTimeoutError(WorktreeError):

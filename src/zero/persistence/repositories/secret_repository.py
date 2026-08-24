@@ -50,20 +50,22 @@ class SecretRepository:
         secret_ref: SecretReference,
         encrypted_value: str,
         *,
+        key_id: str | None = None,
         commit: bool = True,
     ) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
                 "INSERT INTO secret_references "
-                "(id, project_id, name, secret_type, encrypted_value) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "(id, project_id, name, secret_type, encrypted_value, key_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     secret_ref.id.value,
                     secret_ref.project_id.value,
                     secret_ref.name,
                     secret_ref.secret_type,
                     encrypted_value,
+                    key_id,
                 ),
             )
             if commit:
@@ -73,8 +75,7 @@ class SecretRepository:
                 conn.rollback()
             if "UNIQUE" in str(exc):
                 raise SecretAlreadyExistsError(
-                    f"Secret {secret_ref.name!r} already exists in "
-                    f"project {secret_ref.project_id}"
+                    f"Secret {secret_ref.name!r} already exists in project {secret_ref.project_id}"
                 ) from exc
             raise
 
@@ -98,9 +99,7 @@ class SecretRepository:
         )
         row = cursor.fetchone()
         if row is None:
-            raise SecretNotFoundError(
-                f"Secret {secret_id} not found in project {project_id}"
-            )
+            raise SecretNotFoundError(f"Secret {secret_id} not found in project {project_id}")
         return _row_to_secret_reference(row)
 
     def get_by_name(
@@ -116,9 +115,7 @@ class SecretRepository:
         )
         row = cursor.fetchone()
         if row is None:
-            raise SecretNotFoundError(
-                f"Secret {name!r} not found in project {project_id}"
-            )
+            raise SecretNotFoundError(f"Secret {name!r} not found in project {project_id}")
         return _row_to_secret_reference(row)
 
     def get_encrypted_value(
@@ -136,18 +133,29 @@ class SecretRepository:
         being visible": only the server-side integration boundary
         resolves the raw value at the last responsible moment.
         """
+        value, _key_id = self.get_encrypted_record(project_id, secret_id)
+        return value
+
+    def get_encrypted_record(
+        self,
+        project_id: ProjectId,
+        secret_id: SecretReferenceId,
+    ) -> tuple[str, str | None]:
+        """Return ``(ciphertext, key_id)`` for the secret.
+
+        ``key_id`` identifies which encryption-key version produced the
+        ciphertext (``None`` for legacy rows written before key-id
+        stamping existed).
+        """
         conn = self._database.connect()
         cursor = conn.execute(
-            "SELECT encrypted_value FROM secret_references "
-            "WHERE id = ? AND project_id = ?",
+            "SELECT encrypted_value, key_id FROM secret_references WHERE id = ? AND project_id = ?",
             (secret_id.value, project_id.value),
         )
         row = cursor.fetchone()
         if row is None:
-            raise SecretNotFoundError(
-                f"Secret {secret_id} not found in project {project_id}"
-            )
-        return row["encrypted_value"]
+            raise SecretNotFoundError(f"Secret {secret_id} not found in project {project_id}")
+        return row["encrypted_value"], row["key_id"]
 
     def revoke(
         self,
@@ -168,17 +176,13 @@ class SecretRepository:
             # We treat both as "not revocable in this state".
             existing = self._exists(project_id, secret_id)
             if not existing:
-                raise SecretNotFoundError(
-                    f"Secret {secret_id} not found in project {project_id}"
-                )
+                raise SecretNotFoundError(f"Secret {secret_id} not found in project {project_id}")
             # Already revoked — idempotent success.
             return
         if commit:
             conn.commit()
 
-    def _exists(
-        self, project_id: ProjectId, secret_id: SecretReferenceId
-    ) -> bool:
+    def _exists(self, project_id: ProjectId, secret_id: SecretReferenceId) -> bool:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT 1 FROM secret_references WHERE id = ? AND project_id = ?",

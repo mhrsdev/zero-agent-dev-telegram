@@ -21,6 +21,7 @@ durable together or remain unapplied.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -44,8 +45,7 @@ class AuditEventId:
             raise ValueError("AuditEventId must be a non-empty string")
         if not self.value.startswith(AUDIT_EVENT_ID_PREFIX):
             raise ValueError(
-                f"AuditEventId must start with "
-                f"{AUDIT_EVENT_ID_PREFIX!r}; got {self.value!r}"
+                f"AuditEventId must start with {AUDIT_EVENT_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -102,12 +102,12 @@ class AuditEvent:
 #: this list as a defensive check; summaries should be constructed
 #: carefully in the first place, not scanned after the fact.
 SENSITIVE_SUMMARY_PATTERNS: tuple[str, ...] = (
-    "sk-",            # common API key prefix
-    "Bearer ",        # HTTP auth header
-    "password=",      # query-string password
-    "secret=",        # query-string secret
-    "token=",         # query-string token
-    "api_key=",       # query-string api key
+    "sk-",  # common API key prefix
+    "Bearer ",  # HTTP auth header
+    "password=",  # query-string password
+    "secret=",  # query-string secret
+    "token=",  # query-string token
+    "api_key=",  # query-string api key
 )
 
 
@@ -122,7 +122,29 @@ def looks_sensitive(text: str) -> bool:
     if not text:
         return False
     lowered = text.lower()
-    return any(pattern.lower() in lowered for pattern in SENSITIVE_SUMMARY_PATTERNS)
+    if any(pattern.lower() in lowered for pattern in SENSITIVE_SUMMARY_PATTERNS):
+        return True
+    return bool(
+        re.search(
+            r"[\"']?(?:password|secret|token|api[_-]?key|authorization)[\"']?\s*[:=]",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def redact_sensitive_text(text: str) -> str:
+    """Remove credential-shaped key/value material from persisted text."""
+    if not text:
+        return text
+    pattern = re.compile(
+        r"(?:sk-[A-Za-z0-9_-]+|Bearer\s+\S+|"
+        r"(?:password|secret|token|api[_-]?key)\s*=\s*[^\s,;&]+|"
+        r"[\"']?(?:password|secret|token|api[_-]?key|authorization)[\"']?"
+        r"\s*[:=]\s*[\"']?(?:Bearer\s+)?[^\"'\s,;&}]+[\"']?)",
+        re.IGNORECASE,
+    )
+    return pattern.sub("[REDACTED]", text)
 
 
 # ----------------------------------------------------------------------

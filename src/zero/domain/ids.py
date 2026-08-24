@@ -133,6 +133,10 @@ def generate_artifact_id() -> str:
     return f"art_{_generate_token()}"
 
 
+def generate_artifact_provenance_id() -> str:
+    return f"ap_{_generate_token()}"
+
+
 def generate_rag_document_id() -> str:
     return f"rag_{_generate_token()}"
 
@@ -174,6 +178,18 @@ def generate_merge_proposal_id() -> str:
     return f"mp_{_generate_token()}"
 
 
+def generate_integration_worktree_id() -> str:
+    return f"iwt_{_generate_token()}"
+
+
+def generate_integration_evidence_id() -> str:
+    return f"ime_{_generate_token()}"
+
+
+def generate_integration_test_evidence_id() -> str:
+    return f"ite_{_generate_token()}"
+
+
 # Phase 8 — Interface Adapters (M13)
 def generate_interface_binding_id() -> str:
     return f"ib_{_generate_token()}"
@@ -181,6 +197,10 @@ def generate_interface_binding_id() -> str:
 
 def generate_interface_event_id() -> str:
     return f"iev_{_generate_token()}"
+
+
+def generate_interface_delivery_id() -> str:
+    return f"idl_{_generate_token()}"
 
 
 def generate_callback_token_id() -> str:

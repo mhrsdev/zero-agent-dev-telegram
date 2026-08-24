@@ -45,7 +45,14 @@ from typing import Any
 import jsonschema
 
 from zero.app.authorization_service import AuthorizationService
-from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
+from zero.app.tool_runner import (
+    IsolatedToolRunner,
+    ToolRunnerHandlerError,
+    ToolRunnerOutputLimit,
+    ToolRunnerTimeout,
+)
+from zero.domain.audit import AuditEvent, AuditEventId, AuditSource, redact_sensitive_text
+from zero.domain.execution import TaskId
 from zero.domain.identity import ProjectId, UserId
 from zero.domain.ids import generate_audit_event_id, generate_correlation_id
 from zero.domain.tools import (
@@ -61,6 +68,7 @@ from zero.domain.tools import (
     ToolOutputValidationError,
     ToolResult,
     ToolResultStatus,
+    ToolTimeoutError,
 )
 from zero.persistence.repositories.audit_repository import AuditRepository
 from zero.persistence.repositories.tool_repository import ToolRepository
@@ -108,6 +116,33 @@ class ToolContext:
         self.task_id = task_id
         self.correlation_id = correlation_id or generate_correlation_id()
         self.secret_service = secret_service
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Prepare the context for a process-boundary crossing.
+
+        Under ``spawn`` (non-POSIX platforms) the context must survive
+        pickling. A live :class:`SecretService` holds database
+        connections and key material and cannot be inherited by a
+        spawned child, so it is dropped in transit: handlers running in
+        an isolated spawned process resolve no secrets. ``fork``
+        children share the parent image and are unaffected.
+        """
+        state = dict(self.__dict__)
+        if state.get("secret_service") is not None and not hasattr(
+            state["secret_service"], "__reduce__"
+        ):
+            state["secret_service"] = None
+            return state
+        try:
+            import pickle
+
+            pickle.dumps(state["secret_service"])
+        except (pickle.PickleError, TypeError, AttributeError):
+            state["secret_service"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
 
 
 ToolHandler = Callable[[dict[str, Any], ToolContext], dict[str, Any]]
@@ -160,9 +195,7 @@ ECHO_TOOL_OUTPUT_SCHEMA: dict[str, Any] = {
 }
 
 
-def echo_handler(
-    input_data: dict[str, Any], context: ToolContext
-) -> dict[str, Any]:
+def echo_handler(input_data: dict[str, Any], context: ToolContext) -> dict[str, Any]:
     """A harmless deterministic tool that echoes its input.
 
     Per ``zero-tool-capability-runtime`` §"Good and bad first slices":
@@ -201,13 +234,28 @@ class ToolService:
         tool_repo: ToolRepository,
         audit_repo: AuditRepository,
         authorization: AuthorizationService,
+        *,
+        runner: IsolatedToolRunner | None = None,
+        default_timeout_seconds: float = 30.0,
+        max_grant_timeout_seconds: float = 300.0,
+        max_output_bytes: int = 64 * 1024,
+        metrics: Any | None = None,
     ) -> None:
         self._tool_repo = tool_repo
         self._audit_repo = audit_repo
         self._authorization = authorization
+        self._metrics = metrics
+        if max_grant_timeout_seconds <= 0:
+            raise ValueError("max_grant_timeout_seconds must be positive")
+        self._max_grant_timeout_seconds = max_grant_timeout_seconds
+        self._runner = runner or IsolatedToolRunner(
+            default_timeout_seconds=default_timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
         # The handler registry maps handler_key -> callable. This is
         # server-side only; never sent to models.
         self._handlers: dict[str, ToolHandler] = {}
+        self._inline_handler_keys: set[str] = set()
         self._register_builtin_handlers()
 
     def _register_builtin_handlers(self) -> None:
@@ -226,6 +274,7 @@ class ToolService:
         output_schema: dict[str, Any],
         handler_key: str,
         handler: ToolHandler | None = None,
+        inline: bool = False,
     ) -> Tool:
         """Register a new tool in the registry.
 
@@ -236,9 +285,9 @@ class ToolService:
         if handler is not None:
             self._handlers[handler_key] = handler
         elif handler_key not in self._handlers:
-            raise ToolError(
-                f"No handler registered for handler_key {handler_key!r}"
-            )
+            raise ToolError(f"No handler registered for handler_key {handler_key!r}")
+        if inline:
+            self._inline_handler_keys.add(handler_key)
         from zero.domain.ids import generate_tool_id
         from zero.domain.tools import ToolId
 
@@ -266,6 +315,227 @@ class ToolService:
             handler_key="echo",
         )
 
+    def register_worktree_tools(self, worktree_service: Any) -> tuple[Tool, ...]:
+        """Register server-owned coding tools backed by a task worktree.
+
+        These handlers deliberately run in-process because they use the
+        authorized WorktreeService/database boundary. They are not arbitrary
+        extension code and still require a project-scoped tool grant.
+        """
+        read_input = {
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576},
+            },
+            "required": ["relative_path"],
+            "additionalProperties": False,
+        }
+        read_output = {
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["relative_path", "content"],
+            "additionalProperties": False,
+        }
+        write_input = {
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "content": {"type": "string", "maxLength": 1048576},
+            },
+            "required": ["relative_path", "content"],
+            "additionalProperties": False,
+        }
+        write_output = {
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "content_hash": {"type": "string"},
+            },
+            "required": ["relative_path", "content_hash"],
+            "additionalProperties": False,
+        }
+        # The advertised timeout bound matches the worktree command
+        # policy exactly, so models are never invited to request values
+        # the policy will refuse.
+        command_timeout_cap = int(getattr(worktree_service, "max_command_timeout_seconds", 300))
+        command_input = {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "minLength": 1, "maxLength": 128},
+                "args": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": max(1, command_timeout_cap),
+                },
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        }
+        command_output = {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "state": {"type": "string"},
+                "exit_code": {"type": ["integer", "null"]},
+                "artifact_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["run_id", "state", "exit_code", "artifact_ids"],
+            "additionalProperties": False,
+        }
+        diff_output = {
+            "type": "object",
+            "properties": {
+                "artifact_id": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["artifact_id", "content"],
+            "additionalProperties": False,
+        }
+
+        def context_ids(context: ToolContext) -> tuple[TaskId, Any]:
+            if not context.task_id:
+                raise ToolError("coding tools require a task context")
+            return TaskId(context.task_id), context
+
+        def get_worktree(context: ToolContext):
+            task_id, _ = context_ids(context)
+            if not context.execution_id:
+                raise ToolError("coding tools require an execution context")
+            worktree = worktree_service.get_worktree_for_task(
+                context.project_id,
+                task_id,
+                actor_id=context.actor_id,
+                source="system",
+            )
+            if worktree is None or str(worktree.execution_id) != context.execution_id:
+                raise ToolError("the task has no matching owned worktree")
+            return task_id, worktree
+
+        def read_handler(input_data: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+            task_id, worktree = get_worktree(context)
+            return {
+                "relative_path": input_data["relative_path"],
+                "content": worktree_service.read_file(
+                    project_id=context.project_id,
+                    worktree_id=worktree.id,
+                    task_id=task_id,
+                    actor_id=context.actor_id,
+                    relative_path=input_data["relative_path"],
+                    max_bytes=input_data.get("max_bytes", 256 * 1024),
+                ),
+            }
+
+        def write_handler(input_data: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+            task_id, worktree = get_worktree(context)
+            return {
+                "relative_path": input_data["relative_path"],
+                "content_hash": worktree_service.write_file(
+                    project_id=context.project_id,
+                    worktree_id=worktree.id,
+                    task_id=task_id,
+                    actor_id=context.actor_id,
+                    relative_path=input_data["relative_path"],
+                    content=input_data["content"],
+                ),
+            }
+
+        def command_handler(input_data: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+            task_id, worktree = get_worktree(context)
+            run, artifacts = worktree_service.run_command(
+                project_id=context.project_id,
+                worktree_id=worktree.id,
+                task_id=task_id,
+                actor_id=context.actor_id,
+                command=input_data["command"],
+                args=tuple(input_data.get("args", ())),
+                timeout_seconds=input_data.get("timeout_seconds", 300),
+            )
+            return {
+                "run_id": run.id.value,
+                "state": run.state,
+                "exit_code": run.exit_code,
+                "artifact_ids": [artifact.id.value for artifact in artifacts],
+            }
+
+        def diff_handler(_input_data: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+            task_id, worktree = get_worktree(context)
+            artifact = worktree_service.capture_diff(
+                project_id=context.project_id,
+                worktree_id=worktree.id,
+                task_id=task_id,
+                actor_id=context.actor_id,
+            )
+            return {"artifact_id": artifact.id.value, "content": artifact.content}
+
+        definitions = (
+            (
+                "read_file",
+                "Read a bounded UTF-8 file from the current task worktree.",
+                read_input,
+                read_output,
+                "zero.workspace.read_file",
+                read_handler,
+            ),
+            (
+                "write_file",
+                "Atomically write a bounded UTF-8 file in the current task worktree.",
+                write_input,
+                write_output,
+                "zero.workspace.write_file",
+                write_handler,
+            ),
+            (
+                "run_command",
+                "Run one allowlisted, bounded command in the current task worktree.",
+                command_input,
+                command_output,
+                "zero.workspace.run_command",
+                command_handler,
+            ),
+            (
+                "capture_diff",
+                "Capture the current Git diff and status for the current task worktree.",
+                {"type": "object", "properties": {}, "additionalProperties": False},
+                diff_output,
+                "zero.workspace.capture_diff",
+                diff_handler,
+            ),
+        )
+        registered: list[Tool] = []
+        existing = {tool.name for tool in self.list_tools()}
+        for name, description, input_schema, output_schema, handler_key, handler in definitions:
+            if name in existing:
+                existing_tool = self.get_tool_by_name(name)
+                if existing_tool.handler_key != handler_key:
+                    raise ToolError(
+                        f"persistent tool {name!r} has unexpected handler key "
+                        f"{existing_tool.handler_key!r}"
+                    )
+                # Tool rows persist across process restarts, but handlers are
+                # intentionally process-local callables. Rebind the trusted
+                # server-owned handler every time the composition root starts.
+                self._handlers[handler_key] = handler
+                self._inline_handler_keys.add(handler_key)
+                registered.append(existing_tool)
+                continue
+            registered.append(
+                self.register_tool(
+                    name=name,
+                    description=description,
+                    input_schema=input_schema,
+                    output_schema=output_schema,
+                    handler_key=handler_key,
+                    handler=handler,
+                    inline=True,
+                )
+            )
+        return tuple(registered)
+
     def get_tool(self, tool_id: ToolId) -> Tool:
         return self._tool_repo.get_tool_by_id(tool_id)
 
@@ -287,7 +557,7 @@ class ToolService:
         tool_id: ToolId,
         agent_scope: AgentScope,
         max_invocations: int | None = None,
-        timeout_seconds: int | None = None,
+        timeout_seconds: float | None = None,
         source: AuditSource = "system",
     ) -> ToolGrant:
         """Grant a tool to an agent scope in a project.
@@ -299,9 +569,12 @@ class ToolService:
         if max_invocations is not None and max_invocations < 1:
             raise ValueError("max_invocations must be at least 1")
         if timeout_seconds is not None:
-            raise ValueError(
-                "timeout_seconds requires an isolated tool runner, which is not available"
-            )
+            if timeout_seconds <= 0:
+                raise ValueError("timeout_seconds must be positive")
+            if timeout_seconds > self._max_grant_timeout_seconds:
+                raise ValueError(
+                    f"timeout_seconds exceeds maximum {self._max_grant_timeout_seconds:g}"
+                )
         self._authorization.require_permission(
             actor_id=actor_id,
             project_id=project_id,
@@ -418,9 +691,7 @@ class ToolService:
 
         # 2. Validate input against schema (trust boundary).
         try:
-            jsonschema.validate(
-                instance=input_data, schema=tool.input_schema
-            )
+            jsonschema.validate(instance=input_data, schema=tool.input_schema)
         except jsonschema.ValidationError as exc:
             self._audit_invocation(
                 project_id=project_id,
@@ -433,16 +704,13 @@ class ToolService:
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
             raise ToolInputValidationError(
-                f"Input for tool {tool.name!r} failed validation: "
-                f"{exc.message}",
+                f"Input for tool {tool.name!r} failed validation: {exc.message}",
                 errors=[{"path": list(exc.path), "message": exc.message}],
             ) from exc
 
         # 3. Resolve capability grant.
         try:
-            grant = self._tool_repo.get_grant(
-                project_id, tool.id, agent_scope
-            )
+            grant = self._tool_repo.get_grant(project_id, tool.id, agent_scope)
         except ToolGrantNotFoundError:
             self._audit_invocation(
                 project_id=project_id,
@@ -455,14 +723,9 @@ class ToolService:
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
             raise ToolInvocationDeniedError(
-                f"No grant for tool {tool.name!r} in scope {agent_scope} "
-                f"in project {project_id}"
+                f"No grant for tool {tool.name!r} in scope {agent_scope} in project {project_id}"
             )
 
-        if grant.timeout_seconds is not None:
-            raise ToolInvocationDeniedError(
-                "Timeout-constrained grants require an isolated tool runner"
-            )
         if not self._tool_repo.reserve_invocation(grant.id):
             self._audit_invocation(
                 project_id=project_id,
@@ -474,9 +737,7 @@ class ToolService:
                 correlation_id=correlation_id,
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
-            raise ToolInvocationDeniedError(
-                f"Invocation limit reached for tool {tool.name!r}"
-            )
+            raise ToolInvocationDeniedError(f"Invocation limit reached for tool {tool.name!r}")
 
         # 4. Invoke handler.
         handler = self._handlers.get(tool.handler_key)
@@ -491,9 +752,7 @@ class ToolService:
                 correlation_id=correlation_id,
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
-            raise ToolError(
-                f"No handler registered for tool {tool.name!r}"
-            )
+            raise ToolError(f"No handler registered for tool {tool.name!r}")
 
         context = ToolContext(
             project_id=project_id,
@@ -506,28 +765,84 @@ class ToolService:
         )
 
         try:
-            output = handler(input_data, context)
-        except Exception as exc:
-            # Don't leak the traceback to the model.
+            if tool.handler_key in self._inline_handler_keys:
+                # Server-owned handlers may need durable service objects
+                # (worktree repositories, cancellation registries, etc.).
+                # They still pass through the same schema, grant, audit, and
+                # output-validation boundary; only arbitrary extensions use
+                # the isolated child-process runner.
+                output = handler(input_data, context)
+            else:
+                output = self._runner.run(
+                    handler,
+                    input_data,
+                    context,
+                    timeout_seconds=grant.timeout_seconds,
+                )
+        except ToolRunnerTimeout as exc:
             self._audit_invocation(
                 project_id=project_id,
                 actor_id=actor_id,
                 source=source,
                 tool_name=tool.name,
                 status="error",
-                error=f"handler raised: {type(exc).__name__}",
+                error="handler timed out",
                 correlation_id=correlation_id,
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
-            raise ToolError(
-                f"Tool {tool.name!r} handler raised an exception"
-            ) from exc
+            raise ToolTimeoutError(f"Tool {tool.name!r} handler timed out") from exc
+        except ToolRunnerOutputLimit as exc:
+            self._audit_invocation(
+                project_id=project_id,
+                actor_id=actor_id,
+                source=source,
+                tool_name=tool.name,
+                status="error",
+                error="handler output exceeded limit",
+                correlation_id=correlation_id,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+            )
+            raise ToolError(f"Tool {tool.name!r} output exceeds the configured limit") from exc
+        except ToolRunnerHandlerError as exc:
+            self._audit_invocation(
+                project_id=project_id,
+                actor_id=actor_id,
+                source=source,
+                tool_name=tool.name,
+                status="error",
+                error="handler failed in isolated runner",
+                correlation_id=correlation_id,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+            )
+            raise ToolError(f"Tool {tool.name!r} handler failed") from exc
+        except ToolError:
+            self._audit_invocation(
+                project_id=project_id,
+                actor_id=actor_id,
+                source=source,
+                tool_name=tool.name,
+                status="error",
+                error="handler rejected the request",
+                correlation_id=correlation_id,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+            )
+            raise
+        except Exception as exc:
+            self._audit_invocation(
+                project_id=project_id,
+                actor_id=actor_id,
+                source=source,
+                tool_name=tool.name,
+                status="error",
+                error="server-owned handler failed",
+                correlation_id=correlation_id,
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+            )
+            raise ToolError(f"Tool {tool.name!r} handler failed") from exc
 
         # 5. Validate output against schema.
         try:
-            jsonschema.validate(
-                instance=output, schema=tool.output_schema
-            )
+            jsonschema.validate(instance=output, schema=tool.output_schema)
         except jsonschema.ValidationError as exc:
             self._audit_invocation(
                 project_id=project_id,
@@ -540,18 +855,18 @@ class ToolService:
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
             raise ToolOutputValidationError(
-                f"Output of tool {tool.name!r} failed validation: "
-                f"{exc.message}"
+                f"Output of tool {tool.name!r} failed validation: {exc.message}"
             ) from exc
 
         # 6. Construct bounded, redacted model-facing rendering.
         duration_ms = int((time.monotonic() - started_at) * 1000)
-        model_facing = self._render_model_facing(tool, output)
+        safe_output = self._redact_output(output)
+        model_facing = self._render_model_facing(tool, safe_output)
 
         result = ToolResult(
             tool_id=tool.id,
             status="success",
-            output=output,
+            output=safe_output,
             model_facing=model_facing,
             duration_ms=duration_ms,
         )
@@ -570,9 +885,42 @@ class ToolService:
 
         return result
 
-    def _render_model_facing(
-        self, tool: Tool, output: dict[str, Any]
-    ) -> str:
+    @staticmethod
+    def _redact_output(value: Any) -> Any:
+        """Redact credential-shaped values before exposing tool output.
+
+        Tool handlers are extension points and may read files or return
+        subprocess output. Schema validation is not a confidentiality
+        boundary, so both structured secret-looking fields and embedded
+        key/value material are sanitized before a ``ToolResult`` leaves the
+        service.
+        """
+        if isinstance(value, dict):
+            safe: dict[Any, Any] = {}
+            sensitive_key_fragments = (
+                "password",
+                "secret",
+                "token",
+                "api_key",
+                "apikey",
+                "authorization",
+            )
+            for key, item in value.items():
+                key_text = str(key).lower().replace("-", "_")
+                if any(fragment in key_text for fragment in sensitive_key_fragments):
+                    safe[key] = "[REDACTED]"
+                else:
+                    safe[key] = ToolService._redact_output(item)
+            return safe
+        if isinstance(value, list):
+            return [ToolService._redact_output(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(ToolService._redact_output(item) for item in value)
+        if isinstance(value, str):
+            return redact_sensitive_text(value)
+        return value
+
+    def _render_model_facing(self, tool: Tool, output: dict[str, Any]) -> str:
         """Render a compact, redacted, model-facing summary.
 
         Per ``zero-tool-capability-runtime`` §"Output policy is part
@@ -586,7 +934,7 @@ class ToolService:
         # the length to a safe bound.
         import json
 
-        text = json.dumps(output, ensure_ascii=False, sort_keys=True)
+        text = redact_sensitive_text(json.dumps(output, ensure_ascii=False, sort_keys=True))
         if len(text) > 500:
             text = text[:497] + "..."
         return text
@@ -616,6 +964,13 @@ class ToolService:
             "denied": "denied",
             "unknown": "error",
         }
+        mapped_result = result_map.get(status, "error")
+        # Metrics describe aggregates: low-cardinality outcome counters
+        # only (per zero-observability-evidence §"Metrics describe
+        # aggregates").
+        if self._metrics is not None:
+            self._metrics.increment("tool_invocations_total", result=mapped_result, source=source)
+            self._metrics.observe_duration("tool_invocation_duration_ms", duration_ms)
         self._audit_repo.insert(
             AuditEvent(
                 id=AuditEventId(generate_audit_event_id()),
@@ -625,7 +980,7 @@ class ToolService:
                 operation="tool.invoke",
                 target_type="tool",
                 target_id=tool_name,
-                result=result_map.get(status, "error"),  # type: ignore[arg-type]
+                result=mapped_result,  # type: ignore[arg-type]
                 correlation_id=correlation_id,
                 redacted_summary=(
                     f"Invoked tool {tool_name!r} "

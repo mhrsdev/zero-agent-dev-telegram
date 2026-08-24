@@ -37,6 +37,7 @@ from zero.domain.execution import (
     InvalidExecutionTransitionError,
 )
 from zero.domain.identity import (
+    IdentityError,
     MembershipAlreadyExistsError,
     ProjectId,
     ProjectNotFoundError,
@@ -64,22 +65,47 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
         ctx.update(kw)
         return ctx
 
-    def _plan_in_project(project_id: str, plan_id: str):
-        plan = services.plans.get_plan(PlanId(plan_id))
-        if plan.project_id != ProjectId(project_id):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-        return plan
+    def _plan_in_project(project_id: str, plan_id: str, actor_id: UserId):
+        return services.plans.get_plan(
+            PlanId(plan_id),
+            project_id=ProjectId(project_id),
+            actor_id=actor_id,
+            source="web",
+        )
 
-    def _execution_in_project(project_id: str, execution_id: str):
-        execution = services.worker.get_execution(ExecutionId(execution_id))
-        if execution.project_id != ProjectId(project_id):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-        return execution
+    def _web_actor(request: Request, project_id: str, claimed_id: str | None = None) -> UserId:
+        if getattr(request.state, "user_id", None) is not None:
+            authenticated = authenticated_actor(
+                request.state.user_id.value if claimed_id is None else claimed_id
+            )
+            if claimed_id or authenticated.value != "zu_system":
+                return authenticated
+        if claimed_id:
+            return UserId(claimed_id)
+        return services.identity.get_project(ProjectId(project_id)).owner_user_id
+
+    def _execution_in_project(
+        project_id: str,
+        execution_id: str,
+        request: Request,
+        claimed_actor_id: str | None = None,
+    ):
+        project = ProjectId(project_id)
+        actor = _web_actor(request, project_id, claimed_actor_id)
+        execution = services.worker.get_execution(
+            ExecutionId(execution_id),
+            project_id=project,
+            actor_id=actor,
+            source="web",
+        )
+        return execution, actor
 
     @router.get("/login", response_class=HTMLResponse)
     def login_page(request: Request) -> HTMLResponse:
         return templates.TemplateResponse(
-            request, "login.html", _ctx(request),
+            request,
+            "login.html",
+            _ctx(request),
             headers={"Cache-Control": "no-store"},
         )
 
@@ -96,13 +122,15 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
             services.auth.authenticate(access_token)
         except AuthenticationError:
             return templates.TemplateResponse(
-                request, "login.html",
+                request,
+                "login.html",
                 _ctx(request, error="Invalid or expired access token"),
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 headers={"Cache-Control": "no-store"},
             )
         response = RedirectResponse(
-            url="/web/", status_code=status.HTTP_303_SEE_OTHER,
+            url="/web/",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
         response.set_cookie(
             "zero_access_token",
@@ -120,7 +148,8 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
     def logout(request: Request) -> HTMLResponse:
         services.auth.revoke(request.state.access_token, authenticated_actor())
         response = RedirectResponse(
-            url="/web/login", status_code=status.HTTP_303_SEE_OTHER,
+            url="/web/login",
+            status_code=status.HTTP_303_SEE_OTHER,
         )
         response.delete_cookie("zero_access_token", path="/")
         response.headers["Cache-Control"] = "no-store"
@@ -138,8 +167,7 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
                 "FROM projects AS p JOIN project_memberships AS m "
                 "ON m.project_id = p.id WHERE m.user_id = ? "
                 "ORDER BY p.created_at DESC" + (" LIMIT ?" if limit else ""),
-                ((authenticated_actor().value, limit) if limit
-                 else (authenticated_actor().value,)),
+                ((authenticated_actor().value, limit) if limit else (authenticated_actor().value,)),
             )
         else:
             cursor = conn.execute(
@@ -161,7 +189,8 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
     def dashboard(request: Request) -> HTMLResponse:
         health = request.app.state.health_service.report()
         return templates.TemplateResponse(
-            request, "dashboard.html",
+            request,
+            "dashboard.html",
             _ctx(request, health=health.to_dict(), projects=_project_rows(10)),
         )
 
@@ -185,8 +214,7 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
             )
         else:
             cursor = conn.execute(
-                "SELECT id, display_name, status, created_at FROM users "
-                "ORDER BY created_at DESC"
+                "SELECT id, display_name, status, created_at FROM users ORDER BY created_at DESC"
             )
         return [
             {
@@ -201,25 +229,24 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
     @router.get("/users", response_class=HTMLResponse)
     def list_users(request: Request) -> HTMLResponse:
         return templates.TemplateResponse(
-            request, "users.html",
+            request,
+            "users.html",
             _ctx(request, users=_all_users()),
         )
 
     @router.post("/users", response_class=HTMLResponse)
-    def create_user(
-        request: Request, display_name: str = Form(...)
-    ) -> HTMLResponse:
+    def create_user(request: Request, display_name: str = Form(...)) -> HTMLResponse:
         try:
-            services.identity.create_user(
-                display_name=display_name, source="web"
-            )
+            services.identity.create_user(display_name=display_name, source="web")
             return RedirectResponse(
-                url="/web/users", status_code=status.HTTP_303_SEE_OTHER,
+                url="/web/users",
+                status_code=status.HTTP_303_SEE_OTHER,
             )
-        except Exception as exc:
+        except (IdentityError, ValueError):
             return templates.TemplateResponse(
-                request, "users.html",
-                _ctx(request, users=_all_users(), error=str(exc)),
+                request,
+                "users.html",
+                _ctx(request, users=_all_users(), error="request failed"),
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -233,7 +260,8 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
     @router.get("/projects", response_class=HTMLResponse)
     def list_projects(request: Request) -> HTMLResponse:
         return templates.TemplateResponse(
-            request, "projects.html",
+            request,
+            "projects.html",
             _ctx(request, projects=_all_projects()),
         )
 
@@ -251,10 +279,11 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
                 url=f"/web/projects/{project.id.value}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
-        except (UserNotFoundError, ValueError) as exc:
+        except (UserNotFoundError, ValueError):
             return templates.TemplateResponse(
-                request, "projects.html",
-                _ctx(request, projects=_all_projects(), error=str(exc)),
+                request,
+                "projects.html",
+                _ctx(request, projects=_all_projects(), error="request failed"),
                 status_code=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -266,21 +295,25 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
     def project_detail(request: Request, project_id: str) -> HTMLResponse:
         try:
             project = services.identity.get_project(ProjectId(project_id))
-        except (ProjectNotFoundError, ValueError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
+        except (ProjectNotFoundError, ValueError):
+            raise HTTPException(status_code=404, detail="request failed")
 
-        actor_id = getattr(request.state, "user_id", project.owner_user_id)
+        actor_id = _web_actor(request, project_id)
         members_raw = services.identity.list_members(project.id, actor_id)
         members = [
-            {"user_id": m.user_id.value, "role": m.role,
-             "created_at": m.created_at}
+            {"user_id": m.user_id.value, "role": m.role, "created_at": m.created_at}
             for m in members_raw
         ]
-        plans_raw = services.plans.list_plans_for_project(project.id)
+        plans_raw = services.plans.list_plans_for_project(
+            project.id, actor_id=actor_id, source="web"
+        )
         plans = [
-            {"id": p.id.value, "current_state": p.current_state,
-             "current_revision_number": p.current_revision_number,
-             "created_at": p.created_at}
+            {
+                "id": p.id.value,
+                "current_state": p.current_state,
+                "current_revision_number": p.current_revision_number,
+                "created_at": p.created_at,
+            }
             for p in plans_raw
         ]
         conn = services.database.connect()
@@ -291,18 +324,24 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
             (project_id,),
         )
         executions = [
-            {"id": row["id"], "plan_id": row["plan_id"],
-             "state": row["state"], "blocker_reason": row["blocker_reason"],
-             "created_at": row["created_at"]}
+            {
+                "id": row["id"],
+                "plan_id": row["plan_id"],
+                "state": row["state"],
+                "blocker_reason": row["blocker_reason"],
+                "created_at": row["created_at"],
+            }
             for row in cursor.fetchall()
         ]
-        agent_types_raw = services.agent_types.list_types(
-            project.id, include_archived=True
-        )
+        agent_types_raw = services.agent_types.list_types(project.id, include_archived=True)
         agent_types = [
-            {"id": t.id.value, "name": t.name,
-             "responsibility": t.responsibility, "state": t.state,
-             "max_concurrent_instances": t.max_concurrent_instances}
+            {
+                "id": t.id.value,
+                "name": t.name,
+                "responsibility": t.responsibility,
+                "state": t.state,
+                "max_concurrent_instances": t.max_concurrent_instances,
+            }
             for t in agent_types_raw
         ]
         try:
@@ -315,30 +354,39 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
         except AuthorizationError:
             audit_raw = []
         audit_events = [
-            {"created_at": e.created_at, "operation": e.operation,
-             "target_id": e.target_id, "result": e.result}
+            {
+                "created_at": e.created_at,
+                "operation": e.operation,
+                "target_id": e.target_id,
+                "result": e.result,
+            }
             for e in audit_raw
         ]
         return templates.TemplateResponse(
-            request, "project_detail.html",
+            request,
+            "project_detail.html",
             _ctx(
                 request,
                 project={
-                    "id": project.id.value, "name": project.name,
+                    "id": project.id.value,
+                    "name": project.name,
                     "owner_user_id": project.owner_user_id.value,
                     "created_at": project.created_at,
                 },
-                members=members, plans=plans, executions=executions,
-                agent_types=agent_types, audit_events=audit_events,
+                members=members,
+                plans=plans,
+                executions=executions,
+                agent_types=agent_types,
+                audit_events=audit_events,
             ),
         )
 
-    @router.post(
-        "/projects/{project_id}/members", response_class=HTMLResponse
-    )
+    @router.post("/projects/{project_id}/members", response_class=HTMLResponse)
     def add_member(
-        request: Request, project_id: str,
-        member_id: str = Form(...), role: str = Form(...),
+        request: Request,
+        project_id: str,
+        member_id: str = Form(...),
+        role: str = Form(...),
     ) -> HTMLResponse:
         try:
             project = services.identity.get_project(ProjectId(project_id))
@@ -353,76 +401,94 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
                 url=f"/web/projects/{project_id}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
-        except (UserNotFoundError, ProjectNotFoundError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        except MembershipAlreadyExistsError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
+        except (UserNotFoundError, ProjectNotFoundError, ValueError):
+            raise HTTPException(status_code=400, detail="request failed")
+        except MembershipAlreadyExistsError:
+            raise HTTPException(status_code=409, detail="request failed")
 
     # ------------------------------------------------------------------
     # Plans (Slice 3)
     # ------------------------------------------------------------------
 
     @router.post("/projects/{project_id}/plans", response_class=HTMLResponse)
-    def create_plan(
-        request: Request, project_id: str, actor_id: str = Form(...)
-    ) -> HTMLResponse:
+    def create_plan(request: Request, project_id: str, actor_id: str = Form(...)) -> HTMLResponse:
         try:
             plan = services.plans.create_plan(
                 project_id=ProjectId(project_id),
-                actor_id=authenticated_actor(actor_id), source="web",
+                actor_id=authenticated_actor(actor_id),
+                source="web",
             )
             return RedirectResponse(
                 url=f"/web/projects/{project_id}/plans/{plan.id.value}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
-        except (AuthorizationError, ValueError) as exc:
-            raise HTTPException(status_code=403, detail=str(exc))
+        except (AuthorizationError, ValueError):
+            raise HTTPException(status_code=403, detail="request failed")
 
     @router.get(
         "/projects/{project_id}/plans/{plan_id}",
         response_class=HTMLResponse,
     )
-    def plan_detail(
-        request: Request, project_id: str, plan_id: str
-    ) -> HTMLResponse:
+    def plan_detail(request: Request, project_id: str, plan_id: str) -> HTMLResponse:
         try:
             project = services.identity.get_project(ProjectId(project_id))
-            plan = _plan_in_project(project_id, plan_id)
-            revisions_raw = services.plans.list_revisions(PlanId(plan_id))
+            actor = _web_actor(request, project_id)
+            plan = _plan_in_project(project_id, plan_id, actor)
+            revisions_raw = services.plans.list_revisions(
+                PlanId(plan_id),
+                project_id=project.id,
+                actor_id=actor,
+                source="web",
+            )
             revisions = [
-                {"revision_number": r.revision_number, "state": r.state,
-                 "objective": r.content.objective,
-                 "created_at": r.created_at}
+                {
+                    "revision_number": r.revision_number,
+                    "state": r.state,
+                    "objective": r.content.objective,
+                    "created_at": r.created_at,
+                }
                 for r in revisions_raw
             ]
             handoff = None
             if plan.current_state == "approved":
                 current_rev = services.plans.get_current_revision(
-                    PlanId(plan_id)
+                    PlanId(plan_id),
+                    project_id=project.id,
+                    actor_id=actor,
+                    source="web",
                 )
-                h = services.plans.get_handoff_for_revision(current_rev.id)
+                h = services.plans.get_handoff_for_revision(
+                    current_rev.id,
+                    project_id=project.id,
+                    actor_id=actor,
+                    source="web",
+                )
                 if h:
                     handoff = {
                         "id": h.id.value,
                         "execution_id": h.execution_id,
                         "created_at": h.created_at,
                     }
-        except (PlanNotFoundError, ProjectNotFoundError, ValueError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
+        except (PlanNotFoundError, ProjectNotFoundError, ValueError):
+            raise HTTPException(status_code=404, detail="request failed")
         return templates.TemplateResponse(
-            request, "plan_detail.html",
+            request,
+            "plan_detail.html",
             _ctx(
                 request,
                 project={
-                    "id": project.id.value, "name": project.name,
+                    "id": project.id.value,
+                    "name": project.name,
                     "owner_user_id": project.owner_user_id.value,
                 },
                 plan={
-                    "id": plan.id.value, "current_state": plan.current_state,
+                    "id": plan.id.value,
+                    "current_state": plan.current_state,
                     "current_revision_number": plan.current_revision_number,
                     "created_at": plan.created_at,
                 },
-                revisions=revisions, handoff=handoff,
+                revisions=revisions,
+                handoff=handoff,
             ),
         )
 
@@ -431,17 +497,18 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
         response_class=HTMLResponse,
     )
     def propose_revision(
-        request: Request, project_id: str, plan_id: str,
-        actor_id: str = Form(...), objective: str = Form(...),
+        request: Request,
+        project_id: str,
+        plan_id: str,
+        actor_id: str = Form(...),
+        objective: str = Form(...),
         acceptance_criteria: str = Form(...),
         source_event_ids: str = Form(...),
     ) -> HTMLResponse:
         try:
-            _plan_in_project(project_id, plan_id)
+            _plan_in_project(project_id, plan_id, authenticated_actor(actor_id))
             criteria = tuple(
-                line.strip()
-                for line in acceptance_criteria.strip().splitlines()
-                if line.strip()
+                line.strip() for line in acceptance_criteria.strip().splitlines() if line.strip()
             )
             event_ids = tuple(
                 ConversationEventId(eid.strip())
@@ -449,81 +516,93 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
                 if eid.strip()
             )
             content = PlanRevisionContent(
-                objective=objective, scope=(), constraints=(),
-                acceptance_criteria=criteria, risks=(),
-                unresolved_questions=(), source_event_ids=event_ids,
+                objective=objective,
+                scope=(),
+                constraints=(),
+                acceptance_criteria=criteria,
+                risks=(),
+                unresolved_questions=(),
+                source_event_ids=event_ids,
             )
             services.plans.propose_revision(
-                plan_id=PlanId(plan_id), actor_id=authenticated_actor(actor_id),
-                content=content, source="web",
+                plan_id=PlanId(plan_id),
+                project_id=ProjectId(project_id),
+                actor_id=authenticated_actor(actor_id),
+                content=content,
+                source="web",
             )
             return RedirectResponse(
                 url=f"/web/projects/{project_id}/plans/{plan_id}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
-        except (PlanContentValidationError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        except AuthorizationError as exc:
-            raise HTTPException(status_code=403, detail=str(exc))
+        except (PlanContentValidationError, ValueError):
+            raise HTTPException(status_code=400, detail="request failed")
+        except AuthorizationError:
+            raise HTTPException(status_code=403, detail="request failed")
 
     @router.post(
         "/projects/{project_id}/plans/{plan_id}/approve",
         response_class=HTMLResponse,
     )
     def approve_plan(
-        request: Request, project_id: str, plan_id: str,
+        request: Request,
+        project_id: str,
+        plan_id: str,
         actor_id: str = Form(...),
         expected_revision_number: int = Form(...),
         idempotency_key: str = Form(...),
     ) -> HTMLResponse:
         try:
-            _plan_in_project(project_id, plan_id)
+            _plan_in_project(project_id, plan_id, authenticated_actor(actor_id))
             services.plans.approve_revision(
-                plan_id=PlanId(plan_id), actor_id=authenticated_actor(actor_id),
+                plan_id=PlanId(plan_id),
+                project_id=ProjectId(project_id),
+                actor_id=authenticated_actor(actor_id),
                 expected_revision_number=expected_revision_number,
-                idempotency_key=idempotency_key, source="web",
+                idempotency_key=idempotency_key,
+                source="web",
             )
             return RedirectResponse(
                 url=f"/web/projects/{project_id}/plans/{plan_id}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
-        except StaleRevisionError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Stale revision: expected "
-                       f"{exc.expected_revision}, actual "
-                       f"{exc.actual_revision}",
-            )
-        except AuthorizationError as exc:
-            raise HTTPException(status_code=403, detail=str(exc))
-        except (InvalidPlanTransitionError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+        except StaleRevisionError:
+            raise HTTPException(status_code=409, detail="stale revision")
+        except AuthorizationError:
+            raise HTTPException(status_code=403, detail="request failed")
+        except (InvalidPlanTransitionError, ValueError):
+            raise HTTPException(status_code=400, detail="request failed")
 
     @router.post(
         "/projects/{project_id}/plans/{plan_id}/reject",
         response_class=HTMLResponse,
     )
     def reject_plan(
-        request: Request, project_id: str, plan_id: str,
+        request: Request,
+        project_id: str,
+        plan_id: str,
         actor_id: str = Form(...),
         expected_revision_number: int = Form(...),
         idempotency_key: str = Form(...),
     ) -> HTMLResponse:
         try:
-            _plan_in_project(project_id, plan_id)
+            _plan_in_project(project_id, plan_id, authenticated_actor(actor_id))
             services.plans.reject_revision(
-                plan_id=PlanId(plan_id), actor_id=authenticated_actor(actor_id),
+                plan_id=PlanId(plan_id),
+                project_id=ProjectId(project_id),
+                actor_id=authenticated_actor(actor_id),
                 expected_revision_number=expected_revision_number,
-                idempotency_key=idempotency_key, source="web",
+                idempotency_key=idempotency_key,
+                source="web",
             )
             return RedirectResponse(
                 url=f"/web/projects/{project_id}/plans/{plan_id}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
-        except StaleRevisionError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except AuthorizationError as exc:
-            raise HTTPException(status_code=403, detail=str(exc))
+        except StaleRevisionError:
+            raise HTTPException(status_code=409, detail="request failed")
+        except AuthorizationError:
+            raise HTTPException(status_code=403, detail="request failed")
 
     # ------------------------------------------------------------------
     # Executions (Slice 4)
@@ -533,29 +612,36 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
         "/projects/{project_id}/executions/{execution_id}",
         response_class=HTMLResponse,
     )
-    def execution_detail(
-        request: Request, project_id: str, execution_id: str
-    ) -> HTMLResponse:
+    def execution_detail(request: Request, project_id: str, execution_id: str) -> HTMLResponse:
         try:
             project = services.identity.get_project(ProjectId(project_id))
-            execution = _execution_in_project(project_id, execution_id)
+            execution, actor = _execution_in_project(project_id, execution_id, request)
             tasks_raw = services.worker.list_tasks(
-                ExecutionId(execution_id)
+                ExecutionId(execution_id),
+                project_id=ProjectId(project_id),
+                actor_id=actor,
+                source="web",
             )
             tasks = [
-                {"id": t.id.value, "objective": t.objective,
-                 "state": t.state, "blocker_reason": t.blocker_reason,
-                 "created_at": t.created_at}
+                {
+                    "id": t.id.value,
+                    "objective": t.objective,
+                    "state": t.state,
+                    "blocker_reason": t.blocker_reason,
+                    "created_at": t.created_at,
+                }
                 for t in tasks_raw
             ]
-        except (ExecutionError, ProjectNotFoundError, ValueError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
+        except (ExecutionError, ProjectNotFoundError, ValueError):
+            raise HTTPException(status_code=404, detail="request failed")
         return templates.TemplateResponse(
-            request, "execution_detail.html",
+            request,
+            "execution_detail.html",
             _ctx(
                 request,
                 project={
-                    "id": project.id.value, "name": project.name,
+                    "id": project.id.value,
+                    "name": project.name,
                     "owner_user_id": project.owner_user_id.value,
                 },
                 execution={
@@ -574,44 +660,62 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
         response_class=HTMLResponse,
     )
     def cancel_execution(
-        request: Request, project_id: str, execution_id: str,
+        request: Request,
+        project_id: str,
+        execution_id: str,
         actor_id: str = Form(...),
     ) -> HTMLResponse:
         try:
-            _execution_in_project(project_id, execution_id)
+            _execution, actor = _execution_in_project(
+                project_id,
+                execution_id,
+                request,
+                actor_id,
+            )
             services.worker.cancel_execution(
                 execution_id=ExecutionId(execution_id),
-                actor_id=authenticated_actor(actor_id), source="web",
+                project_id=ProjectId(project_id),
+                actor_id=actor,
+                source="web",
             )
             return RedirectResponse(
                 url=f"/web/projects/{project_id}/executions/{execution_id}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
-        except AuthorizationError as exc:
-            raise HTTPException(status_code=403, detail=str(exc))
-        except InvalidExecutionTransitionError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
+        except AuthorizationError:
+            raise HTTPException(status_code=403, detail="request failed")
+        except InvalidExecutionTransitionError:
+            raise HTTPException(status_code=409, detail="request failed")
 
     @router.post(
         "/projects/{project_id}/executions/{execution_id}/recover",
         response_class=HTMLResponse,
     )
     def recover_execution(
-        request: Request, project_id: str, execution_id: str,
+        request: Request,
+        project_id: str,
+        execution_id: str,
         actor_id: str = Form(...),
     ) -> HTMLResponse:
         try:
-            _execution_in_project(project_id, execution_id)
+            _execution, actor = _execution_in_project(
+                project_id,
+                execution_id,
+                request,
+                actor_id,
+            )
             services.worker.recover_after_restart(
                 execution_id=ExecutionId(execution_id),
-                actor_id=authenticated_actor(actor_id), source="web",
+                project_id=ProjectId(project_id),
+                actor_id=actor,
+                source="web",
             )
             return RedirectResponse(
                 url=f"/web/projects/{project_id}/executions/{execution_id}",
                 status_code=status.HTTP_303_SEE_OTHER,
             )
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+        except (AuthenticationError, AuthorizationError, ExecutionError, ValueError):
+            raise HTTPException(status_code=400, detail="request failed")
 
     # ------------------------------------------------------------------
     # Audit log (Slice 6)
@@ -657,16 +761,22 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
                 "ORDER BY created_at DESC LIMIT 100"
             )
             events = [
-                {"id": row["id"], "project_id": row["project_id"],
-                 "actor_id": row["actor_id"], "source": row["source"],
-                 "operation": row["operation"], "target_id": row["target_id"],
-                 "result": row["result"],
-                 "redacted_summary": row["redacted_summary"],
-                 "created_at": row["created_at"]}
+                {
+                    "id": row["id"],
+                    "project_id": row["project_id"],
+                    "actor_id": row["actor_id"],
+                    "source": row["source"],
+                    "operation": row["operation"],
+                    "target_id": row["target_id"],
+                    "result": row["result"],
+                    "redacted_summary": row["redacted_summary"],
+                    "created_at": row["created_at"],
+                }
                 for row in cursor.fetchall()
             ]
         return templates.TemplateResponse(
-            request, "audit.html",
+            request,
+            "audit.html",
             _ctx(request, events=events),
         )
 

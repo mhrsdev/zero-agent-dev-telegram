@@ -35,6 +35,7 @@ Per TELEGRAM_FINDINGS:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
 from zero.domain.identity import ProjectId, UserId
@@ -43,6 +44,7 @@ from zero.domain.plans import PlanId
 #: Prefixes for stable server-issued IDs.
 INTERFACE_BINDING_ID_PREFIX = "ib_"
 INTERFACE_EVENT_ID_PREFIX = "iev_"
+INTERFACE_DELIVERY_ID_PREFIX = "idl_"
 CALLBACK_TOKEN_ID_PREFIX = "ct_"
 
 # ----------------------------------------------------------------------
@@ -112,12 +114,53 @@ class CallbackTokenId:
             raise ValueError("CallbackTokenId must be a non-empty string")
         if not self.value.startswith(CALLBACK_TOKEN_ID_PREFIX):
             raise ValueError(
-                f"CallbackTokenId must start with "
-                f"{CALLBACK_TOKEN_ID_PREFIX!r}; got {self.value!r}"
+                f"CallbackTokenId must start with {CALLBACK_TOKEN_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
         return self.value
+
+
+@dataclass(frozen=True)
+class InterfaceDeliveryId:
+    value: str
+
+    def __post_init__(self) -> None:
+        if not self.value or not isinstance(self.value, str):
+            raise ValueError("InterfaceDeliveryId must be a non-empty string")
+        if not self.value.startswith(INTERFACE_DELIVERY_ID_PREFIX):
+            raise ValueError(
+                f"InterfaceDeliveryId must start with "
+                f"{INTERFACE_DELIVERY_ID_PREFIX!r}; got {self.value!r}"
+            )
+
+    def __str__(self) -> str:
+        return self.value
+
+
+DeliveryState = Literal["pending", "processing", "sent", "failed", "unknown"]
+
+
+@dataclass(frozen=True)
+class ResultDelivery:
+    """Durable intent and receipt boundary for an execution result."""
+
+    id: InterfaceDeliveryId
+    project_id: ProjectId
+    execution_id: str
+    binding_id: InterfaceBindingId
+    created_by: UserId
+    delivery_key: str
+    content: str
+    state: DeliveryState
+    attempt_count: int
+    claim_token: str | None = None
+    lease_expires_at: str | None = None
+    next_attempt_at: str = ""
+    external_message_id: str | None = None
+    last_error: str | None = None
+    created_at: str = ""
+    updated_at: str = ""
 
 
 # ----------------------------------------------------------------------
@@ -196,6 +239,8 @@ class NormalizedEvent:
     event_kind: EventKind
     content: str
     callback_token: str | None = None
+    transport_interaction_id: str | None = None
+    transport_interaction_token: str | None = None
 
 
 # ----------------------------------------------------------------------
@@ -288,11 +333,24 @@ class CallbackToken:
     def is_used(self) -> bool:
         return self.used_at is not None
 
-    @property
-    def is_expired(self) -> bool:
-        """Check if the token has expired. The caller must pass the
-        current time for testability."""
-        return False  # checked by the service with a datetime parameter
+    def is_expired_at(self, now: datetime) -> bool:
+        """Whether the token's expiry has passed at ``now``.
+
+        The current time is an explicit parameter so expiry checks stay
+        deterministic and testable.
+        """
+        from datetime import UTC
+        from datetime import datetime as _datetime
+
+        try:
+            expires = _datetime.fromisoformat(self.expires_at)
+        except ValueError:
+            # An unparseable expiry is treated as already expired:
+            # fail closed rather than granting unbounded life.
+            return True
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=UTC)
+        return expires <= now
 
 
 # ----------------------------------------------------------------------

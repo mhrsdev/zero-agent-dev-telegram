@@ -56,8 +56,8 @@ IntegrationReviewState = Literal[
 ]
 
 ConflictClassification = Literal[
-    "none",                   # no conflicts detected
-    "low_risk",               # deterministic conflict resolvable by policy
+    "none",  # no conflicts detected
+    "low_risk",  # deterministic conflict resolvable by policy
     "human_decision_required",  # product decision needed
 ]
 
@@ -95,8 +95,7 @@ class MergeProposalId:
             raise ValueError("MergeProposalId must be a non-empty string")
         if not self.value.startswith(MERGE_PROPOSAL_ID_PREFIX):
             raise ValueError(
-                f"MergeProposalId must start with "
-                f"{MERGE_PROPOSAL_ID_PREFIX!r}; got {self.value!r}"
+                f"MergeProposalId must start with {MERGE_PROPOSAL_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -122,6 +121,16 @@ class ImpactEntry:
     file_path: str
     change_type: Literal["added", "modified", "deleted"]
     is_contract: bool = False
+    # Complete source provenance is retained for every path occurrence.
+    # These fields are optional for backwards-compatible construction of
+    # historical records, but newly derived entries populate all of them.
+    project_id: str | None = None
+    execution_id: str | None = None
+    task_id: str | None = None
+    worktree_id: str | None = None
+    artifact_id: str | None = None
+    base_revision: str | None = None
+    content_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,9 +143,7 @@ class ConflictDetail:
         source_tasks: tuple of task IDs involved in the conflict.
     """
 
-    conflict_type: Literal[
-        "schema", "api", "type", "config", "file_collision"
-    ]
+    conflict_type: Literal["schema", "api", "type", "config", "file_collision"]
     description: str
     source_tasks: tuple[str, ...] = ()
 
@@ -189,6 +196,27 @@ class IntegrationReview:
     updated_at: str = ""
 
 
+@dataclass(frozen=True)
+class CombinedTestEvidence:
+    """Durable output from a combined integration-worktree test."""
+
+    id: str
+    project_id: ProjectId
+    review_id: IntegrationReviewId
+    execution_id: ExecutionId
+    integration_worktree_id: str
+    worktree_path: str
+    kind: Literal["test", "preparation", "failure"]
+    command: str
+    args: tuple[str, ...]
+    exit_code: int | None
+    timed_out: bool
+    stdout: str
+    stderr: str
+    content_hash: str
+    created_at: str = ""
+
+
 # ----------------------------------------------------------------------
 # Merge proposal
 # ----------------------------------------------------------------------
@@ -231,6 +259,11 @@ class MergeProposal:
     state: MergeProposalState = "proposed"
     approved_by: UserId | None = None
     merged_at: str | None = None
+    # Durable evidence of the external Git transition.
+    integration_worktree_id: str | None = None
+    target_revision: str | None = None
+    rollback_revision: str | None = None
+    evidence_ids: tuple[str, ...] = ()
     created_at: str = ""
     updated_at: str = ""
 
@@ -276,8 +309,6 @@ class HumanDecisionRequiredError(IntegrationError):
     "Human-decision conflict pauses merge."
     """
 
-    def __init__(
-        self, message: str, *, conflicts: list[ConflictDetail] | None = None
-    ) -> None:
+    def __init__(self, message: str, *, conflicts: list[ConflictDetail] | None = None) -> None:
         super().__init__(message)
         self.conflicts = conflicts or []

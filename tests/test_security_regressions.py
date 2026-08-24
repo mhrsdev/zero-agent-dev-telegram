@@ -13,19 +13,47 @@ from zero.app.auth_service import AuthenticationError
 from zero.app.services import build_services
 from zero.app.worker_service import TaskSpec
 from zero.config import Settings
-from zero.domain.identity import ProjectId, UserId, UserNotFoundError
+from zero.domain.identity import IdentityError, ProjectId, UserId, UserNotFoundError
 from zero.domain.plans import PlanRevisionContent
 from zero.persistence.connection import Database
 from zero.persistence.migrations import apply_migrations
 
 
 def _file_services(tmp_path):
-    settings = Settings.load_for_test(
-        database_url=f"sqlite:///{tmp_path / 'zero.db'}"
-    )
+    settings = Settings.load_for_test(database_url=f"sqlite:///{tmp_path / 'zero.db'}")
     database = Database(settings)
     apply_migrations(database)
     return build_services(settings, database)
+
+
+def test_api_errors_do_not_expose_internal_exception_text(tmp_path, monkeypatch) -> None:
+    settings = Settings.load_for_test(database_url=f"sqlite:///{tmp_path / 'api-errors.db'}")
+    app = create_app(settings)
+    marker = "internal-path=/srv/hidden/request-failure"
+
+    def leak_error(*_args, **_kwargs):
+        raise IdentityError(marker)
+
+    monkeypatch.setattr(app.state.services.identity, "create_project", leak_error)
+
+    from httpx import ASGITransport
+
+    async def exercise() -> None:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="https://zero.test",
+        ) as client:
+            response = await client.post(
+                "/projects",
+                json={"owner_id": "zu_owner", "name": "Project"},
+            )
+        assert response.status_code == 400
+        assert marker not in response.text
+        assert "request failed" in response.text
+
+    import anyio
+
+    anyio.run(exercise)
 
 
 def test_plan_transaction_is_atomic_on_file_sqlite(tmp_path) -> None:
@@ -42,6 +70,7 @@ def test_plan_transaction_is_atomic_on_file_sqlite(tmp_path) -> None:
     plan = services.plans.create_plan(project_id=project.id, actor_id=owner.id)
     revision = services.plans.propose_revision(
         plan_id=plan.id,
+        project_id=project.id,
         actor_id=owner.id,
         content=PlanRevisionContent(
             objective="Implement the approved change",
@@ -55,34 +84,75 @@ def test_plan_transaction_is_atomic_on_file_sqlite(tmp_path) -> None:
     )
     approval, handoff = services.plans.approve_revision(
         plan_id=plan.id,
+        project_id=project.id,
         actor_id=owner.id,
         expected_revision_number=1,
         idempotency_key="file-db-approval",
     )
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=project.id,
         actor_id=owner.id,
         task_specs=[TaskSpec(key="task", objective="Run the task")],
     )
-    task = services.worker.list_ready_tasks(execution.id)[0]
+    task = services.worker.list_ready_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )[0]
     attempt = services.worker.claim_task(
         execution_id=execution.id,
         task_id=task.id,
         lease_owner="test-worker",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
 
-    reopened = Database(
-        Settings.load_for_test(database_url=f"sqlite:///{tmp_path / 'zero.db'}")
+    reopened = Database(Settings.load_for_test(database_url=f"sqlite:///{tmp_path / 'zero.db'}"))
+    persisted = build_services(
+        Settings.load_for_test(database_url=f"sqlite:///{tmp_path / 'zero.db'}"), reopened
     )
-    persisted = build_services(Settings.load_for_test(
-        database_url=f"sqlite:///{tmp_path / 'zero.db'}"
-    ), reopened)
-    assert persisted.plans.get_plan(plan.id).current_state == "approved"
-    assert persisted.plans.get_current_revision(plan.id).id == revision.id
-    assert persisted.plans.get_handoff(handoff.id).id == handoff.id
+    assert (
+        persisted.plans.get_plan(
+            plan.id,
+            project_id=project.id,
+            actor_id=owner.id,
+        ).current_state
+        == "approved"
+    )
+    assert (
+        persisted.plans.get_current_revision(
+            plan.id,
+            project_id=project.id,
+            actor_id=owner.id,
+        ).id
+        == revision.id
+    )
+    assert (
+        persisted.plans.get_handoff(
+            handoff.id,
+            project_id=project.id,
+            actor_id=owner.id,
+        ).id
+        == handoff.id
+    )
     assert approval.revision_id == revision.id
-    assert persisted.worker.get_execution(execution.id).state == "running"
-    assert persisted.worker.list_attempts(task.id)[0].id == attempt.id
+    assert (
+        persisted.worker.get_execution(
+            execution.id,
+            project_id=execution.project_id,
+            actor_id=owner.id,
+        ).state
+        == "running"
+    )
+    assert (
+        persisted.worker.list_attempts(
+            task.id,
+            project_id=task.project_id,
+            actor_id=owner.id,
+        )[0].id
+        == attempt.id
+    )
 
 
 def test_create_plan_rolls_back_when_audit_fails(tmp_path, monkeypatch) -> None:
@@ -118,17 +188,15 @@ def test_nested_transactions_cannot_commit_outer_or_failed_inner_work(
     apply_migrations(database)
     services = build_services(settings, database)
 
-    with pytest.raises(RuntimeError, match="outer failure"):
-        with database.transaction():
-            outer_user = services.identity.create_user(display_name="Outer")
-            with pytest.raises(RuntimeError, match="inner failure"):
-                with database.transaction():
-                    services.identity.create_user(display_name="Inner")
-                    raise RuntimeError("inner failure")
-            with pytest.raises(UserNotFoundError):
-                services.identity.get_user(UserId("zu_missing"))
-            assert services.identity.get_user(outer_user.id).id == outer_user.id
-            raise RuntimeError("outer failure")
+    with pytest.raises(RuntimeError, match="outer failure"), database.transaction():
+        outer_user = services.identity.create_user(display_name="Outer")
+        with pytest.raises(RuntimeError, match="inner failure"), database.transaction():
+            services.identity.create_user(display_name="Inner")
+            raise RuntimeError("inner failure")
+        with pytest.raises(UserNotFoundError):
+            services.identity.get_user(UserId("zu_missing"))
+        assert services.identity.get_user(outer_user.id).id == outer_user.id
+        raise RuntimeError("outer failure")
 
     conn = database.connect()
     try:
@@ -159,9 +227,7 @@ def test_add_member_rolls_back_when_audit_fails(tmp_path, monkeypatch) -> None:
     assert services.identity.resolve_scope(project.id, member.id).role is None
 
 
-def test_topology_migration_rolls_back_on_file_sqlite(
-    tmp_path, monkeypatch
-) -> None:
+def test_topology_migration_rolls_back_on_file_sqlite(tmp_path, monkeypatch) -> None:
     services = _file_services(tmp_path)
     owner = services.identity.create_user(display_name="Owner")
     project = services.identity.create_project(owner_id=owner.id, name="Project")
@@ -185,9 +251,7 @@ def test_topology_migration_rolls_back_on_file_sqlite(
         reassign(*args, **kwargs)
         raise RuntimeError("injected topology failure")
 
-    monkeypatch.setattr(
-        services.agent_types._repo, "reassign_knowledge", fail_after_write
-    )
+    monkeypatch.setattr(services.agent_types._repo, "reassign_knowledge", fail_after_write)
     with pytest.raises(RuntimeError, match="injected topology failure"):
         services.agent_types.split_type(
             project_id=project.id,
@@ -201,7 +265,7 @@ def test_topology_migration_rolls_back_on_file_sqlite(
     types = reopened.agent_types.list_types(project.id, include_archived=True)
     assert [(item.name, item.state) for item in types] == [("Source", "active")]
     persisted_record = reopened.agent_types.list_knowledge_for_type(
-        project.id, source.id, include_archived=True
+        project.id, source.id, actor_id=owner.id, include_archived=True
     )[0]
     assert persisted_record.agent_type_id == source.id
     assert persisted_record.state == record.state
@@ -220,9 +284,7 @@ async def test_authenticated_actor_cannot_be_spoofed(tmp_path) -> None:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="https://zero.test") as client:
         assert (await client.get("/healthz")).status_code == 200
-        assert (
-            await client.post("/users", json={"display_name": "Untrusted"})
-        ).status_code == 401
+        assert (await client.post("/users", json={"display_name": "Untrusted"})).status_code == 401
 
         bootstrap = await client.post(
             "/auth/bootstrap",
@@ -249,9 +311,7 @@ async def test_authenticated_actor_cannot_be_spoofed(tmp_path) -> None:
         assert spoofed.status_code == 403
 
         services = app.state.services
-        other = services.identity.create_user(
-            display_name="Isolated User", source="system"
-        )
+        other = services.identity.create_user(display_name="Isolated User", source="system")
         isolated = services.identity.create_project(
             owner_id=other.id, name="Isolated Project", source="system"
         )
@@ -263,9 +323,7 @@ async def test_authenticated_actor_cannot_be_spoofed(tmp_path) -> None:
             services.auth.revoke(disposable_token, UserId(owner_id))
             with pytest.raises(AuthenticationError):
                 services.auth.authenticate(disposable_token)
-        viewer = services.identity.create_user(
-            display_name="Viewer", source="system"
-        )
+        viewer = services.identity.create_user(display_name="Viewer", source="system")
         viewer_token, _ = services.auth.issue_access_token(viewer.id)
         viewer_bearer = {"Authorization": f"Bearer {viewer_token}"}
 
@@ -275,9 +333,7 @@ async def test_authenticated_actor_cannot_be_spoofed(tmp_path) -> None:
             member_id=viewer.id,
             role="viewer",
         )
-        candidate = services.identity.create_user(
-            display_name="Candidate", source="system"
-        )
+        candidate = services.identity.create_user(display_name="Candidate", source="system")
         denied_member_add = await client.post(
             f"/projects/{created.json()['id']}/members",
             headers=viewer_bearer,
@@ -319,17 +375,13 @@ async def test_authenticated_actor_cannot_be_spoofed(tmp_path) -> None:
             )
         ).status_code == 403
         assert (
-            await client.get(
-                f"/projects/{project_id.value}/audit", headers=viewer_bearer
-            )
+            await client.get(f"/projects/{project_id.value}/audit", headers=viewer_bearer)
         ).status_code == 403
         viewer_audit = await client.get("/web/audit", headers=viewer_bearer)
         assert viewer_audit.status_code == 200
         assert project_id.value not in viewer_audit.text
 
-        assert (
-            await client.get(f"/users/{owner_id}", headers=viewer_bearer)
-        ).status_code == 403
+        assert (await client.get(f"/users/{owner_id}", headers=viewer_bearer)).status_code == 403
         assert (
             await client.post(
                 f"/users/{owner_id}/external-identities",
@@ -362,9 +414,7 @@ async def test_authenticated_actor_cannot_be_spoofed(tmp_path) -> None:
         assert "Isolated User" not in user_list.text
         audit = await client.get("/web/audit", headers=bearer)
         assert isolated.id.value not in audit.text
-        assert (
-            await client.get("/web/projects", headers=other_bearer)
-        ).status_code == 200
+        assert (await client.get("/web/projects", headers=other_bearer)).status_code == 200
 
         rejected_login = await client.post(
             "/web/login",

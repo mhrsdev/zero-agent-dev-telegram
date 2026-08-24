@@ -17,6 +17,8 @@ Per PLAN.md M5 acceptance:
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from zero.app.services import build_services
@@ -25,6 +27,7 @@ from zero.config import Settings
 from zero.domain.execution import (
     CycleError,
     InvalidExecutionTransitionError,
+    LeaseOwnershipError,
     MissingDependencyError,
 )
 from zero.domain.plans import PlanRevisionContent
@@ -43,9 +46,7 @@ def _make_approved_plan(services, owner_name="Owner"):
     """Helper: create an approved plan with one revision. Returns
     (owner, project, plan, handoff)."""
     owner = services.identity.create_user(display_name=owner_name)
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Project A"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="Project A")
     event = services.plans.ingest_conversation_event(
         project_id=project.id,
         actor_id=owner.id,
@@ -53,9 +54,7 @@ def _make_approved_plan(services, owner_name="Owner"):
         origin_kind="authenticated_human",
         content="Add a feature.",
     )
-    plan = services.plans.create_plan(
-        project_id=project.id, actor_id=owner.id
-    )
+    plan = services.plans.create_plan(project_id=project.id, actor_id=owner.id)
     content = PlanRevisionContent(
         objective="Add a feature",
         scope=("backend",),
@@ -66,10 +65,11 @@ def _make_approved_plan(services, owner_name="Owner"):
         source_event_ids=(event.id,),
     )
     services.plans.propose_revision(
-        plan_id=plan.id, actor_id=owner.id, content=content
+        plan_id=plan.id, project_id=project.id, actor_id=owner.id, content=content
     )
     _, handoff = services.plans.approve_revision(
         plan_id=plan.id,
+        project_id=project.id,
         actor_id=owner.id,
         expected_revision_number=1,
         idempotency_key="approval-1",
@@ -87,6 +87,7 @@ def test_create_execution_from_approved_handoff(services) -> None:
     task_a = TaskSpec(key="A", objective="Task A")
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[task_a],
     )
@@ -98,9 +99,7 @@ def test_create_execution_rejects_unapproved_plan(services) -> None:
     """Per PLAN.md M5: 'Worker accepts only a valid approved plan
     revision.'"""
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Project A"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="Project A")
     event = services.plans.ingest_conversation_event(
         project_id=project.id,
         actor_id=owner.id,
@@ -108,9 +107,7 @@ def test_create_execution_rejects_unapproved_plan(services) -> None:
         origin_kind="authenticated_human",
         content="Add a feature.",
     )
-    plan = services.plans.create_plan(
-        project_id=project.id, actor_id=owner.id
-    )
+    plan = services.plans.create_plan(project_id=project.id, actor_id=owner.id)
     content = PlanRevisionContent(
         objective="Add a feature",
         scope=(),
@@ -121,7 +118,7 @@ def test_create_execution_rejects_unapproved_plan(services) -> None:
         source_event_ids=(event.id,),
     )
     services.plans.propose_revision(
-        plan_id=plan.id, actor_id=owner.id, content=content
+        plan_id=plan.id, project_id=project.id, actor_id=owner.id, content=content
     )
     # Get the handoff by approving, then reject... actually we can't
     # get a handoff without approving. So we test by creating an
@@ -131,6 +128,7 @@ def test_create_execution_rejects_unapproved_plan(services) -> None:
     with pytest.raises(PlanNotFoundError):
         services.worker.create_execution_from_handoff(
             handoff_id=PlanHandoffId("ph_nonexistent"),
+            project_id=project.id,
             actor_id=owner.id,
             task_specs=[TaskSpec(key="A", objective="Task A")],
         )
@@ -143,11 +141,13 @@ def test_create_execution_is_idempotent(services) -> None:
     task_a = TaskSpec(key="A", objective="Task A")
     execution1 = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[task_a],
     )
     execution2 = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[task_a],
     )
@@ -164,6 +164,7 @@ def test_independent_tasks_become_ready_together(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[
             TaskSpec(key="A", objective="Task A"),
@@ -171,7 +172,11 @@ def test_independent_tasks_become_ready_together(services) -> None:
             TaskSpec(key="C", objective="Task C"),
         ],
     )
-    ready = services.worker.list_ready_tasks(execution.id)
+    ready = services.worker.list_ready_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert len(ready) == 3
 
 
@@ -188,6 +193,7 @@ def test_dependent_tasks_remain_blocked_until_prerequisites_succeed(
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[
             TaskSpec(key="A", objective="Task A"),
@@ -197,13 +203,21 @@ def test_dependent_tasks_remain_blocked_until_prerequisites_succeed(
             DependencySpec(task_key="B", depends_on_key="A"),
         ],
     )
-    tasks = services.worker.list_tasks(execution.id)
+    tasks = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     task_a = next(t for t in tasks if t.objective == "Task A")
     task_b = next(t for t in tasks if t.objective == "Task B")
     assert task_a.state == "ready"
     assert task_b.state == "pending"
     # Ready list contains only A.
-    ready = services.worker.list_ready_tasks(execution.id)
+    ready = services.worker.list_ready_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert len(ready) == 1
     assert ready[0].id == task_a.id
 
@@ -212,6 +226,7 @@ def test_completing_prerequisite_makes_dependent_ready(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[
             TaskSpec(key="A", objective="Task A"),
@@ -221,7 +236,11 @@ def test_completing_prerequisite_makes_dependent_ready(services) -> None:
             DependencySpec(task_key="B", depends_on_key="A"),
         ],
     )
-    tasks = services.worker.list_tasks(execution.id)
+    tasks = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     task_a = next(t for t in tasks if t.objective == "Task A")
     task_b = next(t for t in tasks if t.objective == "Task B")
     # Claim and complete A.
@@ -229,12 +248,16 @@ def test_completing_prerequisite_makes_dependent_ready(services) -> None:
         execution_id=execution.id,
         task_id=task_a.id,
         lease_owner="worker-1",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
     services.worker.complete_task(
         execution_id=execution.id,
         task_id=task_a.id,
         attempt_id=attempt.id,
         actor_id=owner.id,
+        lease_owner="worker-1",
+        project_id=execution.project_id,
     )
     # B should now be ready.
     task_b = services.worker._execution_repo.get_task(task_b.id)
@@ -251,6 +274,7 @@ def test_failed_prerequisite_blocks_dependent(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[
             TaskSpec(key="A", objective="Task A"),
@@ -260,7 +284,11 @@ def test_failed_prerequisite_blocks_dependent(services) -> None:
             DependencySpec(task_key="B", depends_on_key="A"),
         ],
     )
-    tasks = services.worker.list_tasks(execution.id)
+    tasks = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     task_a = next(t for t in tasks if t.objective == "Task A")
     task_b = next(t for t in tasks if t.objective == "Task B")
     # Claim and fail A.
@@ -268,6 +296,8 @@ def test_failed_prerequisite_blocks_dependent(services) -> None:
         execution_id=execution.id,
         task_id=task_a.id,
         lease_owner="worker-1",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
     services.worker.fail_task(
         execution_id=execution.id,
@@ -275,12 +305,18 @@ def test_failed_prerequisite_blocks_dependent(services) -> None:
         attempt_id=attempt.id,
         error_message="something went wrong",
         actor_id=owner.id,
+        lease_owner="worker-1",
+        project_id=execution.project_id,
     )
     # B should be blocked (not ready, not pending).
     task_b = services.worker._execution_repo.get_task(task_b.id)
     assert task_b.state == "blocked"
     # Ready list is empty.
-    ready = services.worker.list_ready_tasks(execution.id)
+    ready = services.worker.list_ready_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert len(ready) == 0
 
 
@@ -295,6 +331,7 @@ def test_cycle_rejected(services) -> None:
     with pytest.raises(CycleError):
         services.worker.create_execution_from_handoff(
             handoff_id=handoff.id,
+            project_id=_project.id,
             actor_id=owner.id,
             task_specs=[
                 TaskSpec(key="A", objective="Task A"),
@@ -312,6 +349,7 @@ def test_self_dependency_rejected(services) -> None:
     with pytest.raises(CycleError):
         services.worker.create_execution_from_handoff(
             handoff_id=handoff.id,
+            project_id=_project.id,
             actor_id=owner.id,
             task_specs=[TaskSpec(key="A", objective="Task A")],
             dependency_specs=[
@@ -326,6 +364,7 @@ def test_missing_dependency_rejected(services) -> None:
     with pytest.raises(MissingDependencyError):
         services.worker.create_execution_from_handoff(
             handoff_id=handoff.id,
+            project_id=_project.id,
             actor_id=owner.id,
             task_specs=[TaskSpec(key="A", objective="Task A")],
             dependency_specs=[
@@ -348,6 +387,7 @@ def test_restart_reconstructs_graph(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[
             TaskSpec(key="A", objective="Task A"),
@@ -357,30 +397,53 @@ def test_restart_reconstructs_graph(services) -> None:
             DependencySpec(task_key="B", depends_on_key="A"),
         ],
     )
-    tasks = services.worker.list_tasks(execution.id)
+    tasks = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     task_a = next(t for t in tasks if t.objective == "Task A")
     # Claim A (now it's running).
     services.worker.claim_task(
         execution_id=execution.id,
         task_id=task_a.id,
         lease_owner="worker-1",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
+    # Simulate a crashed worker with an expired lease; live leases are
+    # intentionally preserved by recovery.
+    conn = services.database.connect()
+    conn.execute(
+        "UPDATE task_attempts SET lease_expires_at = ? WHERE task_id = ?",
+        ("2000-01-01T00:00:00.000000Z", task_a.id.value),
+    )
+    conn.commit()
     # Simulate restart: the worker process died, leaving A in 'running'
     # with an attempt in 'running'.
     # Recovery should: mark the attempt 'unknown', transition A back to
     # 'ready', recompute readiness, and pause the execution.
     recovered = services.worker.recover_after_restart(
-        execution_id=execution.id, actor_id=owner.id
+        execution_id=execution.id, actor_id=owner.id, project_id=execution.project_id
     )
-    assert recovered.state == "paused"
+    # Recovery leaves ready work schedulable rather than pausing it.
+    assert recovered.state == "running"
     # A should be back to ready.
     task_a = services.worker._execution_repo.get_task(task_a.id)
     assert task_a.state == "ready"
     # The attempt should be marked 'unknown'.
-    attempts = services.worker.list_attempts(task_a.id)
+    attempts = services.worker.list_attempts(
+        task_a.id,
+        project_id=task_a.project_id,
+        actor_id=services.identity.get_project(task_a.project_id).owner_user_id,
+    )
     assert attempts[-1].state == "unknown"
     # A snapshot was taken.
-    snapshot = services.worker.get_latest_snapshot(execution.id)
+    snapshot = services.worker.get_latest_snapshot(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert snapshot is not None
     assert snapshot.snapshot_reason == "restart_recovery"
 
@@ -390,35 +453,144 @@ def test_restart_preserves_completed_tasks(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[TaskSpec(key="A", objective="Task A")],
     )
-    task_a = services.worker.list_tasks(execution.id)[0]
+    task_a = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )[0]
     attempt = services.worker.claim_task(
         execution_id=execution.id,
         task_id=task_a.id,
         lease_owner="worker-1",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
     services.worker.complete_task(
         execution_id=execution.id,
         task_id=task_a.id,
         attempt_id=attempt.id,
         actor_id=owner.id,
+        lease_owner="worker-1",
+        project_id=execution.project_id,
     )
     # Restart.
     services.worker.recover_after_restart(
-        execution_id=execution.id, actor_id=owner.id
+        execution_id=execution.id, actor_id=owner.id, project_id=execution.project_id
     )
     task_a = services.worker._execution_repo.get_task(task_a.id)
     assert task_a.state == "completed"
     # Execution should be completed (all tasks completed).
-    execution = services.worker.get_execution(execution.id)
+    execution = services.worker.get_execution(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert execution.state == "completed"
 
 
-# ----------------------------------------------------------------------
-# Replayed scheduler events do not duplicate work
-# ----------------------------------------------------------------------
+def test_recovery_with_ready_tasks_resumes_and_completes_execution(services) -> None:
+    owner, _project, _plan, handoff = _make_approved_plan(services)
+    execution = services.worker.create_execution_from_handoff(
+        handoff_id=handoff.id,
+        project_id=_project.id,
+        actor_id=owner.id,
+        task_specs=[TaskSpec(key="A", objective="A"), TaskSpec(key="B", objective="B")],
+    )
+    tasks = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=owner.id,
+    )
+    for task in tasks:
+        attempt = services.worker.claim_task(
+            execution_id=execution.id,
+            task_id=task.id,
+            project_id=execution.project_id,
+            actor_id=owner.id,
+            lease_owner=f"worker-{task.objective}",
+        )
+        services.database.connect().execute(
+            "UPDATE task_attempts SET lease_expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00.000000Z", attempt.id.value),
+        )
+    services.database.connect().commit()
+    recovered = services.worker.recover_after_restart(
+        execution_id=execution.id,
+        project_id=execution.project_id,
+        actor_id=owner.id,
+    )
+    assert recovered.state == "running"
+    ready = services.worker.list_ready_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=owner.id,
+    )
+    assert len(ready) == 2
+    for task in ready:
+        attempt = services.worker.claim_task(
+            execution_id=execution.id,
+            task_id=task.id,
+            project_id=execution.project_id,
+            actor_id=owner.id,
+            lease_owner=f"reclaimer-{task.id.value}",
+        )
+        services.worker.complete_task(
+            execution_id=execution.id,
+            project_id=execution.project_id,
+            task_id=task.id,
+            attempt_id=attempt.id,
+            actor_id=owner.id,
+            lease_owner=f"reclaimer-{task.id.value}",
+        )
+    final = services.worker.get_execution(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=owner.id,
+    )
+    assert final.state == "completed"
+
+
+def test_task_lease_renewal_is_fenced_to_owner(services) -> None:
+    owner, _project, _plan, handoff = _make_approved_plan(services)
+    execution = services.worker.create_execution_from_handoff(
+        handoff_id=handoff.id,
+        project_id=_project.id,
+        actor_id=owner.id,
+        task_specs=[TaskSpec(key="A", objective="A")],
+    )
+    task = services.worker.list_tasks(
+        execution.id, project_id=execution.project_id, actor_id=owner.id
+    )[0]
+    attempt = services.worker.claim_task(
+        execution_id=execution.id,
+        task_id=task.id,
+        project_id=execution.project_id,
+        actor_id=owner.id,
+        lease_owner="owner-a",
+    )
+    with pytest.raises(LeaseOwnershipError):
+        services.worker.renew_task_lease(
+            execution_id=execution.id,
+            task_id=task.id,
+            attempt_id=attempt.id,
+            project_id=execution.project_id,
+            actor_id=owner.id,
+            lease_owner="owner-b",
+        )
+    time.sleep(0.002)  # guarantee the renewed expiry lands on a later timestamp
+    renewed = services.worker.renew_task_lease(
+        execution_id=execution.id,
+        task_id=task.id,
+        attempt_id=attempt.id,
+        project_id=execution.project_id,
+        actor_id=owner.id,
+        lease_owner="owner-a",
+    )
+    assert renewed.lease_expires_at > attempt.lease_expires_at
 
 
 def test_replayed_claim_creates_new_attempt(services) -> None:
@@ -431,15 +603,22 @@ def test_replayed_claim_creates_new_attempt(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[TaskSpec(key="A", objective="Task A")],
     )
-    task_a = services.worker.list_tasks(execution.id)[0]
+    task_a = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )[0]
     # First claim.
     attempt1 = services.worker.claim_task(
         execution_id=execution.id,
         task_id=task_a.id,
         lease_owner="worker-1",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
     assert attempt1.attempt_number == 1
     # Fail the task.
@@ -449,6 +628,8 @@ def test_replayed_claim_creates_new_attempt(services) -> None:
         attempt_id=attempt1.id,
         error_message="first attempt failed",
         actor_id=owner.id,
+        lease_owner="worker-1",
+        project_id=execution.project_id,
     )
     # Failed tasks can transition back to ready (retry allowed).
     services.worker._execution_repo.update_task_state(task_a.id, "ready")
@@ -457,10 +638,16 @@ def test_replayed_claim_creates_new_attempt(services) -> None:
         execution_id=execution.id,
         task_id=task_a.id,
         lease_owner="worker-2",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
     assert attempt2.attempt_number == 2
     # Both attempts exist.
-    attempts = services.worker.list_attempts(task_a.id)
+    attempts = services.worker.list_attempts(
+        task_a.id,
+        project_id=task_a.project_id,
+        actor_id=services.identity.get_project(task_a.project_id).owner_user_id,
+    )
     assert len(attempts) == 2
 
 
@@ -480,6 +667,7 @@ def test_cancellation_propagates_to_non_terminal_tasks(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[
             TaskSpec(key="A", objective="Task A"),
@@ -487,30 +675,40 @@ def test_cancellation_propagates_to_non_terminal_tasks(services) -> None:
             TaskSpec(key="C", objective="Task C"),
         ],
     )
-    tasks = services.worker.list_tasks(execution.id)
+    tasks = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     task_a = next(t for t in tasks if t.objective == "Task A")
     task_b = next(t for t in tasks if t.objective == "Task B")
     # Complete A.
     attempt_a = services.worker.claim_task(
         execution_id=execution.id,
         task_id=task_a.id,
-        lease_owner="w1",
+        lease_owner="worker-1",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
     services.worker.complete_task(
         execution_id=execution.id,
         task_id=task_a.id,
         attempt_id=attempt_a.id,
         actor_id=owner.id,
+        lease_owner="worker-1",
+        project_id=execution.project_id,
     )
     # Claim B (now running).
     attempt_b = services.worker.claim_task(
         execution_id=execution.id,
         task_id=task_b.id,
         lease_owner="w2",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
     # Cancel the execution.
     cancelled = services.worker.cancel_execution(
-        execution_id=execution.id, actor_id=owner.id
+        execution_id=execution.id, actor_id=owner.id, project_id=execution.project_id
     )
     assert cancelled.state == "cancelled"
     # A is still completed (terminal).
@@ -528,20 +726,41 @@ def test_cancellation_propagates_to_non_terminal_tasks(services) -> None:
     assert task_c.state == "cancelled"
 
 
+def test_cancellation_signals_inflight_runtime(services) -> None:
+    owner, _project, _plan, handoff = _make_approved_plan(services)
+    execution = services.worker.create_execution_from_handoff(
+        handoff_id=handoff.id,
+        project_id=_project.id,
+        actor_id=owner.id,
+        task_specs=[TaskSpec(key="A", objective="Task A")],
+    )
+    cancellation = services.worker.get_cancellation_event(execution.id)
+    assert not cancellation.is_set()
+
+    services.worker.cancel_execution(
+        execution_id=execution.id,
+        actor_id=owner.id,
+        project_id=execution.project_id,
+    )
+
+    assert cancellation.is_set()
+
+
 def test_cannot_cancel_already_terminal_execution(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[TaskSpec(key="A", objective="Task A")],
     )
     services.worker.cancel_execution(
-        execution_id=execution.id, actor_id=owner.id
+        execution_id=execution.id, actor_id=owner.id, project_id=execution.project_id
     )
     # Cannot cancel again.
     with pytest.raises(InvalidExecutionTransitionError):
         services.worker.cancel_execution(
-            execution_id=execution.id, actor_id=owner.id
+            execution_id=execution.id, actor_id=owner.id, project_id=execution.project_id
         )
 
 
@@ -554,36 +773,51 @@ def test_execution_completes_when_all_tasks_complete(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[
             TaskSpec(key="A", objective="Task A"),
             TaskSpec(key="B", objective="Task B"),
         ],
     )
-    tasks = services.worker.list_tasks(execution.id)
+    tasks = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     for task in tasks:
         attempt = services.worker.claim_task(
             execution_id=execution.id,
             task_id=task.id,
-            lease_owner="w1",
+            lease_owner="worker-1",
+            project_id=execution.project_id,
+            actor_id=services.identity.get_project(execution.project_id).owner_user_id,
         )
         services.worker.complete_task(
             execution_id=execution.id,
             task_id=task.id,
             attempt_id=attempt.id,
             actor_id=owner.id,
+            lease_owner="worker-1",
+            project_id=execution.project_id,
         )
-    execution = services.worker.get_execution(execution.id)
+    execution = services.worker.get_execution(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert execution.state == "completed"
 
 
-def test_execution_pauses_when_task_blocked(services) -> None:
-    """Per PLAN.md M5: 'Human-decision conflicts pause rather than
-    being guessed away.' When a task fails and no tasks are running
-    or ready, the execution pauses."""
+def test_execution_fails_when_graph_cannot_proceed(services) -> None:
+    """When a task fails and nothing in the graph can run or become
+    runnable, the execution terminates as ``failed`` instead of
+    pausing forever (audit fix: executions must be able to fail).
+    Provider-unknown blocks still pause for operator reconciliation."""
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[
             TaskSpec(key="A", objective="Task A"),
@@ -594,13 +828,20 @@ def test_execution_pauses_when_task_blocked(services) -> None:
         ],
     )
     task_a = next(
-        t for t in services.worker.list_tasks(execution.id)
+        t
+        for t in services.worker.list_tasks(
+            execution.id,
+            project_id=execution.project_id,
+            actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+        )
         if t.objective == "Task A"
     )
     attempt = services.worker.claim_task(
         execution_id=execution.id,
         task_id=task_a.id,
-        lease_owner="w1",
+        lease_owner="worker-1",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
     services.worker.fail_task(
         execution_id=execution.id,
@@ -608,8 +849,58 @@ def test_execution_pauses_when_task_blocked(services) -> None:
         attempt_id=attempt.id,
         error_message="failed",
         actor_id=owner.id,
+        lease_owner="worker-1",
+        project_id=execution.project_id,
     )
-    execution = services.worker.get_execution(execution.id)
+    execution = services.worker.get_execution(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
+    assert execution.state == "failed"
+    assert execution.blocker_reason is not None
+
+
+def test_execution_pauses_for_provider_unknown_block(services) -> None:
+    """Provider-unknown blocks await reconciliation: the execution pauses
+    rather than being declared permanently failed."""
+    owner, _project, _plan, handoff = _make_approved_plan(services)
+    execution = services.worker.create_execution_from_handoff(
+        handoff_id=handoff.id,
+        project_id=_project.id,
+        actor_id=owner.id,
+        task_specs=[TaskSpec(key="A", objective="Task A")],
+    )
+    task_a = next(
+        t
+        for t in services.worker.list_tasks(
+            execution.id,
+            project_id=execution.project_id,
+            actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+        )
+        if t.objective == "Task A"
+    )
+    attempt = services.worker.claim_task(
+        execution_id=execution.id,
+        task_id=task_a.id,
+        lease_owner="worker-1",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
+    services.worker.mark_provider_outcome_unknown(
+        execution_id=execution.id,
+        task_id=task_a.id,
+        attempt_id=attempt.id,
+        error_message="unknown outcome",
+        actor_id=owner.id,
+        lease_owner="worker-1",
+        project_id=execution.project_id,
+    )
+    execution = services.worker.get_execution(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert execution.state == "paused"
     assert execution.blocker_reason is not None
 
@@ -621,11 +912,9 @@ def test_execution_pauses_when_task_blocked(services) -> None:
 
 def test_execution_isolation_across_projects(services) -> None:
     """Per PLAN.md M2 acceptance: executions are project-scoped."""
-    _owner_a, _, _, handoff_a = _make_approved_plan(services, "Owner A")
+    _owner_a, project_a, _, handoff_a = _make_approved_plan(services, "Owner A")
     owner_b = services.identity.create_user(display_name="Owner B")
-    services.identity.create_project(
-        owner_id=owner_b.id, name="Project B"
-    )
+    services.identity.create_project(owner_id=owner_b.id, name="Project B")
     # owner_b is NOT a member of project A and cannot create an
     # execution from handoff_a.
     from zero.domain.authorization import AuthorizationError
@@ -633,6 +922,7 @@ def test_execution_isolation_across_projects(services) -> None:
     with pytest.raises(AuthorizationError):
         services.worker.create_execution_from_handoff(
             handoff_id=handoff_a.id,
+            project_id=project_a.id,
             actor_id=owner_b.id,
             task_specs=[TaskSpec(key="A", objective="Task A")],
         )
@@ -647,10 +937,15 @@ def test_snapshot_taken_on_creation(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[TaskSpec(key="A", objective="Task A")],
     )
-    snapshot = services.worker.get_latest_snapshot(execution.id)
+    snapshot = services.worker.get_latest_snapshot(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert snapshot is not None
     assert snapshot.snapshot_reason == "before_fan_out"
     assert snapshot.snapshot_version == 1
@@ -660,22 +955,35 @@ def test_snapshot_taken_on_task_completion(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[TaskSpec(key="A", objective="Task A")],
     )
-    task_a = services.worker.list_tasks(execution.id)[0]
+    task_a = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )[0]
     attempt = services.worker.claim_task(
         execution_id=execution.id,
         task_id=task_a.id,
-        lease_owner="w1",
+        lease_owner="worker-1",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
     services.worker.complete_task(
         execution_id=execution.id,
         task_id=task_a.id,
         attempt_id=attempt.id,
         actor_id=owner.id,
+        lease_owner="worker-1",
+        project_id=execution.project_id,
     )
-    snapshot = services.worker.get_latest_snapshot(execution.id)
+    snapshot = services.worker.get_latest_snapshot(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert snapshot is not None
     assert snapshot.snapshot_reason == "after_task_complete"
 
@@ -692,20 +1000,29 @@ def test_completing_already_completed_task_is_noop(services) -> None:
     owner, _project, _plan, handoff = _make_approved_plan(services)
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
+        project_id=_project.id,
         actor_id=owner.id,
         task_specs=[TaskSpec(key="A", objective="Task A")],
     )
-    task_a = services.worker.list_tasks(execution.id)[0]
+    task_a = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )[0]
     attempt = services.worker.claim_task(
         execution_id=execution.id,
         task_id=task_a.id,
-        lease_owner="w1",
+        lease_owner="worker-1",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
     services.worker.complete_task(
         execution_id=execution.id,
         task_id=task_a.id,
         attempt_id=attempt.id,
         actor_id=owner.id,
+        lease_owner="worker-1",
+        project_id=execution.project_id,
     )
     # Second completion is a no-op.
     result = services.worker.complete_task(
@@ -713,5 +1030,7 @@ def test_completing_already_completed_task_is_noop(services) -> None:
         task_id=task_a.id,
         attempt_id=attempt.id,
         actor_id=owner.id,
+        lease_owner="worker-1",
+        project_id=execution.project_id,
     )
     assert result.state == "completed"

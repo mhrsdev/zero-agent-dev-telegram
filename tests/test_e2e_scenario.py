@@ -25,6 +25,8 @@ Per PLAN.md M15 required scenario:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from zero.app.services import build_services
@@ -56,20 +58,18 @@ def test_end_to_end_scenario(services) -> None:
     # ------------------------------------------------------------------
     # Step 2: Create two isolated projects.
     # ------------------------------------------------------------------
-    project_a = services.identity.create_project(
-        owner_id=owner.id, name="Project Alpha"
-    )
-    project_b = services.identity.create_project(
-        owner_id=owner.id, name="Project Beta"
-    )
+    project_a = services.identity.create_project(owner_id=owner.id, name="Project Alpha")
+    project_b = services.identity.create_project(owner_id=owner.id, name="Project Beta")
     assert project_a.id != project_b.id
 
     # ------------------------------------------------------------------
     # Step 3: Configure different permissions and tool access.
     # ------------------------------------------------------------------
     services.identity.add_member(
-        project_id=project_a.id, actor_id=owner.id,
-        member_id=member.id, role="member",
+        project_id=project_a.id,
+        actor_id=owner.id,
+        member_id=member.id,
+        role="member",
     )
     # Member is NOT a member of project B.
     scope_b = services.identity.resolve_scope(project_b.id, member.id)
@@ -79,14 +79,19 @@ def test_end_to_end_scenario(services) -> None:
     # Step 4: Link one secondary interface identity.
     # ------------------------------------------------------------------
     services.identity.link_external_identity(
-        user_id=owner.id, platform="telegram",
-        external_id="7086634092", external_username="alice",
+        user_id=owner.id,
+        platform="telegram",
+        external_id="7086634092",
+        external_username="alice",
         verified=True,
     )
     # Create an enabled Telegram binding for project A.
     services.interfaces.create_binding(
-        project_id=project_a.id, actor_id=owner.id,
-        platform="telegram", chat_id="100", topic_id="7",
+        project_id=project_a.id,
+        actor_id=owner.id,
+        platform="telegram",
+        chat_id="100",
+        topic_id="7",
         is_enabled=True,
     )
 
@@ -94,9 +99,13 @@ def test_end_to_end_scenario(services) -> None:
     # Step 5: Discuss a change in an enabled scope.
     # ------------------------------------------------------------------
     from zero.domain.interfaces import NormalizedEvent
+
     msg_event = NormalizedEvent(
-        platform="telegram", external_event_id="e2e_update_1",
-        external_actor_id="7086634092", chat_id="100", topic_id="7",
+        platform="telegram",
+        external_event_id="e2e_update_1",
+        external_actor_id="7086634092",
+        chat_id="100",
+        topic_id="7",
         event_kind="message",
         content="Let's add an authentication module with OAuth support.",
     )
@@ -104,16 +113,14 @@ def test_end_to_end_scenario(services) -> None:
     assert result.processing_result == "processed"
     # Verify the conversation event was ingested.
     conv_events = services.plans.list_conversation_events(
-        project_id=project_a.id, limit=10
+        project_id=project_a.id, actor_id=owner.id, limit=10
     )
     assert len(conv_events) >= 1
 
     # ------------------------------------------------------------------
     # Step 6: Main Planner creates a plan.
     # ------------------------------------------------------------------
-    plan = services.plans.create_plan(
-        project_id=project_a.id, actor_id=owner.id
-    )
+    plan = services.plans.create_plan(project_id=project_a.id, actor_id=owner.id)
     content = PlanRevisionContent(
         objective="Add authentication module with OAuth",
         scope=("auth", "oauth"),
@@ -124,25 +131,30 @@ def test_end_to_end_scenario(services) -> None:
         source_event_ids=(conv_events[0].id,),
     )
     revision = services.plans.propose_revision(
-        plan_id=plan.id, actor_id=owner.id, content=content
+        plan_id=plan.id, project_id=project_a.id, actor_id=owner.id, content=content
     )
     assert revision.revision_number == 1
-    plan = services.plans.get_plan(plan.id)
+    plan = services.plans.get_plan(plan.id, project_id=project_a.id, actor_id=owner.id)
     assert plan.current_state == "proposed"
 
     # ------------------------------------------------------------------
     # Step 7: Unauthorized approval fails.
     # ------------------------------------------------------------------
     from zero.domain.authorization import AuthorizationError
+
     # A viewer (read-only) cannot approve plans.
     viewer = services.identity.create_user(display_name="Carol Viewer")
     services.identity.add_member(
-        project_id=project_a.id, actor_id=owner.id,
-        member_id=viewer.id, role="viewer",
+        project_id=project_a.id,
+        actor_id=owner.id,
+        member_id=viewer.id,
+        role="viewer",
     )
     with pytest.raises(AuthorizationError):
         services.plans.approve_revision(
-            plan_id=plan.id, actor_id=viewer.id,
+            plan_id=plan.id,
+            project_id=project_a.id,
+            actor_id=viewer.id,
             expected_revision_number=1,
             idempotency_key="viewer-approve",
         )
@@ -155,44 +167,57 @@ def test_end_to_end_scenario(services) -> None:
         objective="Add authentication module with OAuth 2.0",
         scope=("auth", "oauth", "security"),
         constraints=("Must use existing design system",),
-        acceptance_criteria=("Login form renders", "OAuth flow works",
-                             "Token refresh works"),
+        acceptance_criteria=("Login form renders", "OAuth flow works", "Token refresh works"),
         risks=("OAuth provider downtime",),
         unresolved_questions=(),
         source_event_ids=(conv_events[0].id,),
     )
     services.plans.propose_revision(
-        plan_id=plan.id, actor_id=owner.id, content=content2
+        plan_id=plan.id, project_id=project_a.id, actor_id=owner.id, content=content2
     )
     # Approve revision 2 (the current one).
     approval, handoff = services.plans.approve_revision(
-        plan_id=plan.id, actor_id=owner.id,
+        plan_id=plan.id,
+        project_id=project_a.id,
+        actor_id=owner.id,
         expected_revision_number=2,
         idempotency_key="owner-approve",
     )
     assert approval.result == "approved"
     assert handoff.execution_id is None  # not yet picked up
-    plan = services.plans.get_plan(plan.id)
+    plan = services.plans.get_plan(plan.id, project_id=project_a.id, actor_id=owner.id)
     assert plan.current_state == "approved"
 
     # ------------------------------------------------------------------
     # Step 9: Main Worker builds a dependency graph.
     # ------------------------------------------------------------------
     execution = services.worker.create_execution_from_handoff(
-        handoff_id=handoff.id, actor_id=owner.id,
+        handoff_id=handoff.id,
+        project_id=project_a.id,
+        actor_id=owner.id,
         task_specs=[
-            TaskSpec(key="auth", objective="Implement auth module",
-                     permitted_scope=("src/auth/",),
-                     expected_evidence=("Auth module exists",)),
-            TaskSpec(key="oauth", objective="Add OAuth provider",
-                     permitted_scope=("src/auth/oauth.py",),
-                     expected_evidence=("OAuth flow works",)),
+            TaskSpec(
+                key="auth",
+                objective="Implement auth module",
+                permitted_scope=("src/auth/",),
+                expected_evidence=("Auth module exists",),
+            ),
+            TaskSpec(
+                key="oauth",
+                objective="Add OAuth provider",
+                permitted_scope=("src/auth/oauth.py",),
+                expected_evidence=("OAuth flow works",),
+            ),
         ],
         dependency_specs=[
             DependencySpec(task_key="oauth", depends_on_key="auth"),
         ],
     )
-    tasks = services.worker.list_tasks(execution.id)
+    tasks = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert len(tasks) == 2
     auth_task = next(t for t in tasks if t.objective == "Implement auth module")
     oauth_task = next(t for t in tasks if t.objective == "Add OAuth provider")
@@ -204,7 +229,8 @@ def test_end_to_end_scenario(services) -> None:
     # Step 10: Dynamic Sub Agent Types are selected from project need.
     # ------------------------------------------------------------------
     agent_type = services.agent_types.create_type(
-        project_id=project_a.id, actor_id=owner.id,
+        project_id=project_a.id,
+        actor_id=owner.id,
         name="Auth Specialist",
         responsibility="Authentication and authorization code",
         memory_scope="Auth decisions and patterns",
@@ -217,57 +243,97 @@ def test_end_to_end_scenario(services) -> None:
     # (Simulated — we claim and complete the auth task.)
     # ------------------------------------------------------------------
     auth_attempt = services.worker.claim_task(
-        execution_id=execution.id, task_id=auth_task.id,
+        execution_id=execution.id,
+        task_id=auth_task.id,
         lease_owner="worker-1",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
     )
     assert auth_attempt.state == "running"
 
     # ------------------------------------------------------------------
     # Step 12: Dependent task waits correctly.
     # ------------------------------------------------------------------
-    ready_tasks = services.worker.list_ready_tasks(execution.id)
+    ready_tasks = services.worker.list_ready_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     # oauth is NOT ready (auth hasn't completed).
     assert all(t.id != oauth_task.id for t in ready_tasks)
 
     # Complete auth task.
+    auth_evidence = services.artifacts.store_artifact(
+        project_id=project_a.id,
+        actor_id=owner.id,
+        kind="other",
+        content="Auth module exists",
+        producer="e2e-test",
+        provenance=json.dumps(
+            {
+                "execution_id": execution.id.value,
+                "task_id": auth_task.id.value,
+                "attempt_id": auth_attempt.id.value,
+            },
+            sort_keys=True,
+        ),
+    )
     services.worker.complete_task(
-        execution_id=execution.id, task_id=auth_task.id,
-        attempt_id=auth_attempt.id, actor_id=owner.id,
+        execution_id=execution.id,
+        task_id=auth_task.id,
+        attempt_id=auth_attempt.id,
+        actor_id=owner.id,
+        lease_owner="worker-1",
+        evidence=("Auth module exists",),
+        evidence_artifact_ids=(auth_evidence.id,),
+        project_id=execution.project_id,
     )
     # Now oauth should be ready.
-    ready_tasks = services.worker.list_ready_tasks(execution.id)
+    ready_tasks = services.worker.list_ready_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert any(t.id == oauth_task.id for t in ready_tasks)
 
     # ------------------------------------------------------------------
     # Step 13: Tool and provider usage are budgeted and audited.
     # ------------------------------------------------------------------
     from zero.domain.providers import CanonicalMessage, CanonicalRequest
+
     req = CanonicalRequest(
-        provider="fake", model_name="fake-standard",
+        provider="fake",
+        model_name="fake-standard",
         messages=(CanonicalMessage(role="user", content="Review auth code"),),
     )
     preq, resp = services.providers.send_request(
-        project_id=project_a.id, actor_id=owner.id,
-        request=req, execution_id=execution.id,
+        project_id=project_a.id,
+        actor_id=owner.id,
+        request=req,
+        execution_id=execution.id,
     )
     assert preq.state == "completed"
     assert resp.usage.input_tokens > 0
     # Usage is recorded.
-    usage = services.providers.get_usage_for_project(project_a.id)
+    usage = services.providers.get_usage_for_project(project_a.id, actor_id=owner.id)
     assert usage.input_tokens > 0
 
     # ------------------------------------------------------------------
     # Step 14: Context uses relevant diffs/RAG rather than full repo.
     # ------------------------------------------------------------------
     services.artifacts.ingest_rag_document(
-        project_id=project_a.id, actor_id=owner.id,
-        source_type="manual", source_id="auth_design",
+        project_id=project_a.id,
+        actor_id=owner.id,
+        source_type="manual",
+        source_id="auth_design",
         title="Auth Module Design",
         content="The auth module uses OAuth 2.0 with JWT tokens.",
         state="approved",
     )
     context_text, ledger = services.context_builder.build_context(
-        project_id=project_a.id, execution_id=execution.id,
+        project_id=project_a.id,
+        execution_id=execution.id,
+        actor_id=owner.id,
         agent_type_id=agent_type.id,
         system_message="You are a code reviewer.",
         user_prefix="Project: Alpha",
@@ -286,7 +352,8 @@ def test_end_to_end_scenario(services) -> None:
     # ------------------------------------------------------------------
     # Simulate compaction.
     compaction_record = services.compaction.compact(
-        project_id=project_a.id, execution_id=execution.id,
+        project_id=project_a.id,
+        execution_id=execution.id,
         actor_id=owner.id,
         system_message="You are a code reviewer.",
         user_prefix="Project: Alpha",
@@ -309,30 +376,60 @@ def test_end_to_end_scenario(services) -> None:
     # ------------------------------------------------------------------
     # Complete the oauth task too.
     oauth_attempt = services.worker.claim_task(
-        execution_id=execution.id, task_id=oauth_task.id,
+        execution_id=execution.id,
+        task_id=oauth_task.id,
         lease_owner="worker-2",
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
+    oauth_evidence = services.artifacts.store_artifact(
+        project_id=project_a.id,
+        actor_id=owner.id,
+        kind="other",
+        content="OAuth flow works",
+        producer="e2e-test",
+        provenance=json.dumps(
+            {
+                "execution_id": execution.id.value,
+                "task_id": oauth_task.id.value,
+                "attempt_id": oauth_attempt.id.value,
+            },
+            sort_keys=True,
+        ),
     )
     services.worker.complete_task(
-        execution_id=execution.id, task_id=oauth_task.id,
-        attempt_id=oauth_attempt.id, actor_id=owner.id,
+        execution_id=execution.id,
+        task_id=oauth_task.id,
+        attempt_id=oauth_attempt.id,
+        actor_id=owner.id,
+        lease_owner="worker-2",
+        evidence=("OAuth flow works",),
+        evidence_artifact_ids=(oauth_evidence.id,),
+        project_id=execution.project_id,
     )
     # Execution should be completed.
-    execution = services.worker.get_execution(execution.id)
+    execution = services.worker.get_execution(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )
     assert execution.state == "completed"
 
     # ------------------------------------------------------------------
     # Step 19: Accepted results update project knowledge with provenance.
     # ------------------------------------------------------------------
     services.artifacts.ingest_rag_document(
-        project_id=project_a.id, actor_id=owner.id,
-        source_type="task_result", source_id=auth_task.id.value,
+        project_id=project_a.id,
+        actor_id=owner.id,
+        source_type="task_result",
+        source_id=auth_task.id.value,
         title="Auth Module Implementation",
         content="The auth module was implemented with OAuth 2.0 and JWT.",
         state="approved",
     )
     # Verify it's searchable.
     results = services.artifacts.search_rag(
-        project_id=project_a.id, query="OAuth JWT"
+        project_id=project_a.id, actor_id=owner.id, query="OAuth JWT"
     )
     assert any(r.title == "Auth Module Implementation" for r, _ in results)
 
@@ -341,20 +438,24 @@ def test_end_to_end_scenario(services) -> None:
     # ------------------------------------------------------------------
     # Project B cannot search project A's RAG.
     b_results = services.artifacts.search_rag(
-        project_id=project_b.id, query="OAuth JWT"
+        project_id=project_b.id, actor_id=owner.id, query="OAuth JWT"
     )
     assert len(b_results) == 0
     # Project B cannot see project A's plans.
-    b_plans = services.plans.list_plans_for_project(project_b.id)
+    b_plans = services.plans.list_plans_for_project(project_b.id, actor_id=owner.id)
     assert len(b_plans) == 0
     # Project B cannot see project A's executions.
-    b_events = services.audit.list_for_project(project_id=project_b.id, actor_id=project_b.owner_user_id, limit=100)
-    services.audit.list_for_project(project_id=project_a.id, actor_id=project_a.owner_user_id, limit=100)
+    b_events = services.audit.list_for_project(
+        project_id=project_b.id, actor_id=project_b.owner_user_id, limit=100
+    )
+    services.audit.list_for_project(
+        project_id=project_a.id, actor_id=project_a.owner_user_id, limit=100
+    )
     # No project A audit event appears in project B's list.
     for e in b_events:
         assert e.project_id != project_a.id
     # Project B has no usage from project A.
-    b_usage = services.providers.get_usage_for_project(project_b.id)
+    b_usage = services.providers.get_usage_for_project(project_b.id, actor_id=owner.id)
     assert b_usage.input_tokens == 0
 
     # ------------------------------------------------------------------
@@ -362,6 +463,4 @@ def test_end_to_end_scenario(services) -> None:
     # ------------------------------------------------------------------
     findings = services.canary.scan_all()
     for surface, matches in findings.items():
-        assert len(matches) == 0, (
-            f"Secret found in {surface}: {matches}"
-        )
+        assert len(matches) == 0, f"Secret found in {surface}: {matches}"

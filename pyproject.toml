@@ -7,7 +7,7 @@ name = "zero-develop"
 version = "0.1.0"
 description = "Zero Develop — multi-agent control plane for concurrent software development"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Zero Develop" }]
 dependencies = [
@@ -30,7 +30,7 @@ dev = [
 ]
 
 [project.scripts]
-zero-develop = "zero.main:run"
+zero-develop = "zero.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -50,4 +50,4 @@ filterwarnings = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py311"

@@ -8,11 +8,10 @@ Or via the console script installed by ``pip install -e .[dev]``:
 
     zero-develop
 
-The :data:`app` module-level global is constructed lazily on first
-access so that tests can call :func:`create_app` directly with a
-test-configured :class:`Settings`. This keeps production and test on
-the same executable path (per ADR 0002 and
-``zero-modular-bootstrap`` §"One executable path is a design asset").
+The :data:`app` module-level global is constructed eagerly from process
+configuration so that ``uvicorn zero.main:app`` and ``zero-develop`` use
+one fail-closed startup path.
+Tests call :func:`create_app` directly with isolated test settings.
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ import logging
 from fastapi import FastAPI
 
 from zero.app.api import create_app
+from zero.app.observability_service import configure_logging
 from zero.config import ConfigError, Settings
 
 _logger = logging.getLogger("zero")
@@ -38,11 +38,7 @@ def _load_settings() -> Settings:
 
 
 def _configure_logging(settings: Settings) -> None:
-    level = getattr(logging, settings.log_level)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging(settings.log_level)
     _logger.debug("settings: %s", settings.safe_repr())
 
 

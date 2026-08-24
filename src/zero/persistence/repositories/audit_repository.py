@@ -40,9 +40,7 @@ class AuditRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
 
-    def insert(
-        self, event: AuditEvent, *, commit: bool = True
-    ) -> None:
+    def insert(self, event: AuditEvent, *, commit: bool = True) -> None:
         """Append a new audit event.
 
         Per ``zero-control-plane-trust`` §"Audit is evidence, not a
@@ -150,9 +148,7 @@ class AuditRepository:
         )
         return [_row_to_event(row) for row in cursor.fetchall()]
 
-    def list_for_correlation(
-        self, correlation_id: str
-    ) -> list[AuditEvent]:
+    def list_for_correlation(self, correlation_id: str) -> list[AuditEvent]:
         """List all events sharing a correlation ID, oldest first.
 
         Per ``zero-observability-evidence`` §"One correlation spine

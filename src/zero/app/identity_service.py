@@ -149,9 +149,7 @@ class IdentityService:
             role="owner",
             created_at=project.created_at,
         )
-        self._identity_repo.insert_project(
-            project, owner_membership=owner_membership
-        )
+        self._identity_repo.insert_project(project, owner_membership=owner_membership)
         self._audit_repo.insert(
             AuditEvent(
                 id=AuditEventId(generate_audit_event_id()),
@@ -170,6 +168,10 @@ class IdentityService:
 
     def get_project(self, project_id: ProjectId) -> Project:
         return self._identity_repo.get_project(project_id)
+
+    def list_projects(self) -> list[Project]:
+        """List every project (deployment-scoped, for managed workers)."""
+        return self._identity_repo.list_projects()
 
     # ------------------------------------------------------------------
     # Memberships
@@ -217,8 +219,7 @@ class IdentityService:
                     target_id=f"{project.id.value}:{member.id.value}",
                     result="success",
                     redacted_summary=(
-                        f"Added user {member.id.value} to project "
-                        f"{project.id.value} as {role}"
+                        f"Added user {member.id.value} to project {project.id.value} as {role}"
                     ),
                     created_at=_now_utc_iso(),
                 ),
@@ -248,13 +249,9 @@ class IdentityService:
         )
         project = self._identity_repo.get_project(project_id)
         if project.owner_user_id == member_id:
-            raise ValueError(
-                "Cannot remove the project owner; transfer ownership first."
-            )
+            raise ValueError("Cannot remove the project owner; transfer ownership first.")
         with self._identity_repo._database.transaction():
-            self._identity_repo.delete_membership(
-                project.id, member_id, commit=False
-            )
+            self._identity_repo.delete_membership(project.id, member_id, commit=False)
             self._audit_repo.insert(
                 AuditEvent(
                     id=AuditEventId(generate_audit_event_id()),
@@ -266,17 +263,14 @@ class IdentityService:
                     target_id=f"{project.id.value}:{member_id.value}",
                     result="success",
                     redacted_summary=(
-                        f"Removed user {member_id.value} from project "
-                        f"{project.id.value}"
+                        f"Removed user {member_id.value} from project {project.id.value}"
                     ),
                     created_at=_now_utc_iso(),
                 ),
                 commit=False,
             )
 
-    def list_members(
-        self, project_id: ProjectId, actor_id: UserId
-    ) -> list[ProjectMembership]:
+    def list_members(self, project_id: ProjectId, actor_id: UserId) -> list[ProjectMembership]:
         """List members of a project.
 
         Per ``zero-project-isolation-evidence`` §"Scope begins before
@@ -290,9 +284,7 @@ class IdentityService:
         )
         return self._identity_repo.list_memberships_for_project(project_id)
 
-    def resolve_scope(
-        self, project_id: ProjectId, actor_id: UserId
-    ) -> ProjectScope:
+    def resolve_scope(self, project_id: ProjectId, actor_id: UserId) -> ProjectScope:
         """Resolve the actor's role in a project.
 
         This is the canonical "who is this user in this project?" call.
@@ -352,9 +344,7 @@ class IdentityService:
                 target_type="external_identity",
                 target_id=identity.id.value,
                 result="success",
-                redacted_summary=(
-                    f"Linked {platform} identity to user {user.id.value}"
-                ),
+                redacted_summary=(f"Linked {platform} identity to user {user.id.value}"),
                 # NOTE: external_id is intentionally NOT included in
                 # the summary; it is platform-specific PII.
                 created_at=_now_utc_iso(),
@@ -376,20 +366,14 @@ class IdentityService:
         is called, the link cannot be used for authentication.
         """
         # We look up by (platform, external_id) which raises if not found.
-        existing = self._identity_repo.get_external_identity(
-            platform, external_id
-        )
+        existing = self._identity_repo.get_external_identity(platform, external_id)
         if existing is None:
-            raise UserNotFoundError(
-                f"No external identity found for {platform}:{external_id}"
-            )
+            raise UserNotFoundError(f"No external identity found for {platform}:{external_id}")
         if existing.verified_at is not None:
             # Idempotent: already verified.
             return existing
         verified_at = _now_utc_iso()
-        self._identity_repo.mark_external_identity_verified(
-            existing.id, verified_at
-        )
+        self._identity_repo.mark_external_identity_verified(existing.id, verified_at)
         self._audit_repo.insert(
             AuditEvent(
                 id=AuditEventId(generate_audit_event_id()),
@@ -401,8 +385,7 @@ class IdentityService:
                 target_id=existing.id.value,
                 result="success",
                 redacted_summary=(
-                    f"Verified {platform} identity for user "
-                    f"{existing.user_id.value}"
+                    f"Verified {platform} identity for user {existing.user_id.value}"
                 ),
                 created_at=verified_at,
             )
@@ -429,7 +412,5 @@ class IdentityService:
         name": only verified links can be used for authentication.
         Unverified links raise :class:`ExternalIdentityNotVerifiedError`.
         """
-        identity = self._identity_repo.require_verified_external_identity(
-            platform, external_id
-        )
+        identity = self._identity_repo.require_verified_external_identity(platform, external_id)
         return self._identity_repo.get_user(identity.user_id)

@@ -34,9 +34,7 @@ def project_with_owner_and_binding(services):
     """Create a project, owner, verified Telegram identity, and enabled
     binding."""
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Project A"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="Project A")
     # Link the owner's Telegram identity (verified).
     services.identity.link_external_identity(
         user_id=owner.id,
@@ -65,12 +63,13 @@ def project_with_owner_and_binding(services):
 def test_create_binding_not_enabled_by_default(services) -> None:
     """Per TELEGRAM_FINDINGS: General is NOT enabled by default."""
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="P"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="P")
     binding = services.interfaces.create_binding(
-        project_id=project.id, actor_id=owner.id,
-        platform="telegram", chat_id="100", topic_id=None,
+        project_id=project.id,
+        actor_id=owner.id,
+        platform="telegram",
+        chat_id="100",
+        topic_id=None,
     )
     assert binding.is_enabled is False  # NOT enabled by default
 
@@ -99,7 +98,7 @@ def test_enable_binding(services, project_with_owner_and_binding) -> None:
 
 def test_unlinked_user_cannot_act(services, project_with_owner_and_binding) -> None:
     """Per PLAN.md M13: 'Unknown and unlinked users cannot act.'"""
-    _owner, project, _binding = project_with_owner_and_binding
+    owner, project, _binding = project_with_owner_and_binding
     # Send an event from an unlinked Telegram user.
     event = NormalizedEvent(
         platform="telegram",
@@ -114,7 +113,7 @@ def test_unlinked_user_cannot_act(services, project_with_owner_and_binding) -> N
     assert result.processing_result == "ignored_unlinked"
     # No conversation event was ingested.
     events = services.plans.list_conversation_events(
-        project_id=project.id, limit=10
+        project_id=project.id, actor_id=owner.id, limit=10
     )
     assert len(events) == 0
 
@@ -124,9 +123,7 @@ def test_unlinked_user_cannot_act(services, project_with_owner_and_binding) -> N
 # ----------------------------------------------------------------------
 
 
-def test_disabled_scope_produces_no_side_effects(
-    services, project_with_owner_and_binding
-) -> None:
+def test_disabled_scope_produces_no_side_effects(services, project_with_owner_and_binding) -> None:
     """Per PLAN.md M13: 'Disabled topics/channels produce no planning
     or execution side effects.'"""
     owner, project, binding = project_with_owner_and_binding
@@ -148,7 +145,7 @@ def test_disabled_scope_produces_no_side_effects(
     assert result.processing_result == "ignored_disabled"
     # No conversation event was ingested.
     events = services.plans.list_conversation_events(
-        project_id=project.id, limit=10
+        project_id=project.id, actor_id=owner.id, limit=10
     )
     assert len(events) == 0
 
@@ -162,7 +159,7 @@ def test_linked_user_message_ingested_as_conversation(
     services, project_with_owner_and_binding
 ) -> None:
     """Per PLAN.md M13: 'Normal conversation does not become execution.'"""
-    _owner, project, _binding = project_with_owner_and_binding
+    owner, project, _binding = project_with_owner_and_binding
     event = NormalizedEvent(
         platform="telegram",
         external_event_id="update_1",
@@ -176,12 +173,12 @@ def test_linked_user_message_ingested_as_conversation(
     assert result.processing_result == "processed"
     # A conversation event was ingested.
     events = services.plans.list_conversation_events(
-        project_id=project.id, limit=10
+        project_id=project.id, actor_id=owner.id, limit=10
     )
     assert len(events) == 1
     assert events[0].content == "Let's add a login page."
     # No plan was created (normal conversation doesn't execute).
-    plans = services.plans.list_plans_for_project(project.id)
+    plans = services.plans.list_plans_for_project(project.id, actor_id=owner.id)
     assert len(plans) == 0
 
 
@@ -190,12 +187,10 @@ def test_linked_user_message_ingested_as_conversation(
 # ----------------------------------------------------------------------
 
 
-def test_duplicate_event_delivery_is_idempotent(
-    services, project_with_owner_and_binding
-) -> None:
+def test_duplicate_event_delivery_is_idempotent(services, project_with_owner_and_binding) -> None:
     """Per PLAN.md M13: 'Duplicate webhook/update delivery is
     idempotent.'"""
-    _owner, project, _binding = project_with_owner_and_binding
+    owner, project, _binding = project_with_owner_and_binding
     event = NormalizedEvent(
         platform="telegram",
         external_event_id="update_dup_1",
@@ -214,7 +209,7 @@ def test_duplicate_event_delivery_is_idempotent(
     assert "duplicate" in (result2.processing_detail or "")
     # Only one conversation event was ingested.
     events = services.plans.list_conversation_events(
-        project_id=project.id, limit=10
+        project_id=project.id, actor_id=owner.id, limit=10
     )
     assert len(events) == 1
 
@@ -241,25 +236,30 @@ def test_callback_approves_plan(services, project_with_owner_and_binding) -> Non
     services.interfaces.process_inbound_event(msg_event)
     # Create a plan and propose a revision (via the website/API).
     conv_events = services.plans.list_conversation_events(
-        project_id=project.id, limit=10
+        project_id=project.id, actor_id=owner.id, limit=10
     )
-    plan = services.plans.create_plan(
-        project_id=project.id, actor_id=owner.id
-    )
+    plan = services.plans.create_plan(project_id=project.id, actor_id=owner.id)
     from zero.domain.plans import PlanRevisionContent
+
     content = PlanRevisionContent(
-        objective="Add a login page", scope=(), constraints=(),
+        objective="Add a login page",
+        scope=(),
+        constraints=(),
         acceptance_criteria=("Login form renders",),
-        risks=(), unresolved_questions=(),
+        risks=(),
+        unresolved_questions=(),
         source_event_ids=(conv_events[0].id,),
     )
     services.plans.propose_revision(
-        plan_id=plan.id, actor_id=owner.id, content=content
+        plan_id=plan.id, project_id=project.id, actor_id=owner.id, content=content
     )
     # Create a callback token for approval.
     token = services.interfaces.create_callback_token(
-        project_id=project.id, plan_id=plan.id,
-        revision_number=1, action="approve", created_by=owner.id,
+        project_id=project.id,
+        plan_id=plan.id,
+        revision_number=1,
+        action="approve",
+        created_by=owner.id,
     )
     # Send a callback query from the owner.
     callback_event = NormalizedEvent(
@@ -275,7 +275,7 @@ def test_callback_approves_plan(services, project_with_owner_and_binding) -> Non
     result = services.interfaces.process_inbound_event(callback_event)
     assert result.processing_result == "processed"
     # The plan should now be approved.
-    plan = services.plans.get_plan(plan.id)
+    plan = services.plans.get_plan(plan.id, project_id=project.id, actor_id=owner.id)
     assert plan.current_state == "approved"
 
 
@@ -297,35 +297,43 @@ def test_stale_callback_cannot_approve_newer_revision(
     )
     services.interfaces.process_inbound_event(msg_event)
     conv_events = services.plans.list_conversation_events(
-        project_id=project.id, limit=10
+        project_id=project.id, actor_id=owner.id, limit=10
     )
-    plan = services.plans.create_plan(
-        project_id=project.id, actor_id=owner.id
-    )
+    plan = services.plans.create_plan(project_id=project.id, actor_id=owner.id)
     from zero.domain.plans import PlanRevisionContent
+
     content = PlanRevisionContent(
-        objective="V1", scope=(), constraints=(),
+        objective="V1",
+        scope=(),
+        constraints=(),
         acceptance_criteria=("Works",),
-        risks=(), unresolved_questions=(),
+        risks=(),
+        unresolved_questions=(),
         source_event_ids=(conv_events[0].id,),
     )
     services.plans.propose_revision(
-        plan_id=plan.id, actor_id=owner.id, content=content
+        plan_id=plan.id, project_id=project.id, actor_id=owner.id, content=content
     )
     # Create a callback token for revision 1.
     token = services.interfaces.create_callback_token(
-        project_id=project.id, plan_id=plan.id,
-        revision_number=1, action="approve", created_by=owner.id,
+        project_id=project.id,
+        plan_id=plan.id,
+        revision_number=1,
+        action="approve",
+        created_by=owner.id,
     )
     # Edit: propose revision 2.
     content2 = PlanRevisionContent(
-        objective="V2", scope=(), constraints=(),
+        objective="V2",
+        scope=(),
+        constraints=(),
         acceptance_criteria=("Works better",),
-        risks=(), unresolved_questions=(),
+        risks=(),
+        unresolved_questions=(),
         source_event_ids=(conv_events[0].id,),
     )
     services.plans.propose_revision(
-        plan_id=plan.id, actor_id=owner.id, content=content2
+        plan_id=plan.id, project_id=project.id, actor_id=owner.id, content=content2
     )
     # Now try to use the callback for revision 1 (stale).
     callback_event = NormalizedEvent(
@@ -342,13 +350,11 @@ def test_stale_callback_cannot_approve_newer_revision(
     assert result.processing_result == "denied"
     assert "stale" in (result.processing_detail or "").lower()
     # The plan is still in 'proposed' state (not approved).
-    plan = services.plans.get_plan(plan.id)
+    plan = services.plans.get_plan(plan.id, project_id=project.id, actor_id=owner.id)
     assert plan.current_state == "proposed"
 
 
-def test_callback_token_used_twice_is_idempotent(
-    services, project_with_owner_and_binding
-) -> None:
+def test_callback_token_used_twice_is_idempotent(services, project_with_owner_and_binding) -> None:
     """Per PLAN.md M13: 'Duplicate webhook/update delivery is
     idempotent.' A duplicate callback should not approve twice."""
     owner, project, _binding = project_with_owner_and_binding
@@ -364,46 +370,59 @@ def test_callback_token_used_twice_is_idempotent(
     )
     services.interfaces.process_inbound_event(msg_event)
     conv_events = services.plans.list_conversation_events(
-        project_id=project.id, limit=10
+        project_id=project.id, actor_id=owner.id, limit=10
     )
-    plan = services.plans.create_plan(
-        project_id=project.id, actor_id=owner.id
-    )
+    plan = services.plans.create_plan(project_id=project.id, actor_id=owner.id)
     from zero.domain.plans import PlanRevisionContent
+
     content = PlanRevisionContent(
-        objective="Add a feature", scope=(), constraints=(),
+        objective="Add a feature",
+        scope=(),
+        constraints=(),
         acceptance_criteria=("Works",),
-        risks=(), unresolved_questions=(),
+        risks=(),
+        unresolved_questions=(),
         source_event_ids=(conv_events[0].id,),
     )
     services.plans.propose_revision(
-        plan_id=plan.id, actor_id=owner.id, content=content
+        plan_id=plan.id, project_id=project.id, actor_id=owner.id, content=content
     )
     token = services.interfaces.create_callback_token(
-        project_id=project.id, plan_id=plan.id,
-        revision_number=1, action="approve", created_by=owner.id,
+        project_id=project.id,
+        plan_id=plan.id,
+        revision_number=1,
+        action="approve",
+        created_by=owner.id,
     )
     # First callback.
     cb1 = NormalizedEvent(
-        platform="telegram", external_event_id="update_cb_2a",
-        external_actor_id="7086634092", chat_id="100", topic_id="7",
-        event_kind="callback_query", content="[approve]",
+        platform="telegram",
+        external_event_id="update_cb_2a",
+        external_actor_id="7086634092",
+        chat_id="100",
+        topic_id="7",
+        event_kind="callback_query",
+        content="[approve]",
         callback_token=token.id.value,
     )
     result1 = services.interfaces.process_inbound_event(cb1)
     assert result1.processing_result == "processed"
     # Duplicate callback (different update_id, same token).
     cb2 = NormalizedEvent(
-        platform="telegram", external_event_id="update_cb_2b",
-        external_actor_id="7086634092", chat_id="100", topic_id="7",
-        event_kind="callback_query", content="[approve]",
+        platform="telegram",
+        external_event_id="update_cb_2b",
+        external_actor_id="7086634092",
+        chat_id="100",
+        topic_id="7",
+        event_kind="callback_query",
+        content="[approve]",
         callback_token=token.id.value,
     )
     result2 = services.interfaces.process_inbound_event(cb2)
     assert result2.processing_result == "processed"
     assert "already used" in (result2.processing_detail or "")
     # Only one handoff exists (plan was approved once).
-    handoffs = services.plans.list_handoffs_for_project(project.id)
+    handoffs = services.plans.list_handoffs_for_project(project.id, actor_id=owner.id)
     assert len(handoffs) == 1
 
 
@@ -412,12 +431,10 @@ def test_callback_token_used_twice_is_idempotent(
 # ----------------------------------------------------------------------
 
 
-def test_website_and_messaging_observe_same_state(
-    services, project_with_owner_and_binding
-) -> None:
+def test_website_and_messaging_observe_same_state(services, project_with_owner_and_binding) -> None:
     """Per PLAN.md M13: 'Website and messaging actions observe the
     same durable state.'"""
-    _owner, project, _binding = project_with_owner_and_binding
+    owner, project, _binding = project_with_owner_and_binding
     # Ingest a message via the Telegram adapter.
     msg_event = NormalizedEvent(
         platform="telegram",
@@ -431,7 +448,7 @@ def test_website_and_messaging_observe_same_state(
     services.interfaces.process_inbound_event(msg_event)
     # The website (via the plan service) sees the same conversation event.
     events = services.plans.list_conversation_events(
-        project_id=project.id, limit=10
+        project_id=project.id, actor_id=owner.id, limit=10
     )
     assert len(events) == 1
     assert events[0].content == "Shared message."
@@ -466,7 +483,7 @@ def test_platform_outage_does_not_lose_backend_state(
     )
     # The conversation event is still in the backend.
     events = services.plans.list_conversation_events(
-        project_id=project.id, limit=10
+        project_id=project.id, actor_id=owner.id, limit=10
     )
     assert len(events) == 1
     assert events[0].content == "Before outage."
@@ -501,13 +518,17 @@ def test_64bit_telegram_id_preserved(services, project_with_owner_and_binding) -
     user2 = services.identity.create_user(display_name="Big ID User")
     big_id = "9223372036854775807"  # max signed 64-bit
     services.identity.link_external_identity(
-        user_id=user2.id, platform="telegram",
-        external_id=big_id, verified=True,
+        user_id=user2.id,
+        platform="telegram",
+        external_id=big_id,
+        verified=True,
     )
     # Add user2 as a project member.
     services.identity.add_member(
-        project_id=project.id, actor_id=owner.id,
-        member_id=user2.id, role="member",
+        project_id=project.id,
+        actor_id=owner.id,
+        member_id=user2.id,
+        role="member",
     )
     # Send an event from the big-ID user.
     event = NormalizedEvent(
@@ -534,46 +555,56 @@ def test_interface_events_isolated_across_projects(services) -> None:
     project-scoped."""
     # Project A with enabled binding.
     owner_a = services.identity.create_user(display_name="Owner A")
-    project_a = services.identity.create_project(
-        owner_id=owner_a.id, name="Project A"
-    )
+    project_a = services.identity.create_project(owner_id=owner_a.id, name="Project A")
     services.identity.link_external_identity(
-        user_id=owner_a.id, platform="telegram",
-        external_id="111", verified=True,
+        user_id=owner_a.id,
+        platform="telegram",
+        external_id="111",
+        verified=True,
     )
     services.interfaces.create_binding(
-        project_id=project_a.id, actor_id=owner_a.id,
-        platform="telegram", chat_id="200", topic_id=None,
+        project_id=project_a.id,
+        actor_id=owner_a.id,
+        platform="telegram",
+        chat_id="200",
+        topic_id=None,
         is_enabled=True,
     )
     # Project B with enabled binding in a different chat.
     owner_b = services.identity.create_user(display_name="Owner B")
-    project_b = services.identity.create_project(
-        owner_id=owner_b.id, name="Project B"
-    )
+    project_b = services.identity.create_project(owner_id=owner_b.id, name="Project B")
     services.identity.link_external_identity(
-        user_id=owner_b.id, platform="telegram",
-        external_id="222", verified=True,
+        user_id=owner_b.id,
+        platform="telegram",
+        external_id="222",
+        verified=True,
     )
     services.interfaces.create_binding(
-        project_id=project_b.id, actor_id=owner_b.id,
-        platform="telegram", chat_id="300", topic_id=None,
+        project_id=project_b.id,
+        actor_id=owner_b.id,
+        platform="telegram",
+        chat_id="300",
+        topic_id=None,
         is_enabled=True,
     )
     # Send a message in project A's chat.
     event_a = NormalizedEvent(
-        platform="telegram", external_event_id="update_iso_a",
-        external_actor_id="111", chat_id="200", topic_id=None,
-        event_kind="message", content="Project A message.",
+        platform="telegram",
+        external_event_id="update_iso_a",
+        external_actor_id="111",
+        chat_id="200",
+        topic_id=None,
+        event_kind="message",
+        content="Project A message.",
     )
     services.interfaces.process_inbound_event(event_a)
     # Project B's conversation events should be empty.
     events_b = services.plans.list_conversation_events(
-        project_id=project_b.id, limit=10
+        project_id=project_b.id, actor_id=owner_b.id, limit=10
     )
     assert len(events_b) == 0
     # Project A has the event.
     events_a = services.plans.list_conversation_events(
-        project_id=project_a.id, limit=10
+        project_id=project_a.id, actor_id=owner_a.id, limit=10
     )
     assert len(events_a) == 1

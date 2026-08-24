@@ -28,10 +28,16 @@ dependency, and has preserved required human work or recovery artifacts.
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import shutil
+import signal
+import sqlite3
 import subprocess
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
@@ -46,6 +52,7 @@ from zero.domain.ids import (
 )
 from zero.domain.worktrees import (
     ArtifactKind,
+    CommandPolicyError,
     CommandRun,
     CommandRunId,
     CommandRunState,
@@ -58,14 +65,18 @@ from zero.domain.worktrees import (
     Worktree,
     WorktreeAlreadyExistsError,
     WorktreeCleanupError,
+    WorktreeError,
     WorktreeId,
     WorktreeState,
     is_valid_worktree_transition,
 )
 from zero.persistence.repositories.audit_repository import AuditRepository
+from zero.persistence.repositories.execution_repository import ExecutionRepository
 from zero.persistence.repositories.worktree_repository import (
     WorktreeRepository,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _now_utc_iso() -> str:
@@ -74,6 +85,94 @@ def _now_utc_iso() -> str:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _run_bounded_git_output(
+    args: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout: float,
+    max_bytes: int,
+) -> tuple[str, int, bool]:
+    """Run a git read command without buffering unbounded child output.
+
+    A dedicated reader thread drains the child's stdout so the parent
+    never blocks on a full pipe. This works on both POSIX selectors and
+    Windows, where ``select()`` cannot wait on pipes.
+    """
+    capture_limit = max_bytes + 1
+    process = subprocess.Popen(
+        args,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    def terminate_process_group() -> None:
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+                return
+            except ProcessLookupError:
+                pass
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+    chunks: list[bytes] = []
+    total = 0
+    truncated_early = False
+
+    def drain() -> None:
+        nonlocal total, truncated_early
+        assert process.stdout is not None
+        while True:
+            try:
+                data = process.stdout.read(8192)
+            except (OSError, ValueError):
+                return
+            if not data:
+                return
+            room = capture_limit - total
+            if room > 0:
+                chunks.append(data[:room])
+                total += min(len(data), room)
+            else:
+                truncated_early = True
+            if total >= capture_limit:
+                terminate_process_group()
+
+    reader = threading.Thread(target=drain, name="zero-bounded-git-reader", daemon=True)
+    reader.start()
+    try:
+        reader.join(timeout=timeout)
+        if reader.is_alive():
+            # The child kept producing output past the deadline.
+            terminate_process_group()
+            reader.join(timeout=5)
+            raise subprocess.TimeoutExpired(args, timeout)
+        if (truncated_early or total >= capture_limit) and process.poll() is None:
+            # The budget was reached; stop the child before waiting.
+            terminate_process_group()
+        process.wait(timeout=5)
+    except BaseException:
+        terminate_process_group()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+    raw = b"".join(chunks)
+    truncated = len(raw) > max_bytes
+    return raw[:max_bytes].decode("utf-8", errors="replace"), process.returncode, truncated
 
 
 # ----------------------------------------------------------------------
@@ -108,6 +207,13 @@ def validate_repository_path(local_path: str) -> str:
             f"local_path must not contain '..' components; got {local_path!r}",
             path=local_path,
         )
+    # Reject links before resolving them.  Resolving a symlink and then
+    # accepting its target turns a path indirection into an escape hatch.
+    if p.is_symlink():
+        raise PathValidationError(
+            f"local_path must not be a symlink: {local_path!r}",
+            path=local_path,
+        )
     # Resolve and check it's still absolute and doesn't escape.
     try:
         resolved = p.resolve(strict=True)
@@ -138,18 +244,14 @@ def validate_repository_path(local_path: str) -> str:
     return str(resolved)
 
 
-def validate_worktree_path(
-    worktree_root: str, worktree_id: str
-) -> str:
+def validate_worktree_path(worktree_root: str, worktree_id: str) -> str:
     """Validate and construct a worktree path.
 
     The worktree path is ``<worktree_root>/<worktree_id>``. The
     worktree_root must be absolute and must not contain ``..``.
     """
     if not worktree_root or not isinstance(worktree_root, str):
-        raise PathValidationError(
-            "worktree_root must not be empty", path=worktree_root
-        )
+        raise PathValidationError("worktree_root must not be empty", path=worktree_root)
     root = Path(worktree_root)
     if not root.is_absolute():
         raise PathValidationError(
@@ -211,14 +313,202 @@ class WorktreeService:
         audit_repo: AuditRepository,
         authorization_service: AuthorizationService,
         *,
+        execution_repo: ExecutionRepository | None = None,
         worktree_root: str | None = None,
+        allowed_commands: frozenset[str] | set[str] | tuple[str, ...] = (),
+        isolation_mode: Literal["disabled", "host_bounded"] = "host_bounded",
+        max_timeout_seconds: int = 300,
+        max_output_bytes: int = 64 * 1024,
     ) -> None:
         self._repo = worktree_repo
         self._audit_repo = audit_repo
         self._authz = authorization_service
+        self._execution_repo = execution_repo or ExecutionRepository(worktree_repo._database)
         # worktree_root is the parent directory under which all
         # worktrees are created. If None, a default is used.
-        self._worktree_root = worktree_root or "/tmp/zero-worktrees"
+        from zero.config import DEFAULT_WORKTREE_ROOT
+
+        self._worktree_root = worktree_root or DEFAULT_WORKTREE_ROOT
+        self._allowed_commands = frozenset(allowed_commands)
+        if isolation_mode not in {"disabled", "host_bounded"}:
+            raise ValueError("unsupported worktree isolation mode")
+        self._isolation_mode = isolation_mode
+        self._max_timeout_seconds = max_timeout_seconds
+        self._max_output_bytes = max_output_bytes
+
+    @property
+    def max_command_timeout_seconds(self) -> int:
+        """The configured upper bound for worktree command timeouts."""
+        return self._max_timeout_seconds
+
+    def _ensure_private_worktree_root(self) -> Path:
+        root = Path(self._worktree_root)
+        if root.exists() and root.is_symlink():
+            raise PathValidationError("worktree root must not be a symlink", path=str(root))
+        if root.exists() and not root.is_dir():
+            raise PathValidationError("worktree root must be a directory", path=str(root))
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(root, 0o700)
+            owner = root.stat().st_uid
+        except OSError as exc:
+            raise WorktreeError(f"cannot secure worktree root: {exc}") from exc
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is None:
+            # POSIX ownership semantics are unavailable (e.g. Windows,
+            # where st_uid is a placeholder). The 0700 permission set is
+            # best-effort there; surface the limitation instead of
+            # silently pretending the ownership check passed.
+            logger.warning(
+                "worktree root %s: POSIX uid ownership check unavailable on this "
+                "platform; relying on directory permissions only",
+                root,
+            )
+        elif owner != geteuid():
+            raise WorktreeError("worktree root is not owned by the service user")
+        return root
+
+    def _require_execution_isolation(self) -> None:
+        """Reject execution when no genuine isolation contract is configured."""
+        if self._isolation_mode == "disabled":
+            raise CommandPolicyError(
+                "command execution is disabled: no genuine isolation backend is configured"
+            )
+
+    def _require_no_active_commands(
+        self,
+        *,
+        project_id: ProjectId,
+        worktree_id: WorktreeId,
+    ) -> None:
+        active = self._repo.list_command_runs_for_worktree(
+            worktree_id,
+            project_id=project_id,
+        )
+        terminal = {"completed", "timed_out", "cancelled", "unknown"}
+        if any(run.state not in terminal for run in active):
+            raise WorktreeCleanupError(
+                f"worktree {worktree_id} has a non-terminal command run; refusing cleanup"
+            )
+
+    def _validate_command(
+        self,
+        command: str,
+        args: tuple[str, ...],
+        timeout_seconds: int,
+    ) -> None:
+        """Apply the fail-closed command policy before touching a worktree."""
+        if (
+            not command
+            or not isinstance(command, str)
+            or Path(command).name != command
+            or "/" in command
+            or "\\" in command
+            or command not in self._allowed_commands
+        ):
+            raise CommandPolicyError(
+                f"command {command!r} is not permitted by the configured policy"
+            )
+        if not isinstance(args, tuple) or len(args) > 64:
+            raise CommandPolicyError("command arguments exceed the policy limit")
+        if any(not isinstance(arg, str) or "\x00" in arg or len(arg) > 8192 for arg in args):
+            raise CommandPolicyError("command argument violates the policy")
+        if timeout_seconds < 1 or timeout_seconds > self._max_timeout_seconds:
+            raise CommandPolicyError(
+                f"timeout must be between 1 and {self._max_timeout_seconds} seconds"
+            )
+
+    def _run_bounded_process(
+        self,
+        argv: list[str],
+        *,
+        cwd: str,
+        timeout_seconds: int,
+    ) -> tuple[int | None, bool, str, str]:
+        """Run one allowlisted command with bounded output and group cleanup."""
+        clean_env = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "HOME": cwd,
+            "LANG": "C",
+            "LC_ALL": "C",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+        }
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=clean_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            return 127, False, "", f"Command not found: {argv[0]}"
+
+        output: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+
+        def drain(name: str, stream) -> None:
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    return
+                remaining = self._max_output_bytes - len(output[name])
+                if remaining > 0:
+                    output[name].extend(chunk[:remaining])
+
+        readers = [
+            threading.Thread(
+                target=drain,
+                args=(name, stream),
+                daemon=True,
+            )
+            for name, stream in (
+                ("stdout", proc.stdout),
+                ("stderr", proc.stderr),
+            )
+            if stream is not None
+        ]
+        for reader in readers:
+            reader.start()
+        timed_out = False
+        try:
+            exit_code = proc.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            exit_code = None
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        for reader in readers:
+            reader.join(timeout=2)
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
+
+        marker = f"\n[output truncated after {self._max_output_bytes} bytes]"
+
+        def decode(name: str) -> str:
+            raw = bytes(output[name])
+            truncated = len(raw) >= self._max_output_bytes
+            if truncated:
+                raw = raw[: max(0, self._max_output_bytes - len(marker))]
+                return raw.decode("utf-8", errors="replace") + marker
+            return raw.decode("utf-8", errors="replace")
+
+        stderr = decode("stderr")
+        if timed_out:
+            timeout_marker = f"\n[Command timed out after {timeout_seconds}s]"
+            if (
+                len(stderr.encode("utf-8")) + len(timeout_marker.encode("utf-8"))
+                <= self._max_output_bytes
+            ):
+                stderr += timeout_marker
+        return exit_code, timed_out, decode("stdout"), stderr
 
     # ------------------------------------------------------------------
     # Repository registration
@@ -239,6 +529,12 @@ class WorktreeService:
         Per PLAN.md M6: "Repository registration and validated local
         path handling."
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.start",
+            source=source,
+        )
         if not name or not name.strip():
             raise ValueError("repository name must not be empty")
         validated_path = validate_repository_path(local_path)
@@ -268,13 +564,34 @@ class WorktreeService:
         return repository
 
     def get_repository(
-        self, project_id: ProjectId, repo_id: RepositoryId
+        self,
+        project_id: ProjectId,
+        repo_id: RepositoryId,
+        *,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> Repository:
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
         return self._repo.get_repository(project_id, repo_id)
 
     def list_repositories(
-        self, project_id: ProjectId
+        self,
+        project_id: ProjectId,
+        *,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> list[Repository]:
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
         return self._repo.list_repositories_for_project(project_id)
 
     # ------------------------------------------------------------------
@@ -314,18 +631,24 @@ class WorktreeService:
             permission="execution.start",
             source=source,
         )
+        self._require_execution_isolation()
         # Get the repository (project-scoped).
         repository = self._repo.get_repository(project_id, repository_id)
+        # Validate the complete project -> execution -> task lineage before
+        # creating directories or invoking Git.
+        execution = self._execution_repo.get_execution(execution_id, project_id=project_id)
+        task = self._execution_repo.get_task(task_id, project_id=project_id)
+        if task.execution_id != execution.id:
+            raise WorktreeError(f"Task {task_id} does not belong to execution {execution_id}")
         # Resolve the base revision.
         rev = base_revision or repository.default_base_revision or "HEAD"
         # Generate IDs.
         worktree_id = WorktreeId(generate_worktree_id())
         branch_name = f"zero/{worktree_id.value}"
-        worktree_path = validate_worktree_path(
-            self._worktree_root, worktree_id.value
-        )
-        # Ensure the worktree root exists.
-        Path(self._worktree_root).mkdir(parents=True, exist_ok=True)
+        worktree_path = validate_worktree_path(self._worktree_root, worktree_id.value)
+        # Ensure the worktree root exists, is private, and is owned by
+        # the service user before allocating a child path.
+        self._ensure_private_worktree_root()
         # Create the worktree using git.
         try:
             self._git_worktree_add(
@@ -334,20 +657,21 @@ class WorktreeService:
                 branch_name,
                 rev,
             )
-        except subprocess.CalledProcessError as exc:
-            # Clean up the directory if git failed.
-            try:
-                shutil.rmtree(worktree_path, ignore_errors=True)
-            except Exception:
-                pass
-            raise WorktreeError(
-                f"Failed to create worktree: {exc.stderr or exc}"
-            ) from exc
+            os.chmod(worktree_path, 0o700)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            # Clean up the directory if Git or root hardening failed.
+            shutil.rmtree(worktree_path, ignore_errors=True)
+            detail = getattr(exc, "stderr", None) or exc
+            raise WorktreeError(f"Failed to create worktree: {detail}") from exc
         # Capture the actual base revision (resolve HEAD to a SHA).
         try:
             actual_base = self._git_rev_parse(worktree_path, "HEAD")
-        except Exception:
-            actual_base = rev
+        except (OSError, WorktreeError, subprocess.SubprocessError) as exc:
+            try:
+                self._git_worktree_remove(worktree_path, force=True)
+            except (OSError, WorktreeError):
+                shutil.rmtree(worktree_path, ignore_errors=True)
+            raise WorktreeError("failed to resolve created worktree HEAD") from exc
         # Record the worktree.
         worktree = Worktree(
             id=worktree_id,
@@ -367,9 +691,9 @@ class WorktreeService:
         except WorktreeAlreadyExistsError:
             # Clean up the git worktree we just created.
             try:
-                self._git_worktree_remove(repository.local_path, worktree_path)
-            except Exception:
-                pass
+                self._git_worktree_remove(worktree_path)
+            except (OSError, WorktreeError):
+                logger.debug("duplicate worktree cleanup failed")
             raise
         self._audit_repo.insert(
             AuditEvent(
@@ -381,10 +705,7 @@ class WorktreeService:
                 target_type="worktree",
                 target_id=worktree.id.value,
                 result="success",
-                redacted_summary=(
-                    f"Created worktree {worktree.id.value} for task "
-                    f"{task_id.value}"
-                ),
+                redacted_summary=(f"Created worktree {worktree.id.value} for task {task_id.value}"),
                 correlation_id=execution_id.value,
                 created_at=_now_utc_iso(),
             )
@@ -400,6 +721,12 @@ class WorktreeService:
         source: AuditSource = "system",
     ) -> Worktree:
         """Transition a worktree from ``allocated`` to ``active``."""
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.start",
+            source=source,
+        )
         worktree = self._repo.get_worktree(project_id, worktree_id)
         if not is_valid_worktree_transition(worktree.state, "active"):
             raise InvalidWorktreeTransitionError(
@@ -418,12 +745,17 @@ class WorktreeService:
         source: AuditSource = "system",
     ) -> Worktree:
         """Transition a worktree to ``succeeded`` or ``failed``."""
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.start",
+            source=source,
+        )
         worktree = self._repo.get_worktree(project_id, worktree_id)
         new_state: WorktreeState = "succeeded" if succeeded else "failed"
         if not is_valid_worktree_transition(worktree.state, new_state):
             raise InvalidWorktreeTransitionError(
-                f"Cannot transition worktree from {worktree.state!r} "
-                f"to {new_state!r}"
+                f"Cannot transition worktree from {worktree.state!r} to {new_state!r}"
             )
         self._repo.update_worktree_state(worktree_id, new_state)
         return self._repo.get_worktree(project_id, worktree_id)
@@ -433,31 +765,268 @@ class WorktreeService:
         *,
         project_id: ProjectId,
         worktree_id: WorktreeId,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> Worktree:
         """Mark a worktree as interrupted (e.g. after a crash)."""
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.start",
+            source=source,
+        )
         worktree = self._repo.get_worktree(project_id, worktree_id)
         if not is_valid_worktree_transition(worktree.state, "interrupted"):
             raise InvalidWorktreeTransitionError(
-                f"Cannot transition worktree from {worktree.state!r} "
-                f"to 'interrupted'"
+                f"Cannot transition worktree from {worktree.state!r} to 'interrupted'"
             )
         self._repo.update_worktree_state(worktree_id, "interrupted")
         return self._repo.get_worktree(project_id, worktree_id)
 
     def get_worktree(
-        self, project_id: ProjectId, worktree_id: WorktreeId
+        self,
+        project_id: ProjectId,
+        worktree_id: WorktreeId,
+        *,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> Worktree:
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
         return self._repo.get_worktree(project_id, worktree_id)
 
     def get_worktree_for_task(
-        self, task_id: TaskId
+        self,
+        project_id: ProjectId,
+        task_id: TaskId,
+        *,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> Worktree | None:
-        return self._repo.get_worktree_for_task(task_id)
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        return self._repo.get_worktree_for_task(task_id, project_id=project_id)
 
     def list_worktrees_for_execution(
-        self, execution_id: ExecutionId
+        self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+        *,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> list[Worktree]:
-        return self._repo.list_worktrees_for_execution(execution_id)
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        return self._repo.list_worktrees_for_execution(
+            execution_id,
+            project_id=project_id,
+        )
+
+    def list_worktrees_for_project(
+        self,
+        project_id: ProjectId,
+        *,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> list[Worktree]:
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        return self._repo.list_worktrees_for_project(project_id)
+
+    # ------------------------------------------------------------------
+    # Scoped file operations
+    # ------------------------------------------------------------------
+
+    def _owned_worktree_for_file(
+        self,
+        *,
+        project_id: ProjectId,
+        worktree_id: WorktreeId,
+        task_id: TaskId,
+        actor_id: UserId,
+        permission: Literal["execution.start", "execution.view_diffs"],
+        source: AuditSource,
+    ) -> Worktree:
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission=permission,
+            source=source,
+        )
+        worktree = self._repo.get_worktree(project_id, worktree_id)
+        if worktree.task_id != task_id:
+            raise WorktreeError("task does not own the requested worktree")
+        if worktree.state not in ("allocated", "active", "interrupted"):
+            raise InvalidWorktreeTransitionError(
+                f"Cannot access files in worktree state {worktree.state!r}"
+            )
+        worktree_path = Path(worktree.worktree_path)
+        if worktree_path.is_symlink() or not worktree_path.is_dir():
+            raise PathValidationError(
+                "worktree path is not a resident directory", path=worktree.worktree_path
+            )
+        if not is_path_inside(str(worktree_path), self._worktree_root):
+            raise PathValidationError(
+                "worktree path escaped the private root", path=worktree.worktree_path
+            )
+        return worktree
+
+    @staticmethod
+    def _resolve_task_file(worktree: Worktree, relative_path: str) -> tuple[Path, str]:
+        if not isinstance(relative_path, str) or not relative_path.strip():
+            raise PathValidationError("relative_path must not be empty", path=str(relative_path))
+        if len(relative_path) > 4096:
+            raise PathValidationError("relative_path is too long", path=relative_path)
+        candidate = Path(relative_path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise PathValidationError(
+                "relative_path must stay inside the worktree", path=relative_path
+            )
+        if any(part == ".git" or part.startswith(".git/") for part in candidate.parts):
+            raise PathValidationError("Git metadata is not a task file", path=relative_path)
+        root = Path(worktree.worktree_path).resolve(strict=True)
+        target = root.joinpath(candidate)
+        try:
+            resolved = target.resolve(strict=False)
+        except (OSError, RuntimeError) as exc:
+            raise PathValidationError(
+                "relative_path could not be resolved", path=relative_path
+            ) from exc
+        if not is_path_inside(str(resolved), str(root)):
+            raise PathValidationError("relative_path escaped the worktree", path=relative_path)
+        if target.exists() and target.is_symlink():
+            raise PathValidationError("symlinked task files are not permitted", path=relative_path)
+        return resolved, str(candidate)
+
+    def read_file(
+        self,
+        *,
+        project_id: ProjectId,
+        worktree_id: WorktreeId,
+        task_id: TaskId,
+        actor_id: UserId,
+        relative_path: str,
+        max_bytes: int = 256 * 1024,
+        source: AuditSource = "system",
+    ) -> str:
+        """Read a bounded UTF-8 file from the task-owned worktree."""
+        if max_bytes < 1 or max_bytes > 1024 * 1024:
+            raise ValueError("max_bytes must be between 1 and 1048576")
+        worktree = self._owned_worktree_for_file(
+            project_id=project_id,
+            worktree_id=worktree_id,
+            task_id=task_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
+        path, display_path = self._resolve_task_file(worktree, relative_path)
+        if not path.is_file():
+            raise WorktreeError(f"task file does not exist: {display_path}")
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise WorktreeError(f"task file could not be read: {display_path}") from exc
+        if len(raw) > max_bytes:
+            raise WorktreeError(f"task file exceeds the {max_bytes}-byte read limit")
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WorktreeError("binary task files are not exposed to the text model") from exc
+        self._audit_repo.insert(
+            AuditEvent(
+                id=AuditEventId(generate_audit_event_id()),
+                project_id=project_id,
+                actor_id=actor_id,
+                source=source,
+                operation="file.read",
+                target_type="worktree_file",
+                target_id=f"{worktree.id.value}:{display_path}",
+                result="success",
+                redacted_summary=f"Read bounded task file {display_path!r}",
+                correlation_id=worktree.execution_id.value,
+                created_at=_now_utc_iso(),
+            )
+        )
+        return content
+
+    def write_file(
+        self,
+        *,
+        project_id: ProjectId,
+        worktree_id: WorktreeId,
+        task_id: TaskId,
+        actor_id: UserId,
+        relative_path: str,
+        content: str,
+        max_bytes: int = 256 * 1024,
+        source: AuditSource = "system",
+    ) -> str:
+        """Atomically write one bounded UTF-8 file inside a task worktree."""
+        if not isinstance(content, str):
+            raise TypeError("content must be text")
+        encoded = content.encode("utf-8")
+        if len(encoded) > max_bytes or max_bytes < 1 or max_bytes > 1024 * 1024:
+            raise WorktreeError(f"task file exceeds the {max_bytes}-byte write limit")
+        worktree = self._owned_worktree_for_file(
+            project_id=project_id,
+            worktree_id=worktree_id,
+            task_id=task_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
+        path, display_path = self._resolve_task_file(worktree, relative_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.is_symlink():
+            raise PathValidationError("symlinked task files are not permitted", path=relative_path)
+        temporary = path.with_name(f".{path.name}.zero-write-{os.getpid()}-{threading.get_ident()}")
+        try:
+            temporary.write_bytes(encoded)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        except OSError as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise WorktreeError(f"task file could not be written: {display_path}") from exc
+        content_hash = _sha256(content)
+        self._audit_repo.insert(
+            AuditEvent(
+                id=AuditEventId(generate_audit_event_id()),
+                project_id=project_id,
+                actor_id=actor_id,
+                source=source,
+                operation="file.write",
+                target_type="worktree_file",
+                target_id=f"{worktree.id.value}:{display_path}",
+                result="success",
+                redacted_summary=(
+                    f"Wrote task file {display_path!r} "
+                    f"({len(encoded)} bytes, sha256={content_hash})"
+                ),
+                correlation_id=worktree.execution_id.value,
+                created_at=_now_utc_iso(),
+            )
+        )
+        return content_hash
 
     # ------------------------------------------------------------------
     # Command runner
@@ -490,16 +1059,27 @@ class WorktreeService:
         ``git merge``, or any deployment command. It is the caller's
         responsibility to ensure the command is safe.
         """
+        # Check authority and the explicit policy before looking up the
+        # worktree.  This both fails closed and avoids exposing resource
+        # details to callers without execution authority.
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.start",
+            source=source,
+        )
+        self._require_execution_isolation()
+        self._validate_command(command, args, timeout_seconds)
         worktree = self._repo.get_worktree(project_id, worktree_id)
+        if worktree.task_id != task_id:
+            raise WorktreeError("task does not own the requested worktree; refusing command")
         if worktree.state not in ("allocated", "active", "interrupted"):
             raise InvalidWorktreeTransitionError(
                 f"Cannot run command in worktree state {worktree.state!r}"
             )
         # Validate the worktree path still exists and is inside the root.
         if not Path(worktree.worktree_path).is_dir():
-            raise WorktreeError(
-                f"Worktree path does not exist: {worktree.worktree_path}"
-            )
+            raise WorktreeError(f"Worktree path does not exist: {worktree.worktree_path}")
         if not is_path_inside(worktree.worktree_path, self._worktree_root):
             raise PathValidationError(
                 f"Worktree path escaped root: {worktree.worktree_path}",
@@ -525,33 +1105,31 @@ class WorktreeService:
         # Transition worktree to active if it was allocated.
         if worktree.state == "allocated":
             self._repo.update_worktree_state(worktree_id, "active")
-        # Run the command.
+        # Run the command in a clean environment and a dedicated process
+        # group.  The helper drains pipes while the process runs, so a noisy
+        # child cannot deadlock the runner or grow stored output without a
+        # bound.
         try:
-            proc = subprocess.run(
+            exit_code, timed_out, stdout, stderr = self._run_bounded_process(
                 [command, *args],
                 cwd=worktree.worktree_path,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
+                timeout_seconds=timeout_seconds,
             )
-            new_state: CommandRunState = "completed"
-            exit_code = proc.returncode
-            timed_out = False
-            stdout = proc.stdout
-            stderr = proc.stderr
-        except subprocess.TimeoutExpired as exc:
-            new_state = "timed_out"
-            exit_code = None
-            timed_out = True
-            stdout = exc.stdout.decode("utf-8", errors="replace") if exc.stdout else ""
-            stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
-            stderr += f"\n[Command timed out after {timeout_seconds}s]"
-        except FileNotFoundError:
-            new_state = "completed"
-            exit_code = 127
-            timed_out = False
-            stdout = ""
-            stderr = f"Command not found: {command}"
+        except (OSError, WorktreeError, subprocess.SubprocessError) as exc:
+            try:
+                self._repo.update_command_run_state(
+                    run_id,
+                    "unknown",
+                    exit_code=None,
+                    timed_out=False,
+                )
+            except (OSError, RuntimeError, sqlite3.Error) as cleanup_exc:
+                logger.debug(
+                    "command-run failure state could not be persisted: %s",
+                    type(cleanup_exc).__name__,
+                )
+            raise WorktreeError(f"command runner failed before completion: {exc}") from exc
+        new_state: CommandRunState = "timed_out" if timed_out else "completed"
         # Update the command run.
         self._repo.update_command_run_state(
             run_id,
@@ -584,11 +1162,7 @@ class WorktreeService:
                 )
             )
         # Capture exit status artifact.
-        exit_content = (
-            f"exit_code={exit_code}\n"
-            f"timed_out={timed_out}\n"
-            f"state={new_state}\n"
-        )
+        exit_content = f"exit_code={exit_code}\ntimed_out={timed_out}\nstate={new_state}\n"
         artifacts.append(
             self._capture_artifact(
                 project_id=project_id,
@@ -611,8 +1185,7 @@ class WorktreeService:
                 target_id=run_id.value,
                 result="success" if new_state == "completed" and exit_code == 0 else "failure",
                 redacted_summary=(
-                    f"Ran {command} (exit={exit_code}, "
-                    f"timed_out={timed_out}, state={new_state})"
+                    f"Ran {command} (exit={exit_code}, timed_out={timed_out}, state={new_state})"
                 ),
                 correlation_id=worktree.execution_id.value,
                 created_at=_now_utc_iso(),
@@ -637,41 +1210,86 @@ class WorktreeService:
         and untracked files (via ``git status``) so the diff artifact
         gives a complete picture of what changed.
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        self._require_execution_isolation()
         worktree = self._repo.get_worktree(project_id, worktree_id)
-        if not Path(worktree.worktree_path).is_dir():
-            raise WorktreeError(
-                f"Worktree path does not exist: {worktree.worktree_path}"
+        if worktree.task_id != task_id:
+            raise WorktreeError("task does not own the requested worktree; refusing diff")
+        worktree_path = Path(worktree.worktree_path)
+        if worktree_path.is_symlink() or not is_path_inside(
+            str(worktree_path), self._worktree_root
+        ):
+            raise PathValidationError(
+                "worktree path is outside the private worktree root",
+                path=worktree.worktree_path,
             )
+        if not worktree_path.is_dir():
+            raise WorktreeError(f"Worktree path does not exist: {worktree.worktree_path}")
         parts: list[str] = []
         # Capture tracked changes.
         try:
-            proc = subprocess.run(
-                ["git", "diff", worktree.base_revision],
+            tracked_output, _returncode, tracked_truncated = _run_bounded_git_output(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "diff.external=",
+                    "-C",
+                    worktree.worktree_path,
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "diff",
+                    worktree.base_revision,
+                ],
                 cwd=worktree.worktree_path,
-                capture_output=True,
-                text=True,
                 timeout=60,
+                env=self._git_environment(),
+                max_bytes=self._max_output_bytes,
             )
-            if proc.stdout:
+            if tracked_output:
                 parts.append("--- Tracked changes ---\n")
-                parts.append(proc.stdout)
+                parts.append(tracked_output)
+            if tracked_truncated:
+                parts.append("\n[tracked diff truncated by policy]\n")
         except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
             parts.append(f"[Failed to capture tracked diff: {exc}]\n")
         # Capture untracked files.
         try:
-            proc = subprocess.run(
-                ["git", "status", "--porcelain"],
+            status_output, _returncode, status_truncated = _run_bounded_git_output(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-C",
+                    worktree.worktree_path,
+                    "status",
+                    "--porcelain",
+                ],
                 cwd=worktree.worktree_path,
-                capture_output=True,
-                text=True,
                 timeout=60,
+                env=self._git_environment(),
+                max_bytes=self._max_output_bytes,
             )
-            if proc.stdout:
+            if status_output:
                 parts.append("--- Status (includes untracked) ---\n")
-                parts.append(proc.stdout)
+                parts.append(status_output)
+            if status_truncated:
+                parts.append("\n[git status truncated by policy]\n")
         except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
             parts.append(f"[Failed to capture status: {exc}]\n")
         diff_content = "".join(parts)
+        encoded = diff_content.encode("utf-8")
+        if len(encoded) > self._max_output_bytes:
+            diff_content = (
+                encoded[: self._max_output_bytes].decode("utf-8", errors="replace")
+                + "\n[output truncated by policy]\n"
+            )
         return self._capture_artifact(
             project_id=project_id,
             worktree_id=worktree_id,
@@ -679,6 +1297,87 @@ class WorktreeService:
             command_run_id=None,
             kind="diff",
             content=diff_content,
+        )
+
+    def capture_source_snapshot(
+        self,
+        *,
+        project_id: ProjectId,
+        worktree_id: WorktreeId,
+        task_id: TaskId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> TaskArtifact:
+        """Capture a typed record of the worktree's source state.
+
+        The snapshot records the exact base commit, the current HEAD,
+        and the porcelain status so the source state a task started
+        from (and ended in) is provable without shipping file contents.
+        This makes the ``source_snapshot`` evidence label satisfiable by
+        the runtime instead of permanently unprovable.
+        """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        self._require_execution_isolation()
+        worktree = self._repo.get_worktree(project_id, worktree_id)
+        if worktree.task_id != task_id:
+            raise WorktreeError("task does not own the requested worktree; refusing snapshot")
+        worktree_path = Path(worktree.worktree_path)
+        if worktree_path.is_symlink() or not is_path_inside(
+            str(worktree_path), self._worktree_root
+        ):
+            raise PathValidationError(
+                "worktree path is outside the private worktree root",
+                path=worktree.worktree_path,
+            )
+        if not worktree_path.is_dir():
+            raise WorktreeError(f"Worktree path does not exist: {worktree.worktree_path}")
+        parts: list[str] = [
+            f"base_revision: {worktree.base_revision}\n",
+        ]
+        for label, args in (
+            ("head", ["rev-parse", "HEAD"]),
+            ("status", ["status", "--porcelain"]),
+        ):
+            try:
+                output, _returncode, truncated = _run_bounded_git_output(
+                    [
+                        "git",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-C",
+                        worktree.worktree_path,
+                        *args,
+                    ],
+                    cwd=worktree.worktree_path,
+                    timeout=60,
+                    env=self._git_environment(),
+                    max_bytes=self._max_output_bytes,
+                )
+                parts.append(f"--- {label} ---\n{output}")
+                if truncated:
+                    parts.append(f"\n[{label} truncated by policy]\n")
+            except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+                parts.append(f"[Failed to capture {label}: {exc}]\n")
+        # The worktree-local task_artifacts table does not carry this
+        # kind (its CHECK predates the evidence label); the caller
+        # persists the snapshot canonically at the project artifact
+        # layer, which does accept ``source_snapshot``.
+        content = "".join(parts)
+        return TaskArtifact(
+            id=TaskArtifactId(generate_task_artifact_id()),
+            project_id=project_id,
+            worktree_id=worktree_id,
+            task_id=task_id,
+            command_run_id=None,
+            kind="source_snapshot",
+            content=content,
+            content_hash=_sha256(content),
+            created_at=_now_utc_iso(),
         )
 
     def _capture_artifact(
@@ -723,11 +1422,20 @@ class WorktreeService:
         recovery checks pass." The caller must verify that integration
         is complete before calling this.
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.start",
+            source=source,
+        )
         worktree = self._repo.get_worktree(project_id, worktree_id)
+        self._require_no_active_commands(
+            project_id=project_id,
+            worktree_id=worktree_id,
+        )
         if not is_valid_worktree_transition(worktree.state, "cleanup_eligible"):
             raise InvalidWorktreeTransitionError(
-                f"Cannot transition worktree from {worktree.state!r} "
-                f"to 'cleanup_eligible'"
+                f"Cannot transition worktree from {worktree.state!r} to 'cleanup_eligible'"
             )
         self._repo.update_worktree_state(
             worktree_id,
@@ -757,7 +1465,17 @@ class WorktreeService:
           (it refuses to remove if there are uncommitted changes unless
           ``--force`` is passed; we do NOT pass ``--force``).
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.start",
+            source=source,
+        )
         worktree = self._repo.get_worktree(project_id, worktree_id)
+        self._require_no_active_commands(
+            project_id=project_id,
+            worktree_id=worktree_id,
+        )
         if worktree.state != "cleanup_eligible":
             raise WorktreeCleanupError(
                 f"Worktree {worktree_id} is in state {worktree.state!r}, "
@@ -772,9 +1490,7 @@ class WorktreeService:
         # Remove the git worktree.
         if Path(worktree.worktree_path).exists():
             try:
-                self._git_worktree_remove(
-                    worktree.worktree_path, force=False
-                )
+                self._git_worktree_remove(worktree.worktree_path, force=False)
             except subprocess.CalledProcessError as exc:
                 # git refused to remove (e.g. uncommitted changes).
                 raise WorktreeCleanupError(
@@ -819,6 +1535,12 @@ class WorktreeService:
         ``interrupted``; it is NOT deleted. The caller can then decide
         whether to resume or clean up.
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.start",
+            source=source,
+        )
         worktrees = self._repo.list_worktrees_for_project(project_id)
         recovered: list[Worktree] = []
         for wt in worktrees:
@@ -826,8 +1548,11 @@ class WorktreeService:
                 try:
                     self._repo.update_worktree_state(wt.id, "interrupted")
                     recovered.append(self._repo.get_worktree(project_id, wt.id))
-                except Exception:
-                    pass
+                except (OSError, RuntimeError, WorktreeError, sqlite3.Error) as recovery_exc:
+                    logger.debug(
+                        "worktree recovery failed: %s",
+                        type(recovery_exc).__name__,
+                    )
         if recovered:
             self._audit_repo.insert(
                 AuditEvent(
@@ -839,9 +1564,7 @@ class WorktreeService:
                     target_type="worktree",
                     target_id=None,
                     result="success",
-                    redacted_summary=(
-                        f"Recovered {len(recovered)} worktrees after restart"
-                    ),
+                    redacted_summary=(f"Recovered {len(recovered)} worktrees after restart"),
                     created_at=_now_utc_iso(),
                 )
             )
@@ -853,20 +1576,59 @@ class WorktreeService:
 
     def list_artifacts_for_task(
         self,
+        project_id: ProjectId,
         task_id: TaskId,
         *,
+        actor_id: UserId,
         kind: ArtifactKind | None = None,
+        source: AuditSource = "system",
     ) -> list[TaskArtifact]:
-        return self._repo.list_artifacts_for_task(task_id, kind=kind)
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        return self._repo.list_artifacts_for_task(
+            task_id,
+            project_id=project_id,
+            kind=kind,
+        )
 
     def list_command_runs_for_worktree(
-        self, worktree_id: WorktreeId
+        self,
+        project_id: ProjectId,
+        worktree_id: WorktreeId,
+        *,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> list[CommandRun]:
-        return self._repo.list_command_runs_for_worktree(worktree_id)
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        return self._repo.list_command_runs_for_worktree(
+            worktree_id,
+            project_id=project_id,
+        )
 
     # ------------------------------------------------------------------
     # Git helpers
     # ------------------------------------------------------------------
+
+    def _git_environment(self) -> dict[str, str]:
+        return {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "HOME": "/nonexistent",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "GIT_EDITOR": ":",
+        }
 
     def _git_worktree_add(
         self,
@@ -879,6 +1641,10 @@ class WorktreeService:
         subprocess.run(
             [
                 "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "diff.external=",
                 "-C",
                 repo_path,
                 "worktree",
@@ -891,40 +1657,72 @@ class WorktreeService:
             check=True,
             capture_output=True,
             text=True,
+            timeout=60,
+            env=self._git_environment(),
         )
 
-    def _git_worktree_remove(
-        self, worktree_path: str, *, force: bool = False
-    ) -> None:
+    def _git_worktree_remove(self, worktree_path: str, *, force: bool = False) -> None:
         """Run ``git worktree remove <path>``.
 
-        The command must be run from within a git repository. We run
-        it from the worktree path itself, which git recognizes as part
-        of the worktree network (the worktree has a ``.git`` file that
-        points back to the main repo).
+        The command must run from within the repository network. We
+        resolve the main repository from the worktree's ``.git`` file
+        and run from there. In particular we do NOT use the worktree
+        itself as the working directory: on Windows a process holds a
+        delete lock on its current directory, which would make the
+        removal fail with a spurious permission error.
         """
-        cmd = ["git", "worktree", "remove"]
+        cmd = ["git", "-c", "core.hooksPath=/dev/null", "worktree", "remove"]
         if force:
             cmd.append("--force")
         cmd.append(worktree_path)
         subprocess.run(
             cmd,
-            cwd=worktree_path,
+            cwd=self._worktree_parent_repo_path(worktree_path),
             check=True,
             capture_output=True,
             text=True,
+            timeout=60,
+            env=self._git_environment(),
         )
+
+    @staticmethod
+    def _worktree_parent_repo_path(worktree_path: str) -> str:
+        """Resolve the main repository path for a linked worktree."""
+        git_file = Path(worktree_path) / ".git"
+        if git_file.is_file():
+            try:
+                first_line = git_file.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+            except (OSError, IndexError):
+                first_line = ""
+            if first_line.startswith("gitdir:"):
+                gitdir = Path(first_line[len("gitdir:") :].strip())
+                # ``<repo>/.git/worktrees/<name>`` -> repo root is three
+                # levels up when relative; absolute paths are kept.
+                if not gitdir.is_absolute():
+                    gitdir = Path(worktree_path) / gitdir
+                candidate = gitdir.parent.parent.parent
+                if (candidate / ".git").exists():
+                    return str(candidate)
+        return worktree_path
 
     def _git_rev_parse(self, repo_path: str, ref: str) -> str:
         """Resolve a ref to a SHA."""
         proc = subprocess.run(
-            ["git", "-C", repo_path, "rev-parse", ref],
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "diff.external=",
+                "-C",
+                repo_path,
+                "rev-parse",
+                ref,
+            ],
             check=True,
             capture_output=True,
             text=True,
+            timeout=60,
+            env=self._git_environment(),
         )
         return proc.stdout.strip()
-
-
-# Import here to avoid circular import at module load time.
-from zero.domain.worktrees import WorktreeError

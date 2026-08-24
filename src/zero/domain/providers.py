@@ -28,8 +28,9 @@ Per ``zero-claude-token-economics`` SKILL.md:
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from zero.domain.artifacts import ArtifactId
 from zero.domain.execution import ExecutionId
@@ -84,8 +85,7 @@ class ProviderModelId:
             raise ValueError("ProviderModelId must be a non-empty string")
         if not self.value.startswith(PROVIDER_MODEL_ID_PREFIX):
             raise ValueError(
-                f"ProviderModelId must start with "
-                f"{PROVIDER_MODEL_ID_PREFIX!r}; got {self.value!r}"
+                f"ProviderModelId must start with {PROVIDER_MODEL_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -144,6 +144,51 @@ class CanonicalMessage:
 
 
 @dataclass(frozen=True)
+class ToolDeclaration:
+    """A tool advertised to the model, including its argument JSON Schema.
+
+    A bare tool name gives the model no contract for its arguments;
+    real function calling requires the parameter schema to travel with
+    the request. ``parameters`` must be a JSON-Schema object mapping
+    when provided.
+    """
+
+    name: str
+    description: str = ""
+    parameters: Mapping[str, Any] | None = None
+
+    def normalized_parameters(self) -> dict[str, Any]:
+        if self.parameters is None:
+            return {"type": "object"}
+        if not isinstance(self.parameters, Mapping):
+            raise TypeError(f"tool {self.name!r} parameters must be a JSON-Schema object")
+        return dict(self.parameters)
+
+
+def coerce_tool_declarations(
+    tools: Sequence[ToolDeclaration | str | Mapping[str, Any]],
+) -> tuple[ToolDeclaration, ...]:
+    """Normalize mixed name/declaration tool specs into declarations."""
+    declarations: list[ToolDeclaration] = []
+    for tool in tools:
+        if isinstance(tool, ToolDeclaration):
+            declarations.append(tool)
+        elif isinstance(tool, str):
+            declarations.append(ToolDeclaration(name=tool))
+        elif isinstance(tool, Mapping):
+            declarations.append(
+                ToolDeclaration(
+                    name=str(tool.get("name") or ""),
+                    description=str(tool.get("description") or ""),
+                    parameters=tool.get("parameters"),
+                )
+            )
+        else:
+            raise TypeError(f"unsupported tool specification: {type(tool).__name__}")
+    return tuple(declarations)
+
+
+@dataclass(frozen=True)
 class CanonicalRequest:
     """A provider-neutral request to a model.
 
@@ -157,7 +202,9 @@ class CanonicalRequest:
         messages: the conversation messages.
         max_tokens: max output tokens.
         temperature: sampling temperature (0.0 = deterministic).
-        tools: tuple of tool name strings available to the model.
+        tools: tool declarations available to the model. Bare name
+            strings are accepted for compatibility and coerced to
+            declarations without schemas.
         system_message: optional system message (separate from messages).
     """
 
@@ -166,8 +213,9 @@ class CanonicalRequest:
     messages: tuple[CanonicalMessage, ...]
     max_tokens: int = 4096
     temperature: float = 0.0
-    tools: tuple[str, ...] = ()
+    tools: tuple[ToolDeclaration | str, ...] = ()
     system_message: str | None = None
+    stream: bool = False
 
 
 @dataclass(frozen=True)
@@ -205,14 +253,21 @@ class CanonicalResponse:
     content: str
     tool_calls: tuple[ToolCallResult, ...] = ()
     finish_reason: str = "stop"
-    usage: TokenUsage = None  # type: ignore[assignment]
+    usage: TokenUsage | None = None
     provider_message_id: str | None = None
     raw_response_artifact_id: ArtifactId | None = None
 
 
-# ----------------------------------------------------------------------
-# Token usage (separate classes per zero-claude-token-economics)
-# ----------------------------------------------------------------------
+@dataclass(frozen=True)
+class CanonicalStreamEvent:
+    """Provider-neutral incremental response event."""
+
+    kind: Literal["text_delta", "tool_call_delta", "usage", "message_end"]
+    text: str = ""
+    tool_call: ToolCallResult | None = None
+    usage: TokenUsage | None = None
+    finish_reason: str | None = None
+    provider_message_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -240,23 +295,15 @@ class TokenUsage:
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
             cache_creation_input_tokens=(
-                self.cache_creation_input_tokens
-                + other.cache_creation_input_tokens
+                self.cache_creation_input_tokens + other.cache_creation_input_tokens
             ),
-            cache_read_input_tokens=(
-                self.cache_read_input_tokens
-                + other.cache_read_input_tokens
-            ),
+            cache_read_input_tokens=(self.cache_read_input_tokens + other.cache_read_input_tokens),
         )
 
     @property
     def total_input_tokens(self) -> int:
         """Total processed input = uncached + cache creation + cache read."""
-        return (
-            self.input_tokens
-            + self.cache_creation_input_tokens
-            + self.cache_read_input_tokens
-        )
+        return self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
 
     @property
     def cache_read_ratio(self) -> float:
@@ -271,28 +318,31 @@ class TokenUsage:
         Per ``zero-claude-token-economics`` reference: accept provider
         naming differences only in adapters.
         """
+
         def _read(names: tuple[str, ...]) -> int:
             for name in names:
                 if name in data and data[name] is not None:
                     val = data[name]
                     if isinstance(val, bool) or not isinstance(val, int):
-                        raise ValueError(
-                            f"invalid token count for {names[0]}: {val!r}"
-                        )
+                        raise ValueError(f"invalid token count for {names[0]}: {val!r}")
                     return max(0, val)
             return 0
 
         return cls(
             input_tokens=_read(("input_tokens", "inputTokens")),
             output_tokens=_read(("output_tokens", "outputTokens")),
-            cache_creation_input_tokens=_read((
-                "cache_creation_input_tokens",
-                "cacheCreationInputTokens",
-            )),
-            cache_read_input_tokens=_read((
-                "cache_read_input_tokens",
-                "cacheReadInputTokens",
-            )),
+            cache_creation_input_tokens=_read(
+                (
+                    "cache_creation_input_tokens",
+                    "cacheCreationInputTokens",
+                )
+            ),
+            cache_read_input_tokens=_read(
+                (
+                    "cache_read_input_tokens",
+                    "cacheReadInputTokens",
+                )
+            ),
         )
 
 
@@ -324,10 +374,12 @@ ProviderErrorClass = Literal[
 ]
 
 #: Errors that justify a bounded retry.
-RETRIABLE_ERROR_CLASSES: frozenset[ProviderErrorClass] = frozenset({
-    "rate_limit",
-    "transient",
-})
+RETRIABLE_ERROR_CLASSES: frozenset[ProviderErrorClass] = frozenset(
+    {
+        "rate_limit",
+        "transient",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -374,11 +426,17 @@ class ProviderRequest:
     model_name: str
     request_hash: str
     state: ProviderRequestState
+    idempotency_key: str | None = None
     error_class: ProviderErrorClass | None = None
     error_message: str | None = None
     response_artifact_id: ArtifactId | None = None
     started_at: str = ""
     completed_at: str | None = None
+    attempt_count: int = 0
+    claim_owner: str | None = None
+    claim_token: str | None = None
+    lease_expires_at: str | None = None
+    heartbeat_at: str | None = None
 
 
 # ----------------------------------------------------------------------
@@ -395,8 +453,7 @@ class UsageRecordId:
             raise ValueError("UsageRecordId must be a non-empty string")
         if not self.value.startswith(USAGE_RECORD_ID_PREFIX):
             raise ValueError(
-                f"UsageRecordId must start with "
-                f"{USAGE_RECORD_ID_PREFIX!r}; got {self.value!r}"
+                f"UsageRecordId must start with {USAGE_RECORD_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -481,6 +538,14 @@ class ProviderError(RuntimeError):
     """Base class for provider-domain typed failures."""
 
 
+class ProviderCancelledError(ProviderError):
+    """Local or provider-side cancellation stopped the request."""
+
+
+class ProviderUnknownOutcomeError(ProviderError):
+    """The provider may have accepted the request but no result is known."""
+
+
 class ProviderNotFoundError(ProviderError):
     pass
 
@@ -493,25 +558,12 @@ class ProviderRequestNotFoundError(ProviderError):
     pass
 
 
+class ProviderRequestStateError(ProviderError):
+    """A provider request state transition is not valid for its current state."""
+
+
 class InvalidProviderRequestError(ProviderError):
     """The canonical request is malformed."""
-
-
-class ToolMessageValidationError(ProviderError):
-    """A tool-call/result pair failed validation.
-
-    Per ``zero-provider-adapter-contract`` §"Provider rendering
-    validates tool-call/result shape before submission" and
-    ``zero-context-memory`` §"sanitize_tool_pairs": malformed or
-    orphaned tool messages are rejected or safely repaired without
-    inventing success.
-    """
-
-
-class DuplicateUsageError(ProviderError):
-    """A usage record with the same (request_id, message_id) already
-    exists. Per ``zero-claude-token-economics``: duplicate streamed
-    usage is not double-counted."""
 
 
 class PricingNotFoundError(ProviderError):

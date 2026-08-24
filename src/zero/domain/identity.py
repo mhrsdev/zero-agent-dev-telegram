@@ -44,9 +44,7 @@ class UserId:
         if not self.value or not isinstance(self.value, str):
             raise ValueError("UserId must be a non-empty string")
         if not self.value.startswith(USER_ID_PREFIX):
-            raise ValueError(
-                f"UserId must start with {USER_ID_PREFIX!r}; got {self.value!r}"
-            )
+            raise ValueError(f"UserId must start with {USER_ID_PREFIX!r}; got {self.value!r}")
 
     def __str__(self) -> str:
         return self.value
@@ -62,10 +60,7 @@ class ProjectId:
         if not self.value or not isinstance(self.value, str):
             raise ValueError("ProjectId must be a non-empty string")
         if not self.value.startswith(PROJECT_ID_PREFIX):
-            raise ValueError(
-                f"ProjectId must start with {PROJECT_ID_PREFIX!r}; "
-                f"got {self.value!r}"
-            )
+            raise ValueError(f"ProjectId must start with {PROJECT_ID_PREFIX!r}; got {self.value!r}")
 
     def __str__(self) -> str:
         return self.value
@@ -226,20 +221,12 @@ class ProjectScope:
     is_member: bool = False
 
     @classmethod
-    def for_member(
-        cls, project_id: ProjectId, actor_id: UserId, role: ProjectRole
-    ) -> ProjectScope:
-        return cls(
-            project_id=project_id, actor_id=actor_id, role=role, is_member=True
-        )
+    def for_member(cls, project_id: ProjectId, actor_id: UserId, role: ProjectRole) -> ProjectScope:
+        return cls(project_id=project_id, actor_id=actor_id, role=role, is_member=True)
 
     @classmethod
-    def for_non_member(
-        cls, project_id: ProjectId, actor_id: UserId
-    ) -> ProjectScope:
-        return cls(
-            project_id=project_id, actor_id=actor_id, role=None, is_member=False
-        )
+    def for_non_member(cls, project_id: ProjectId, actor_id: UserId) -> ProjectScope:
+        return cls(project_id=project_id, actor_id=actor_id, role=None, is_member=False)
 
 
 # ----------------------------------------------------------------------

@@ -129,77 +129,48 @@ From `PLAN.md` §22 and §5; `zero-modular-bootstrap` skill:
 
 | Artifact | Location | Status |
 |---|---|---|
-| `SUMMARY.md` product definition | `project-foundation/SUMMARY.md` | Documented, hash verified |
-| `PLAN.md` 15-milestone plan | `project-foundation/PLAN.md` | Documented, hash verified |
-| `MANIFEST.sha256` file inventory | `project-foundation/MANIFEST.sha256` | Documented, hash verified |
-| 16 skill `SKILL.md` files | `project-foundation/skills/*/SKILL.md` | Documented, all hashes verified |
-| `zero-context-memory` reference Python module | `…/zero-context-memory/scripts/context_management.py` | Standalone-tested (7 tests pass) |
-| `zero-context-memory` reference test suite | `…/zero-context-memory/scripts/test_context_management.py` | Passes |
-| `zero-context-memory` source findings | `…/zero-context-memory/references/SOURCE_FINDINGS.md` | Documented |
-| `zero-claude-token-economics` reference Python module | `…/zero-claude-token-economics/scripts/token_accounting.py` | Standalone-tested (6 tests pass) |
-| `zero-claude-token-economics` reference test suite | `…/zero-claude-token-economics/scripts/test_token_accounting.py` | Passes |
-| `zero-claude-token-economics` source findings | `…/zero-claude-token-economics/references/SOURCE_FINDINGS.md` | Documented |
-| `zero-interface-adapter-model` Telegram findings | `…/zero-interface-adapter-model/references/TELEGRAM_FINDINGS.md` | Documented |
-| Reference repos cloned for code reference | `/home/z/my-project/reference-repos/{hermes-agent,grok-build,claude-code}` | Cloned (depth=1) |
+| Executable ASGI control plane | `src/zero/main.py`, `src/zero/app/` | Implemented and covered by the local suite |
+| SQLite schema and migration runner | `src/zero/persistence/` | Implemented; 30 migrations, full-stem IDs, transactional application |
+| Project-lineage hardening | `src/zero/persistence/migrations/0025_project_lineage_hardening.sql`, `0026_project_ownership_and_legacy_provider_recovery.sql` | Implemented with direct SQL INSERT/UPDATE regressions and immutable ownership triggers |
+| Provider/runtime cancellation contract | `src/zero/app/agent_runtime.py`, provider tests | Implemented and regression-tested |
+| Installable package metadata | `pyproject.toml` | Wheel/sdist package data declares templates, static files, and migrations |
+| Clean release artifact gate | `scripts/validate_release_artifacts.py` | Implemented; checks wheel/sdist contents independently |
+| CI quality and release workflow | `.github/workflows/ci.yml` | Implemented; runs tests, static gates, artifact, startup, and health checks |
+| Development launcher | `scripts/run_dev.sh` | Implemented and executable |
 
-Reference repos provide code-level evidence for the patterns the foundation
-already extracted into `SOURCE_FINDINGS.md`. They are not copied wholesale.
+Reference repositories and foundation documents remain evidence sources for design patterns, not
+runtime dependencies or copied implementations.
 
-## 5. Absent implementation (what does not exist yet)
+## 5. Absent implementation and rollout gaps
 
-The following capabilities are **documented but not implemented**. They will
-be built in subsequent milestones.
+The original Milestone 0 list described the planned system before implementation began. It is
+retained here as a requirement history, not as a claim about the current tree. The remaining gaps
+are operational or deliberately deferred:
 
-- Any executable Zero Develop application code.
-- Health/readiness endpoint.
-- Configuration validation.
-- Database schema or migrations.
-- Identity model (Zero User, External Identity, Project, Membership).
-- Authorization decision path.
-- Secret reference/lookup boundary.
-- Tool registry + capability grants.
-- Audit log store.
-- Plan lifecycle (DRAFT → PROPOSED → APPROVED) and Main Planner.
-- Execution graph, task lifecycle, Main Worker.
-- Branch/worktree runner.
-- Sub Agent Type lifecycle (split/merge/retire).
-- Artifact store.
-- Project RAG.
-- Retrieval router, context builder, token accountant, compaction service.
-- Provider adapters.
-- Integration/merge gates.
-- Website.
-- Telegram/Discord adapters.
-- Observability (logs, metrics, traces).
-- Recovery, backup, restore procedures.
+- Product-level encrypted backup and rehearsed restore.
+- Live provider, Telegram, and Discord qualification with securely provisioned credentials.
+- Browser, mobile, and accessibility validation.
+- Concurrency and linearizability hardening around plan approval, task claiming/completion,
+  provider idempotency, agent limits, and topology rollback.
+- Production deployment, TLS, supervision, external persistence, and disaster-recovery rehearsal.
 
 ## 6. Known blockers and evidence limitations
 
-- **Network access for live Telegram/Discord/Provider APIs**: deferred to
-  later milestones. Phase 1 uses deterministic test adapters only.
-- **Provider billing truth**: client-side estimates are explicitly not
-  billing truth (`zero-claude-token-economics/SOURCE_FINDINGS.md` §3).
-  Reconciliation path is deferred until a real provider adapter exists.
-- **Grok Build Rust test execution**: foundation notes `cargo` was
-  unavailable during initial research; we will not depend on Rust tests.
-- **Claude Code runtime source**: not published; we treat only documented
-  contracts as evidence, never inferred binary behavior.
-- **No conflicts between foundation documents**: the ingestion pass found
-  no non-reversible product or security conflicts. All wording differences
-  are non-blocking (e.g. "modules" vs "service objects" describe the same
-  in-process boundary).
+- **External integrations**: deterministic local adapters do not prove live provider, Telegram, or
+  Discord behavior.
+- **Provider billing truth**: local usage accounting is not provider billing truth.
+- **Execution isolation**: host-bounded worktree execution is not a hostile-code sandbox.
+- **Backup security**: backup/restore operations require a stable configured encryption key and
+  fail closed when it is absent; the deployment must protect that key separately from the archive.
+- **Release evidence**: clean wheel/sdist contents, installed startup, and 30-migration upgrade
+  probes are separate gates from the source-tree test suite.
 
-## 7. Skills applied to Phase 1
+## 7. Verification discipline applied to remediation
 
-Phase 1 (Milestone 0 + Milestone 1) is shaped by these skills:
+The remediation follows the evidence boundaries from the foundation and the runtime references:
 
-- `zero-foundation-ingestion` — read-before-build discipline, requirement
-  normalization, current-state vs roadmap-state separation.
-- `zero-modular-bootstrap` — smallest stack supported by evidence, one
-  deployable control plane, one executable path, configuration as trust
-  boundary, persistence starts with invariants.
-- `zero-control-plane-trust` — conceptual model for identity, project
-  scope, authorization, capabilities, secrets, audit (used to design the
-  schema direction even though full implementation arrives in Milestone 2).
-- `zero-rollout-readiness` — PASS/PARTIAL/BLOCKED status discipline and
-  claim-to-evidence mapping used throughout this ledger.
+- test-first regressions for callback compatibility and database lineage;
+- database-level enforcement rather than service-only checks;
+- full filename-stem migration identity rather than numeric-prefix identity;
+- isolated temporary databases and installed artifacts for release probes;
+- no secrets in source, tests, logs, reports, or release artifacts.

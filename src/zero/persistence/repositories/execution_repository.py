@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 from zero.domain.execution import (
     AttemptState,
@@ -24,6 +25,8 @@ from zero.domain.execution import (
     ExecutionNotFoundError,
     ExecutionSnapshot,
     ExecutionSnapshotId,
+    InvalidTaskTransitionError,
+    LeaseOwnershipError,
     Task,
     TaskAttempt,
     TaskAttemptId,
@@ -63,6 +66,7 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         permitted_scope=tuple(json.loads(row["permitted_scope"])),
         expected_evidence=tuple(json.loads(row["expected_evidence"])),
         state=row["state"],  # type: ignore[arg-type]
+        completion_evidence=tuple(json.loads(row["completion_evidence"] or "[]")),
         blocker_reason=row["blocker_reason"],
         agent_type_id=row["agent_type_id"],
         terminal_state_set_at=row["terminal_state_set_at"],
@@ -109,9 +113,7 @@ class ExecutionRepository:
     # Executions
     # ------------------------------------------------------------------
 
-    def insert_execution(
-        self, execution: Execution, *, commit: bool = True
-    ) -> None:
+    def insert_execution(self, execution: Execution, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -140,24 +142,33 @@ class ExecutionRepository:
                 return
             raise
 
-    def get_execution(self, execution_id: ExecutionId) -> Execution:
+    def get_execution(
+        self,
+        execution_id: ExecutionId,
+        *,
+        project_id: ProjectId | None = None,
+    ) -> Execution:
         conn = self._database.connect()
-        cursor = conn.execute(
-            "SELECT id, plan_id, plan_revision_id, plan_handoff_id, project_id, "
-            "state, blocker_reason, idempotency_key, created_at, updated_at "
-            "FROM executions WHERE id = ?",
-            (execution_id.value,),
-        )
+        if project_id is None:
+            cursor = conn.execute(
+                "SELECT id, plan_id, plan_revision_id, plan_handoff_id, project_id, "
+                "state, blocker_reason, idempotency_key, created_at, updated_at "
+                "FROM executions WHERE id = ?",
+                (execution_id.value,),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT id, plan_id, plan_revision_id, plan_handoff_id, project_id, "
+                "state, blocker_reason, idempotency_key, created_at, updated_at "
+                "FROM executions WHERE id = ? AND project_id = ?",
+                (execution_id.value, project_id.value),
+            )
         row = cursor.fetchone()
         if row is None:
-            raise ExecutionNotFoundError(
-                f"Execution {execution_id} not found"
-            )
+            raise ExecutionNotFoundError(f"Execution {execution_id} not found")
         return _row_to_execution(row)
 
-    def get_execution_for_revision(
-        self, plan_revision_id: PlanRevisionId
-    ) -> Execution | None:
+    def get_execution_for_revision(self, plan_revision_id: PlanRevisionId) -> Execution | None:
         from zero.domain.plans import PlanRevisionId as _PRId
 
         if isinstance(plan_revision_id, _PRId):
@@ -176,9 +187,7 @@ class ExecutionRepository:
             return None
         return _row_to_execution(row)
 
-    def list_executions_for_project(
-        self, project_id: ProjectId
-    ) -> list[Execution]:
+    def list_executions_for_project(self, project_id: ProjectId) -> list[Execution]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, plan_id, plan_revision_id, plan_handoff_id, project_id, "
@@ -214,9 +223,7 @@ class ExecutionRepository:
                 (new_state, execution_id.value),
             )
         if cursor.rowcount == 0:
-            raise ExecutionNotFoundError(
-                f"Execution {execution_id} not found"
-            )
+            raise ExecutionNotFoundError(f"Execution {execution_id} not found")
         if commit:
             conn.commit()
 
@@ -224,17 +231,15 @@ class ExecutionRepository:
     # Tasks
     # ------------------------------------------------------------------
 
-    def insert_task(
-        self, task: Task, *, commit: bool = True
-    ) -> None:
+    def insert_task(self, task: Task, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, execution_id, project_id, objective, permitted_scope, "
                 "expected_evidence, state, blocker_reason, agent_type_id, "
-                "terminal_state_set_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "terminal_state_set_at, completion_evidence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task.id.value,
                     task.execution_id.value,
@@ -246,6 +251,7 @@ class ExecutionRepository:
                     task.blocker_reason,
                     task.agent_type_id,
                     task.terminal_state_set_at,
+                    json.dumps(list(task.completion_evidence)),
                 ),
             )
             if commit:
@@ -255,31 +261,49 @@ class ExecutionRepository:
                 conn.rollback()
             raise
 
-    def get_task(self, task_id: TaskId) -> Task:
+    def get_task(
+        self,
+        task_id: TaskId,
+        *,
+        project_id: ProjectId | None = None,
+    ) -> Task:
         conn = self._database.connect()
-        cursor = conn.execute(
+        columns = (
             "SELECT id, execution_id, project_id, objective, permitted_scope, "
             "expected_evidence, state, blocker_reason, agent_type_id, "
-            "terminal_state_set_at, created_at, updated_at "
-            "FROM tasks WHERE id = ?",
-            (task_id.value,),
+            "terminal_state_set_at, completion_evidence, created_at, updated_at "
         )
+        if project_id is None:
+            cursor = conn.execute(f"{columns}FROM tasks WHERE id = ?", (task_id.value,))
+        else:
+            cursor = conn.execute(
+                f"{columns}FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id.value, project_id.value),
+            )
         row = cursor.fetchone()
         if row is None:
             raise TaskNotFoundError(f"Task {task_id} not found")
         return _row_to_task(row)
 
     def list_tasks_for_execution(
-        self, execution_id: ExecutionId
+        self,
+        execution_id: ExecutionId,
+        *,
+        project_id: ProjectId | None = None,
     ) -> list[Task]:
         conn = self._database.connect()
-        cursor = conn.execute(
+        query = (
             "SELECT id, execution_id, project_id, objective, permitted_scope, "
             "expected_evidence, state, blocker_reason, agent_type_id, "
-            "terminal_state_set_at, created_at, updated_at "
-            "FROM tasks WHERE execution_id = ? ORDER BY created_at ASC",
-            (execution_id.value,),
+            "terminal_state_set_at, completion_evidence, created_at, updated_at "
+            "FROM tasks WHERE execution_id = ?"
         )
+        params: list[str] = [execution_id.value]
+        if project_id is not None:
+            query += " AND project_id = ?"
+            params.append(project_id.value)
+        query += " ORDER BY created_at ASC"
+        cursor = conn.execute(query, tuple(params))
         return [_row_to_task(row) for row in cursor.fetchall()]
 
     def update_task_state(
@@ -289,35 +313,52 @@ class ExecutionRepository:
         *,
         blocker_reason: str | None = None,
         agent_type_id: str | None = None,
+        completion_evidence: tuple[str, ...] | None = None,
         commit: bool = True,
     ) -> None:
         conn = self._database.connect()
         from zero.domain.execution import is_terminal_task_state
 
+        evidence_json = (
+            json.dumps(list(completion_evidence)) if completion_evidence is not None else None
+        )
+
+        # agent_type_id is durable task policy: a state transition that
+        # does not explicitly reassign it must never overwrite (and
+        # therefore null out) the assigned type.
+        if agent_type_id is not None:
+            type_clause = "agent_type_id = ?, "
+            type_params: tuple[str, ...] = (agent_type_id,)
+        else:
+            type_clause = ""
+            type_params = ()
+
         if is_terminal_task_state(new_state):
             cursor = conn.execute(
                 "UPDATE tasks SET state = ?, blocker_reason = ?, "
-                "agent_type_id = ?, "
+                f"{type_clause}completion_evidence = COALESCE(?, completion_evidence), "
                 "terminal_state_set_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
                 "WHERE id = ?",
                 (
                     new_state,
                     blocker_reason,
-                    agent_type_id,
+                    *type_params,
+                    evidence_json,
                     task_id.value,
                 ),
             )
         else:
             cursor = conn.execute(
                 "UPDATE tasks SET state = ?, blocker_reason = ?, "
-                "agent_type_id = ?, "
+                f"{type_clause}completion_evidence = COALESCE(?, completion_evidence), "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
                 "WHERE id = ?",
                 (
                     new_state,
                     blocker_reason,
-                    agent_type_id,
+                    *type_params,
+                    evidence_json,
                     task_id.value,
                 ),
             )
@@ -326,18 +367,39 @@ class ExecutionRepository:
         if commit:
             conn.commit()
 
+    def claim_task_atomically(
+        self,
+        *,
+        execution_id: ExecutionId,
+        task_id: TaskId,
+        project_id: ProjectId,
+        commit: bool = True,
+    ) -> None:
+        """CAS the task from ready to running inside the caller's transaction."""
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "UPDATE tasks SET state = 'running', "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE id = ? AND execution_id = ? AND project_id = ? "
+            "AND state = 'ready'",
+            (task_id.value, execution_id.value, project_id.value),
+        )
+        if cursor.rowcount != 1:
+            raise InvalidTaskTransitionError(
+                f"Task {task_id} is no longer claimable for execution {execution_id}"
+            )
+        if commit:
+            conn.commit()
+
     # ------------------------------------------------------------------
     # Task dependencies
     # ------------------------------------------------------------------
 
-    def insert_dependency(
-        self, dependency: TaskDependency, *, commit: bool = True
-    ) -> None:
+    def insert_dependency(self, dependency: TaskDependency, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
-                "INSERT INTO task_dependencies (task_id, depends_on_task_id) "
-                "VALUES (?, ?)",
+                "INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)",
                 (
                     dependency.task_id.value,
                     dependency.depends_on_task_id.value,
@@ -354,15 +416,12 @@ class ExecutionRepository:
             # CHECK constraint violation (task_id == depends_on_task_id)
             raise
 
-    def list_dependencies_for_task(
-        self, task_id: TaskId
-    ) -> list[TaskDependency]:
+    def list_dependencies_for_task(self, task_id: TaskId) -> list[TaskDependency]:
         """Return all dependencies of ``task_id`` (i.e. the tasks that
         ``task_id`` depends on)."""
         conn = self._database.connect()
         cursor = conn.execute(
-            "SELECT task_id, depends_on_task_id FROM task_dependencies "
-            "WHERE task_id = ?",
+            "SELECT task_id, depends_on_task_id FROM task_dependencies WHERE task_id = ?",
             (task_id.value,),
         )
         return [
@@ -373,9 +432,7 @@ class ExecutionRepository:
             for row in cursor.fetchall()
         ]
 
-    def list_dependents_of_task(
-        self, task_id: TaskId
-    ) -> list[TaskDependency]:
+    def list_dependents_of_task(self, task_id: TaskId) -> list[TaskDependency]:
         """Return all tasks that depend on ``task_id``."""
         conn = self._database.connect()
         cursor = conn.execute(
@@ -392,16 +449,23 @@ class ExecutionRepository:
         ]
 
     def list_all_dependencies_for_execution(
-        self, execution_id: ExecutionId
+        self,
+        execution_id: ExecutionId,
+        *,
+        project_id: ProjectId | None = None,
     ) -> list[TaskDependency]:
         conn = self._database.connect()
-        cursor = conn.execute(
+        query = (
             "SELECT td.task_id, td.depends_on_task_id "
             "FROM task_dependencies td "
             "JOIN tasks t ON td.task_id = t.id "
-            "WHERE t.execution_id = ?",
-            (execution_id.value,),
+            "WHERE t.execution_id = ?"
         )
+        params: list[str] = [execution_id.value]
+        if project_id is not None:
+            query += " AND t.project_id = ?"
+            params.append(project_id.value)
+        cursor = conn.execute(query, tuple(params))
         return [
             TaskDependency(
                 task_id=TaskId(row["task_id"]),
@@ -414,9 +478,7 @@ class ExecutionRepository:
     # Task attempts
     # ------------------------------------------------------------------
 
-    def insert_attempt(
-        self, attempt: TaskAttempt, *, commit: bool = True
-    ) -> None:
+    def insert_attempt(self, attempt: TaskAttempt, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -445,8 +507,7 @@ class ExecutionRepository:
                 from zero.domain.execution import DuplicateAttemptError
 
                 raise DuplicateAttemptError(
-                    f"Attempt {attempt.attempt_number} already exists "
-                    f"for task {attempt.task_id}"
+                    f"Attempt {attempt.attempt_number} already exists for task {attempt.task_id}"
                 ) from exc
             raise
 
@@ -464,16 +525,23 @@ class ExecutionRepository:
         return _row_to_attempt(row)
 
     def list_attempts_for_task(
-        self, task_id: TaskId
+        self,
+        task_id: TaskId,
+        *,
+        project_id: ProjectId | None = None,
     ) -> list[TaskAttempt]:
         conn = self._database.connect()
-        cursor = conn.execute(
+        query = (
             "SELECT id, task_id, project_id, attempt_number, state, "
             "error_message, lease_owner, lease_expires_at, started_at, "
-            "completed_at FROM task_attempts WHERE task_id = ? "
-            "ORDER BY attempt_number ASC",
-            (task_id.value,),
+            "completed_at FROM task_attempts WHERE task_id = ?"
         )
+        params: list[str] = [task_id.value]
+        if project_id is not None:
+            query += " AND project_id = ?"
+            params.append(project_id.value)
+        query += " ORDER BY attempt_number ASC"
+        cursor = conn.execute(query, tuple(params))
         return [_row_to_attempt(row) for row in cursor.fetchall()]
 
     def update_attempt_state(
@@ -482,38 +550,99 @@ class ExecutionRepository:
         new_state: AttemptState,
         *,
         error_message: str | None = None,
+        expected_task_id: TaskId | None = None,
+        expected_project_id: ProjectId | None = None,
+        expected_lease_owner: str | None = None,
+        require_active_lease: bool = False,
         commit: bool = True,
     ) -> None:
         conn = self._database.connect()
 
-        terminal_states = {"succeeded", "failed", "cancelled"}
+        terminal_states = {"succeeded", "failed", "cancelled", "unknown"}
+        if require_active_lease and new_state not in terminal_states:
+            raise InvalidTaskTransitionError(
+                "active lease fencing is only valid for terminal attempt states"
+            )
+        if require_active_lease and (
+            expected_task_id is None or expected_project_id is None or expected_lease_owner is None
+        ):
+            raise LeaseOwnershipError("active lease fencing requires complete attempt identity")
+
+        where = "id = ?"
+        where_params: list[str] = [attempt_id.value]
+        if require_active_lease:
+            assert expected_task_id is not None
+            assert expected_project_id is not None
+            assert expected_lease_owner is not None
+            where += (
+                " AND task_id = ? AND project_id = ? AND state = 'running'"
+                " AND lease_owner = ? AND lease_expires_at IS NOT NULL"
+                " AND julianday(lease_expires_at) > julianday('now')"
+            )
+            where_params.extend(
+                [
+                    expected_task_id.value,
+                    expected_project_id.value,
+                    expected_lease_owner,
+                ]
+            )
+
         if new_state in terminal_states:
             cursor = conn.execute(
                 "UPDATE task_attempts SET state = ?, error_message = ?, "
                 "completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
-                "WHERE id = ?",
-                (new_state, error_message, attempt_id.value),
+                f"WHERE {where}",
+                (new_state, error_message, *where_params),
             )
         else:
             # "unknown" is not terminal; it means we don't know the
             # outcome yet.
             cursor = conn.execute(
-                "UPDATE task_attempts SET state = ?, error_message = ? "
-                "WHERE id = ?",
-                (new_state, error_message, attempt_id.value),
+                f"UPDATE task_attempts SET state = ?, error_message = ? WHERE {where}",
+                (new_state, error_message, *where_params),
             )
         if cursor.rowcount == 0:
+            if require_active_lease:
+                raise LeaseOwnershipError(f"lease is no longer active for attempt {attempt_id}")
             raise TaskNotFoundError(f"Task attempt {attempt_id} not found")
         if commit:
             conn.commit()
 
-    # ------------------------------------------------------------------
-    # Execution snapshots
-    # ------------------------------------------------------------------
-
-    def insert_snapshot(
-        self, snapshot: ExecutionSnapshot, *, commit: bool = True
+    def renew_attempt_lease(
+        self,
+        attempt_id: TaskAttemptId,
+        *,
+        task_id: TaskId,
+        project_id: ProjectId,
+        lease_owner: str,
+        lease_duration_seconds: int,
+        commit: bool = True,
     ) -> None:
+        """Extend only the currently live lease owned by ``lease_owner``."""
+        if lease_duration_seconds < 1 or lease_duration_seconds > 86_400:
+            raise LeaseOwnershipError("lease duration is outside the allowed range")
+        expires = datetime.now(UTC) + timedelta(seconds=lease_duration_seconds)
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "UPDATE task_attempts SET lease_expires_at = ? "
+            "WHERE id = ? AND task_id = ? AND project_id = ? "
+            "AND state = 'running' AND lease_owner = ? "
+            "AND lease_expires_at IS NOT NULL "
+            "AND julianday(lease_expires_at) > julianday('now')",
+            (
+                expires.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                attempt_id.value,
+                task_id.value,
+                project_id.value,
+                lease_owner,
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise LeaseOwnershipError(f"lease is no longer active for attempt {attempt_id}")
+        if commit:
+            conn.commit()
+
+    def insert_snapshot(self, snapshot: ExecutionSnapshot, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -538,24 +667,29 @@ class ExecutionRepository:
             raise
 
     def get_latest_snapshot(
-        self, execution_id: ExecutionId
+        self,
+        execution_id: ExecutionId,
+        *,
+        project_id: ProjectId | None = None,
     ) -> ExecutionSnapshot | None:
         conn = self._database.connect()
-        cursor = conn.execute(
+        query = (
             "SELECT id, execution_id, project_id, snapshot_version, "
             "graph_state, snapshot_reason, created_at "
-            "FROM execution_snapshots WHERE execution_id = ? "
-            "ORDER BY snapshot_version DESC LIMIT 1",
-            (execution_id.value,),
+            "FROM execution_snapshots WHERE execution_id = ?"
         )
+        params: list[str] = [execution_id.value]
+        if project_id is not None:
+            query += " AND project_id = ?"
+            params.append(project_id.value)
+        query += " ORDER BY snapshot_version DESC LIMIT 1"
+        cursor = conn.execute(query, tuple(params))
         row = cursor.fetchone()
         if row is None:
             return None
         return _row_to_snapshot(row)
 
-    def list_snapshots_for_execution(
-        self, execution_id: ExecutionId
-    ) -> list[ExecutionSnapshot]:
+    def list_snapshots_for_execution(self, execution_id: ExecutionId) -> list[ExecutionSnapshot]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, execution_id, project_id, snapshot_version, "

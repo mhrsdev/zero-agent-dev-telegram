@@ -23,6 +23,8 @@ Per ``zero-context-memory`` SKILL.md:
 from __future__ import annotations
 
 import hashlib
+import logging
+import sqlite3
 from datetime import UTC, datetime
 
 from zero.app.authorization_service import AuthorizationService
@@ -31,15 +33,19 @@ from zero.domain.artifacts import (
     ArtifactHandle,
     ArtifactId,
     ArtifactKind,
+    ArtifactProvenance,
+    ArtifactProvenanceId,
+    IndexRebuildError,
     RagDocument,
     RagDocumentId,
     RagDocumentState,
     RagSourceType,
 )
-from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
+from zero.domain.audit import AuditEvent, AuditEventId, AuditSource, looks_sensitive
 from zero.domain.identity import ProjectId, UserId
 from zero.domain.ids import (
     generate_artifact_id,
+    generate_artifact_provenance_id,
     generate_audit_event_id,
     generate_rag_document_id,
 )
@@ -50,6 +56,8 @@ from zero.persistence.repositories.artifact_repository import (
     ArtifactRepository,
 )
 from zero.persistence.repositories.audit_repository import AuditRepository
+
+logger = logging.getLogger(__name__)
 
 
 def _now_utc_iso() -> str:
@@ -99,6 +107,7 @@ class ArtifactService:
         provenance: str | None = None,
         media_type: str = "text/plain",
         source: AuditSource = "system",
+        commit: bool = True,
     ) -> Artifact:
         """Store an immutable artifact.
 
@@ -114,43 +123,75 @@ class ArtifactService:
         content internally, while authorization and metadata remain
         independent.
         """
+        # Artifact contents are project evidence.  Authorize before
+        # validating or deduplicating the payload so an unauthorized caller
+        # cannot use this method as a write oracle.
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.start",
+            source=source,
+        )
         if not content:
             raise ValueError("content must not be empty")
         content_hash = _sha256(content)
-        # Check for an existing artifact with the same hash.
-        existing = self._repo.get_artifact_by_hash(project_id, content_hash)
-        if existing is not None:
-            return existing
-        artifact = Artifact(
-            id=ArtifactId(generate_artifact_id()),
-            project_id=project_id,
-            content_hash=content_hash,
-            kind=kind,
-            media_type=media_type,
-            size_bytes=len(content.encode("utf-8")),
-            content=content,
-            producer=producer,
-            provenance=provenance,
-            created_at=_now_utc_iso(),
-        )
-        self._repo.insert_artifact(artifact)
-        self._audit_repo.insert(
-            AuditEvent(
-                id=AuditEventId(generate_audit_event_id()),
-                project_id=project_id,
-                actor_id=actor_id,
-                source=source,
-                operation="artifact.store",
-                target_type="artifact",
-                target_id=artifact.id.value,
-                result="success",
-                redacted_summary=(
-                    f"Stored artifact {artifact.id.value} "
-                    f"(kind={kind}, size={artifact.size_bytes})"
+        from contextlib import nullcontext
+
+        transaction = self._repo.database.transaction() if commit else nullcontext()
+        with transaction:
+            # The transaction begins before the deduplication read.  On a
+            # file-backed SQLite database this serializes competing writers,
+            # so the second caller observes the first caller's committed
+            # artifact instead of constructing a loser ID and provenance row.
+            existing = self._repo.get_artifact_by_hash(project_id, content_hash)
+            if existing is None:
+                artifact = Artifact(
+                    id=ArtifactId(generate_artifact_id()),
+                    project_id=project_id,
+                    content_hash=content_hash,
+                    kind=kind,
+                    media_type=media_type,
+                    size_bytes=len(content.encode("utf-8")),
+                    content=content,
+                    producer=producer,
+                    provenance=provenance,
+                    created_at=_now_utc_iso(),
+                )
+                self._repo.insert_artifact(artifact, commit=False)
+                is_new_artifact = True
+            else:
+                artifact = existing
+                is_new_artifact = False
+            self._repo.insert_provenance(
+                ArtifactProvenance(
+                    id=ArtifactProvenanceId(generate_artifact_provenance_id()),
+                    project_id=project_id,
+                    artifact_id=artifact.id,
+                    actor_id=actor_id,
+                    producer=producer,
+                    provenance=provenance,
+                    created_at=_now_utc_iso(),
                 ),
-                created_at=_now_utc_iso(),
+                commit=False,
             )
-        )
+            if is_new_artifact:
+                self._audit_repo.insert(
+                    AuditEvent(
+                        id=AuditEventId(generate_audit_event_id()),
+                        project_id=project_id,
+                        actor_id=actor_id,
+                        source=source,
+                        operation="artifact.store",
+                        target_type="artifact",
+                        target_id=artifact.id.value,
+                        result="success",
+                        redacted_summary=(
+                            f"Stored artifact {artifact.id.value} (kind={kind}, size={artifact.size_bytes})"
+                        ),
+                        created_at=_now_utc_iso(),
+                    ),
+                    commit=False,
+                )
         return artifact
 
     def get_artifact(
@@ -169,6 +210,12 @@ class ArtifactService:
         Unauthorized access raises ArtifactNotFoundError (not a
         separate "forbidden" error, to avoid leaking existence).
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
         return self._repo.get_artifact(project_id, artifact_id)
 
     def get_artifact_handle(
@@ -186,11 +233,19 @@ class ArtifactService:
         needs: artifact ID, kind, size, hash, and a short summary.
         The full content is NOT included.
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
         artifact = self._repo.get_artifact(project_id, artifact_id)
-        # Build a short summary (first 200 chars, redacted).
+        # Build a short summary and redact sensitive-looking content.
         summary = artifact.content[:200]
         if len(artifact.content) > 200:
             summary += "..."
+        if looks_sensitive(summary):
+            summary = "[REDACTED: sensitive content detected]"
         return ArtifactHandle(
             id=artifact.id,
             kind=artifact.kind,
@@ -203,13 +258,33 @@ class ArtifactService:
         self,
         *,
         project_id: ProjectId,
+        actor_id: UserId,
         kind: ArtifactKind | None = None,
+        source: AuditSource = "system",
     ) -> list[Artifact]:
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
         return self._repo.list_artifacts_for_project(project_id, kind=kind)
 
-    # ------------------------------------------------------------------
-    # Project RAG ingestion
-    # ------------------------------------------------------------------
+    def list_provenance(
+        self,
+        *,
+        project_id: ProjectId,
+        artifact_id: ArtifactId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> list[ArtifactProvenance]:
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        return self._repo.list_provenance(project_id, artifact_id)
 
     def ingest_rag_document(
         self,
@@ -233,11 +308,23 @@ class ArtifactService:
         activate partial indexes": if indexing fails, the document
         state is not changed to 'approved'.
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="agent.manage",
+            source=source,
+        )
         if not title or not title.strip():
             raise ValueError("title must not be empty")
         if not content or not content.strip():
             raise ValueError("content must not be empty")
         content_hash = _sha256(content)
+        requested_state = state
+        # An approved document is not authoritative until its derived index
+        # entry and index version commit.  Persist it as a candidate first so
+        # an indexing failure cannot create the contradictory state
+        # ``approved + index_version=NULL``.
+        persisted_state = "candidate" if requested_state == "approved" else requested_state
         doc = RagDocument(
             id=RagDocumentId(generate_rag_document_id()),
             project_id=project_id,
@@ -246,21 +333,30 @@ class ArtifactService:
             title=title.strip(),
             content=content,
             content_hash=content_hash,
-            state=state,
+            state=persisted_state,
             created_at=_now_utc_iso(),
             updated_at=_now_utc_iso(),
         )
         self._repo.insert_rag_document(doc)
-        # If the document is approved, index it immediately.
-        if state == "approved":
+        index_error: Exception | None = None
+        if requested_state == "approved":
             try:
-                self._repo.index_rag_document(doc)
-                self._repo.set_rag_document_index_version(doc.id, 1)
-            except Exception:
-                # Indexing failed: do NOT change the document state.
-                # The document remains 'approved' but index_version
-                # stays None. A rebuild will pick it up.
-                pass
+                with self._repo.database.transaction():
+                    self._repo.index_rag_document(doc, commit=False)
+                    self._repo.update_rag_document_state(doc.id, "approved", commit=False)
+                    self._repo.set_rag_document_index_version(doc.id, 1, commit=False)
+            except (IndexRebuildError, OSError, sqlite3.Error, ValueError) as exc:
+                index_error = exc
+                # A failed index attempt may have partially inserted a derived
+                # row if a custom index backend committed before failing.  The
+                # canonical document remains a candidate and is retriable.
+                try:
+                    self._repo.remove_rag_document_from_index(doc.id)
+                except (IndexRebuildError, OSError, sqlite3.Error) as cleanup_exc:
+                    logger.debug(
+                        "RAG index cleanup failed: %s",
+                        type(cleanup_exc).__name__,
+                    )
         self._audit_repo.insert(
             AuditEvent(
                 id=AuditEventId(generate_audit_event_id()),
@@ -270,15 +366,16 @@ class ArtifactService:
                 operation="rag.ingest",
                 target_type="rag_document",
                 target_id=doc.id.value,
-                result="success",
+                result="failure" if index_error is not None else "success",
                 redacted_summary=(
                     f"Ingested RAG document {doc.id.value} "
-                    f"(source={source_type}:{source_id}, state={state})"
+                    f"(requested_state={requested_state}, "
+                    f"state={'candidate' if index_error else requested_state})"
                 ),
                 created_at=_now_utc_iso(),
             )
         )
-        return doc
+        return self._repo.get_rag_document(project_id, doc.id)
 
     def approve_rag_document(
         self,
@@ -293,19 +390,22 @@ class ArtifactService:
         Per ``zero-context-memory``: only 'approved' documents are
         indexed. If indexing fails, the document state is NOT changed.
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="agent.manage",
+            source=source,
+        )
         doc = self._repo.get_rag_document(project_id, doc_id)
         if doc.state != "candidate":
-            raise ValueError(
-                f"Cannot approve document in state {doc.state!r}"
-            )
-        # Try to index first. If it fails, do not change state.
-        try:
-            self._repo.index_rag_document(doc)
-        except Exception:
-            raise
-        # Indexing succeeded; change state.
-        self._repo.update_rag_document_state(doc_id, "approved")
-        self._repo.set_rag_document_index_version(doc_id, 1)
+            raise ValueError(f"Cannot approve document in state {doc.state!r}")
+        # Indexing and activation are one commit point.  A failure leaves
+        # the candidate untouched and never exposes a searchable partial
+        # document.
+        with self._repo.database.transaction():
+            self._repo.index_rag_document(doc, commit=False)
+            self._repo.update_rag_document_state(doc_id, "approved", commit=False)
+            self._repo.set_rag_document_index_version(doc_id, 1, commit=False)
         return self._repo.get_rag_document(project_id, doc_id)
 
     def supersede_rag_document(
@@ -324,13 +424,17 @@ class ArtifactService:
         deleted; it transitions to 'superseded' state with a link to
         the new document.
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="agent.manage",
+            source=source,
+        )
         self._repo.get_rag_document(project_id, old_doc_id)
         # Remove the old document from the index.
         self._repo.remove_rag_document_from_index(old_doc_id)
         # Mark as superseded.
-        self._repo.update_rag_document_state(
-            old_doc_id, "superseded", superseded_by=new_doc_id
-        )
+        self._repo.update_rag_document_state(old_doc_id, "superseded", superseded_by=new_doc_id)
         return self._repo.get_rag_document(project_id, old_doc_id)
 
     def archive_rag_document(
@@ -342,8 +446,15 @@ class ArtifactService:
         source: AuditSource = "system",
     ) -> RagDocument:
         """Archive a RAG document and remove it from the index."""
-        self._repo.remove_rag_document_from_index(doc_id)
-        self._repo.update_rag_document_state(doc_id, "archived")
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="agent.manage",
+            source=source,
+        )
+        self._repo.get_rag_document(project_id, doc_id)
+        self._repo.remove_rag_document_from_index(doc_id, project_id=project_id)
+        self._repo.update_rag_document_state(doc_id, "archived", project_id=project_id)
         return self._repo.get_rag_document(project_id, doc_id)
 
     # ------------------------------------------------------------------
@@ -354,8 +465,10 @@ class ArtifactService:
         self,
         *,
         project_id: ProjectId,
+        actor_id: UserId,
         query: str,
         limit: int = 20,
+        source: AuditSource = "system",
     ) -> list[tuple[RagDocument, float]]:
         """Search the Project RAG for documents matching ``query``.
 
@@ -367,6 +480,14 @@ class ArtifactService:
         Per ``zero-project-isolation-evidence``: the query filters by
         project_id before any row is loaded.
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be between 1 and 100")
         return self._repo.search_rag(project_id, query, limit=limit)
 
     # ------------------------------------------------------------------
@@ -388,6 +509,12 @@ class ArtifactService:
 
         Returns the number of documents indexed.
         """
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="agent.manage",
+            source=source,
+        )
         count = self._repo.rebuild_index(project_id)
         self._audit_repo.insert(
             AuditEvent(
@@ -405,9 +532,7 @@ class ArtifactService:
         )
         return count
 
-    def count_indexed_documents(
-        self, project_id: ProjectId
-    ) -> int:
+    def count_indexed_documents(self, project_id: ProjectId) -> int:
         return self._repo.count_indexed_documents(project_id)
 
     # ------------------------------------------------------------------
@@ -418,13 +543,30 @@ class ArtifactService:
         self,
         project_id: ProjectId,
         doc_id: RagDocumentId,
+        *,
+        actor_id: UserId,
+        source: AuditSource = "system",
     ) -> RagDocument:
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
         return self._repo.get_rag_document(project_id, doc_id)
 
     def list_rag_documents(
         self,
         project_id: ProjectId,
         *,
+        actor_id: UserId,
         state: RagDocumentState | None = None,
+        source: AuditSource = "system",
     ) -> list[RagDocument]:
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
         return self._repo.list_rag_documents_for_project(project_id, state=state)

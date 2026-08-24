@@ -1,47 +1,60 @@
-# Phase 9 Closeout Report — Audited State
+# Phase 9 Remediation Closeout — Audited State
 
 - **Phase**: 9 (Milestone 14 + Milestone 15)
 - **Status**: PARTIAL / NOT PRODUCTION READY
-- **Audit date**: 2026-08-08
+- **Audit date**: 2026-08-17
 
-## Verified in the isolated test environment
+This report describes the current effective working tree after the release-remediation pass.
+It does not convert deterministic local evidence into production or live-integration evidence.
 
-- The complete source test suite passes under `ZERO_ENV=test`.
-- Python 3.12 clean-wheel installation and isolated runtime smoke pass.
-- The wheel contains all 11 SQL migrations, 9 HTML templates, and static CSS.
-- Installed-wheel smoke verifies package imports, all migrations, `/healthz`, and basic
-  identity/project/audit HTTP flows from a cwd outside the source tree.
-- HTTP authentication uses opaque access tokens whose digests, not raw values, are persisted.
-- Request actors are context-local and client-supplied actor/owner mismatches are rejected.
-- File-backed SQLite regressions verify rollback of plan and topology partial writes.
-- Provider replay reconstructs tool calls, and tool invocation caps are reserved atomically.
-- Deterministic tests cover project isolation, secret redaction, recovery helpers,
-  worktree isolation, provider accounting, and interface event idempotency.
-- Source compilation and Ruff's critical runtime rules (`E9,F63,F7,F82`) pass.
-- Fresh migration, idempotent re-run, and `0010 -> 0011` upgrade smokes pass.
+## Verified in the current source tree
+
+- The complete suite passes under `ZERO_ENV=test`: **471 passed**.
+- Python compilation passes for `src`, `tests`, and `scripts`.
+- Full scoped Ruff passes for `src`, `tests`, and `scripts` with no diagnostics.
+- Repository-wide scoped Ruff formatting is clean.
+- The provider callback contract carries the runtime cancellation event and has a regression test.
+- Direct SQL regressions reject cross-project INSERT and UPDATE combinations for interface events,
+  integration evidence, and result deliveries.
+- The migration runner uses full filename stems as identifiers, so the three distinct `0012_*`
+  migrations remain collision-safe.
+- The effective migration set contains **28** SQL files, including the project-lineage hardening
+  migration `0025_project_lineage_hardening.sql` and the ownership/legacy-provider recovery
+  migration `0026_project_ownership_and_legacy_provider_recovery.sql`.
+- Fresh, rerun, atomicity, concurrency, and populated-upgrade probes passed against the complete
+  28-migration set.
+- Configuration remains fail-closed when required environment configuration is absent.
+
+## Release gates added or repaired
+
+- `scripts/validate_release_artifacts.py` checks wheel and sdist contents independently for all
+  expected migration stems and required runtime modules.
+- `.github/workflows/ci.yml` runs the full test, lint, format, syntax, clean-artifact, installed
+  migration, configuration-failure, and HTTP startup gates.
+- `scripts/run_dev.sh` supports checkout-local source startup without requiring an editable install.
 
 ## Partial or deliberately blocked
 
-- `BackupService` writes a plaintext SQL dump. Restore and integrity checks are tested,
-  but product-level encrypted backup is **not implemented**. It must not be described as
-  satisfying the encrypted-backup requirement.
-- `timeout_seconds` is not enforceable for arbitrary in-process Python handlers. Timed
-  grants are rejected fail-closed; only `max_invocations` is currently enforced.
-- Provider and Telegram/Discord behavior is exercised with deterministic adapters and
-  canonical events only. No live provider billing, Telegram, or Discord integration was
-  verified.
-- Web routes are covered through ASGI tests, not a real browser, mobile matrix, or an
-  accessibility audit.
-- A wheel build and installed ASGI smoke passed; no production deployment, TLS, process
-  supervision, external database, or disaster-recovery drill was performed.
-- The full Ruff policy still reports 28 broad-exception/test-style findings, and the
-  repository-wide format check is not clean. Critical runtime lint is clean.
-- Independent review still identifies concurrency/linearizability work in plan approval,
-  task claiming/completion, agent concurrency, provider idempotency scope, and complete
-  topology knowledge rollback. These remain outside this stable development checkpoint.
+- `BackupService` writes an authenticated encrypted backup when stable configured key material is
+  available and fails closed when it is absent.
+- `timeout_seconds` is not enforceable for arbitrary in-process Python handlers; only the supported
+  invocation limits are enforced.
+- Provider and Telegram/Discord behavior uses deterministic local adapters. No live provider
+  billing, Telegram, or Discord integration has been verified.
+- Web routes are covered through ASGI tests, not a real browser, mobile matrix, or accessibility
+  audit.
+- Production deployment, TLS, supervision, external persistence, and disaster-recovery drills
+  remain unperformed.
+- Concurrency and linearizability hardening remains incomplete around plan approval, task
+  claiming/completion, agent limits, provider idempotency scope, and topology rollback.
+- The final staged wheel/sdist artifact gate passed: both artifacts contain exactly 28 migrations,
+  the required runtime modules, and the sdist contains the key scripts and regressions.
+- The final installed wheel passed import, fresh migration/rerun/integrity, fail-closed configuration,
+  and loopback `/`, `/healthz`, and `/readyz` probes under Python 3.12.
 
 ## Rollout decision
 
-The artifact is suitable for isolated development and deterministic evaluation only.
-Production rollout remains blocked until encrypted backup, live-adapter validation,
-browser/accessibility validation, and an owner-authorized deployment rehearsal are done.
+The artifact is suitable for isolated development and deterministic evaluation only. Production
+rollout remains blocked until live-adapter validation, browser/accessibility validation,
+concurrency hardening, external persistence, and an owner-authorized deployment rehearsal are
+complete. Backup operations also require separately protected `ZERO_SECRET_KEY` authority.

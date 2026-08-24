@@ -83,9 +83,7 @@ async def test_projects_page_lists_projects(client) -> None:
     # Create a user and project via the API.
     user_resp = await client.post("/users", json={"display_name": "Owner"})
     user_id = user_resp.json()["id"]
-    await client.post(
-        "/projects", json={"owner_id": user_id, "name": "Web Project"}
-    )
+    await client.post("/projects", json={"owner_id": user_id, "name": "Web Project"})
     resp = await client.get("/web/projects")
     assert resp.status_code == 200
     assert "Web Project" in resp.text
@@ -115,9 +113,7 @@ async def test_create_project_via_web_form(client) -> None:
 async def test_project_detail_shows_members(client) -> None:
     user_resp = await client.post("/users", json={"display_name": "Owner"})
     user_id = user_resp.json()["id"]
-    proj_resp = await client.post(
-        "/projects", json={"owner_id": user_id, "name": "Detail Project"}
-    )
+    proj_resp = await client.post("/projects", json={"owner_id": user_id, "name": "Detail Project"})
     project_id = proj_resp.json()["id"]
     resp = await client.get(f"/web/projects/{project_id}")
     assert resp.status_code == 200
@@ -159,9 +155,7 @@ async def test_add_member_via_web_form(client) -> None:
 async def test_create_plan_via_web_form(client) -> None:
     owner_resp = await client.post("/users", json={"display_name": "Owner"})
     owner_id = owner_resp.json()["id"]
-    proj_resp = await client.post(
-        "/projects", json={"owner_id": owner_id, "name": "Plan Project"}
-    )
+    proj_resp = await client.post("/projects", json={"owner_id": owner_id, "name": "Plan Project"})
     project_id = proj_resp.json()["id"]
     resp = await client.post(
         f"/web/projects/{project_id}/plans",
@@ -177,14 +171,10 @@ async def test_create_plan_via_web_form(client) -> None:
 async def test_plan_detail_shows_revisions(client) -> None:
     owner_resp = await client.post("/users", json={"display_name": "Owner"})
     owner_id = owner_resp.json()["id"]
-    proj_resp = await client.post(
-        "/projects", json={"owner_id": owner_id, "name": "Rev Project"}
-    )
+    proj_resp = await client.post("/projects", json={"owner_id": owner_id, "name": "Rev Project"})
     project_id = proj_resp.json()["id"]
     # Create a plan via the API.
-    plan_resp = await client.post(
-        f"/projects/{project_id}/plans", json={"actor_id": owner_id}
-    )
+    plan_resp = await client.post(f"/projects/{project_id}/plans", json={"actor_id": owner_id})
     plan_id = plan_resp.json()["id"]
     # The plan detail page should load.
     resp = await client.get(f"/web/projects/{project_id}/plans/{plan_id}")
@@ -202,9 +192,7 @@ async def test_execution_detail_shows_tasks(client) -> None:
     # Full setup: user, project, plan, approve, create execution.
     owner_resp = await client.post("/users", json={"display_name": "Owner"})
     owner_id = owner_resp.json()["id"]
-    proj_resp = await client.post(
-        "/projects", json={"owner_id": owner_id, "name": "Exec Project"}
-    )
+    proj_resp = await client.post("/projects", json={"owner_id": owner_id, "name": "Exec Project"})
     project_id = proj_resp.json()["id"]
     # Ingest event.
     event_resp = await client.post(
@@ -218,9 +206,7 @@ async def test_execution_detail_shows_tasks(client) -> None:
     )
     event_id = event_resp.json()["id"]
     # Create plan.
-    plan_resp = await client.post(
-        f"/projects/{project_id}/plans", json={"actor_id": owner_id}
-    )
+    plan_resp = await client.post(f"/projects/{project_id}/plans", json={"actor_id": owner_id})
     plan_id = plan_resp.json()["id"]
     # Propose revision.
     await client.post(
@@ -256,9 +242,7 @@ async def test_execution_detail_shows_tasks(client) -> None:
     )
     execution_id = exec_resp.json()["id"]
     # The execution detail page should show the task.
-    resp = await client.get(
-        f"/web/projects/{project_id}/executions/{execution_id}"
-    )
+    resp = await client.get(f"/web/projects/{project_id}/executions/{execution_id}")
     assert resp.status_code == 200
     assert "Task A" in resp.text
     assert "pending" in resp.text or "ready" in resp.text
@@ -307,9 +291,7 @@ async def test_no_secrets_in_html(client) -> None:
     for page in pages:
         resp = await client.get(page)
         assert resp.status_code == 200
-        assert secret_value not in resp.text, (
-            f"Secret value found in HTML on page {page}"
-        )
+        assert secret_value not in resp.text, f"Secret value found in HTML on page {page}"
 
 
 # ----------------------------------------------------------------------
@@ -322,9 +304,7 @@ async def test_stale_revision_returns_error(client) -> None:
     """Per PLAN.md M12: 'stale-revision behavior'."""
     owner_resp = await client.post("/users", json={"display_name": "Owner"})
     owner_id = owner_resp.json()["id"]
-    proj_resp = await client.post(
-        "/projects", json={"owner_id": owner_id, "name": "Stale Project"}
-    )
+    proj_resp = await client.post("/projects", json={"owner_id": owner_id, "name": "Stale Project"})
     project_id = proj_resp.json()["id"]
     event_resp = await client.post(
         f"/projects/{project_id}/conversation-events",
@@ -336,9 +316,7 @@ async def test_stale_revision_returns_error(client) -> None:
         },
     )
     event_id = event_resp.json()["id"]
-    plan_resp = await client.post(
-        f"/projects/{project_id}/plans", json={"actor_id": owner_id}
-    )
+    plan_resp = await client.post(f"/projects/{project_id}/plans", json={"actor_id": owner_id})
     plan_id = plan_resp.json()["id"]
     # Propose revision 1.
     await client.post(

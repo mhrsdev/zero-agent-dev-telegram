@@ -158,9 +158,7 @@ class PlanId:
         if not self.value or not isinstance(self.value, str):
             raise ValueError("PlanId must be a non-empty string")
         if not self.value.startswith(PLAN_ID_PREFIX):
-            raise ValueError(
-                f"PlanId must start with {PLAN_ID_PREFIX!r}; got {self.value!r}"
-            )
+            raise ValueError(f"PlanId must start with {PLAN_ID_PREFIX!r}; got {self.value!r}")
 
     def __str__(self) -> str:
         return self.value
@@ -175,8 +173,7 @@ class PlanRevisionId:
             raise ValueError("PlanRevisionId must be a non-empty string")
         if not self.value.startswith(PLAN_REVISION_ID_PREFIX):
             raise ValueError(
-                f"PlanRevisionId must start with "
-                f"{PLAN_REVISION_ID_PREFIX!r}; got {self.value!r}"
+                f"PlanRevisionId must start with {PLAN_REVISION_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -292,8 +289,7 @@ class PlanApprovalId:
             raise ValueError("PlanApprovalId must be a non-empty string")
         if not self.value.startswith(PLAN_APPROVAL_ID_PREFIX):
             raise ValueError(
-                f"PlanApprovalId must start with "
-                f"{PLAN_APPROVAL_ID_PREFIX!r}; got {self.value!r}"
+                f"PlanApprovalId must start with {PLAN_APPROVAL_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -347,8 +343,7 @@ class PlanHandoffId:
             raise ValueError("PlanHandoffId must be a non-empty string")
         if not self.value.startswith(PLAN_HANDOFF_ID_PREFIX):
             raise ValueError(
-                f"PlanHandoffId must start with "
-                f"{PLAN_HANDOFF_ID_PREFIX!r}; got {self.value!r}"
+                f"PlanHandoffId must start with {PLAN_HANDOFF_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -434,15 +429,6 @@ class StaleRevisionError(PlanError):
         super().__init__(message)
         self.expected_revision = expected_revision
         self.actual_revision = actual_revision
-
-
-class PlanAlreadyApprovedError(PlanError):
-    """The plan has already been approved; a second approval is a
-    no-op (idempotent) or an error (if the result differs)."""
-
-
-class PlanAlreadyRejectedError(PlanError):
-    """The plan has already been rejected."""
 
 
 class ConversationEventNotFoundError(PlanError):

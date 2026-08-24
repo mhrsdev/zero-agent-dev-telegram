@@ -106,9 +106,7 @@ class AuditService:
             permission="audit.view",
             source=source,
         )
-        return self._audit_repo.list_for_project(
-            project_id, limit=limit, offset=offset
-        )
+        return self._audit_repo.list_for_project(project_id, limit=limit, offset=offset)
 
     def list_for_actor(
         self,
@@ -117,11 +115,7 @@ class AuditService:
         limit: int = 100,
         offset: int = 0,
     ) -> list[AuditEvent]:
-        return self._audit_repo.list_for_actor(
-            actor_id, limit=limit, offset=offset
-        )
+        return self._audit_repo.list_for_actor(actor_id, limit=limit, offset=offset)
 
-    def list_for_correlation(
-        self, correlation_id: str
-    ) -> list[AuditEvent]:
+    def list_for_correlation(self, correlation_id: str) -> list[AuditEvent]:
         return self._audit_repo.list_for_correlation(correlation_id)

@@ -159,9 +159,7 @@ class AgentTypeService:
         )
         return agent_type
 
-    def get_type(
-        self, project_id: ProjectId, type_id: AgentTypeId
-    ) -> AgentType:
+    def get_type(self, project_id: ProjectId, type_id: AgentTypeId) -> AgentType:
         return self._repo.get_agent_type(project_id, type_id)
 
     def list_types(
@@ -254,8 +252,7 @@ class AgentTypeService:
         agent_type = self._repo.get_agent_type(project_id, type_id)
         if agent_type.state != "active":
             raise InvalidAgentTypeTransitionError(
-                f"Cannot create instance of type in state "
-                f"{agent_type.state!r}"
+                f"Cannot create instance of type in state {agent_type.state!r}"
             )
         instance = AgentInstance(
             id=AgentInstanceId(generate_agent_instance_id()),
@@ -291,18 +288,28 @@ class AgentTypeService:
             raise InvalidAgentTypeTransitionError(
                 f"Cannot assign instance in state {instance.state!r}"
             )
-        # Check concurrency limit again (race-safe via the check above,
-        # though a truly concurrent system would need a DB-level lock).
-        agent_type = self._repo.get_agent_type(project_id, instance.agent_type_id)
-        running = self._repo.count_running_instances(instance.agent_type_id)
-        if running >= agent_type.max_concurrent_instances:
-            raise ConcurrencyLimitExceededError(
-                f"Type {agent_type.name!r} has reached its concurrency "
-                f"limit of {agent_type.max_concurrent_instances}"
+        # BEGIN IMMEDIATE serializes writers: the limit check and the
+        # transition happen inside one write transaction so two
+        # concurrent assignments cannot both observe free capacity.
+        with self._repo.database.transaction():
+            agent_type = self._repo.get_agent_type(project_id, instance.agent_type_id)
+            current = self._repo.get_instance(instance_id)
+            if current.state != "idle":
+                raise InvalidAgentTypeTransitionError(
+                    f"Cannot assign instance in state {current.state!r}"
+                )
+            running = self._repo.count_running_instances(instance.agent_type_id)
+            if running >= agent_type.max_concurrent_instances:
+                raise ConcurrencyLimitExceededError(
+                    f"Type {agent_type.name!r} has reached its concurrency "
+                    f"limit of {agent_type.max_concurrent_instances}"
+                )
+            self._repo.update_instance_state(
+                instance_id,
+                "running",
+                task_id=task_id,
+                commit=False,
             )
-        self._repo.update_instance_state(
-            instance_id, "running", task_id=task_id
-        )
         return self._repo.get_instance(instance_id)
 
     def complete_instance(
@@ -323,9 +330,7 @@ class AgentTypeService:
         self._repo.update_instance_state(instance_id, new_state)
         return self._repo.get_instance(instance_id)
 
-    def list_instances_for_type(
-        self, type_id: AgentTypeId
-    ) -> list[AgentInstance]:
+    def list_instances_for_type(self, type_id: AgentTypeId) -> list[AgentInstance]:
         return self._repo.list_instances_for_type(type_id)
 
     # ------------------------------------------------------------------
@@ -346,6 +351,12 @@ class AgentTypeService:
     ) -> KnowledgeRecord:
         """Add a knowledge record to a type (or project-wide if type_id
         is None)."""
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="agent.manage",
+            source=source,
+        )
         if not content or not content.strip():
             raise ValueError("content must not be empty")
         # If type_id is provided, verify it exists and belongs to the project.
@@ -371,23 +382,35 @@ class AgentTypeService:
         project_id: ProjectId,
         type_id: AgentTypeId,
         *,
+        actor_id: UserId,
         include_archived: bool = False,
+        source: AuditSource = "system",
     ) -> list[KnowledgeRecord]:
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
         # Verify the type belongs to the project.
         self._repo.get_agent_type(project_id, type_id)
-        return self._repo.list_knowledge_for_type(
-            type_id, include_archived=include_archived
-        )
+        return self._repo.list_knowledge_for_type(type_id, include_archived=include_archived)
 
     def list_knowledge_for_project(
         self,
         project_id: ProjectId,
         *,
+        actor_id: UserId,
         include_archived: bool = False,
+        source: AuditSource = "system",
     ) -> list[KnowledgeRecord]:
-        return self._repo.list_knowledge_for_project(
-            project_id, include_archived=include_archived
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission="execution.view_diffs",
+            source=source,
         )
+        return self._repo.list_knowledge_for_project(project_id, include_archived=include_archived)
 
     # ------------------------------------------------------------------
     # Topology migration: split
@@ -454,17 +477,13 @@ class AgentTypeService:
                 )
                 new_types.append(new_type)
             # 3. Route knowledge.
-            all_records = self._repo.list_knowledge_for_type(
-                source_type_id, include_archived=False
-            )
+            all_records = self._repo.list_knowledge_for_type(source_type_id, include_archived=False)
             routed_ids: set[str] = set()
             name_to_type = {t.name: t for t in new_types}
             if knowledge_routing:
                 for dest_name, record_ids in knowledge_routing.items():
                     if dest_name not in name_to_type:
-                        raise ValueError(
-                            f"Unknown destination type {dest_name!r}"
-                        )
+                        raise ValueError(f"Unknown destination type {dest_name!r}")
                     dest_type = name_to_type[dest_name]
                     for rid in record_ids:
                         # Verify the record belongs to the source type.
@@ -486,9 +505,7 @@ class AgentTypeService:
                         routed_record_ids.add(rid.value)
             for record in all_records:
                 if record.id.value not in routed_record_ids:
-                    self._repo.update_knowledge_state(
-                        record.id, "archived", commit=False
-                    )
+                    self._repo.update_knowledge_state(record.id, "archived", commit=False)
                     unrouted.append(record.id.value)
             # 5. Reconcile: every source record must be accounted for.
             # Routed records were reassigned to destination types (their
@@ -594,30 +611,18 @@ class AgentTypeService:
                 memory_scope=destination_memory_scope,
                 # Merge tool permissions from all sources (union).
                 permitted_tools=tuple(
-                    sorted(
-                        {
-                            tool
-                            for t in source_types
-                            for tool in t.permitted_tools
-                        }
-                    )
+                    sorted({tool for t in source_types for tool in t.permitted_tools})
                 ),
                 model_policy=dict(source_types[0].model_policy),
-                context_budget_tokens=max(
-                    t.context_budget_tokens for t in source_types
-                ),
-                max_concurrent_instances=max(
-                    t.max_concurrent_instances for t in source_types
-                ),
+                context_budget_tokens=max(t.context_budget_tokens for t in source_types),
+                max_concurrent_instances=max(t.max_concurrent_instances for t in source_types),
                 source=source,
                 commit=False,
             )
             # 3. Migrate all knowledge records.
             total_migrated = 0
             for src_type in source_types:
-                records = self._repo.list_knowledge_for_type(
-                    src_type.id, include_archived=False
-                )
+                records = self._repo.list_knowledge_for_type(src_type.id, include_archived=False)
                 for record in records:
                     self._repo.reassign_knowledge(
                         record.id, dest_type.id, migrated_from=record.id, commit=False
@@ -626,7 +631,9 @@ class AgentTypeService:
             # 4. Archive source types.
             for src_type in source_types:
                 self._repo.update_agent_type(
-                    src_type.id, state="archived", superseded_by=dest_type.id,
+                    src_type.id,
+                    state="archived",
+                    superseded_by=dest_type.id,
                     commit=False,
                 )
             self._audit_repo.insert(
@@ -684,8 +691,7 @@ class AgentTypeService:
         running = self._repo.count_running_instances(type_id)
         if running > 0:
             raise KnowledgeReconciliationError(
-                f"Cannot retire type {agent_type.name!r}: {running} "
-                f"instances are still running"
+                f"Cannot retire type {agent_type.name!r}: {running} instances are still running"
             )
         with self._repo._database.transaction():
             # 1. Take a snapshot.
@@ -694,17 +700,11 @@ class AgentTypeService:
             )
             # 2. Archive all knowledge records.
             if archive_knowledge:
-                records = self._repo.list_knowledge_for_type(
-                    type_id, include_archived=False
-                )
+                records = self._repo.list_knowledge_for_type(type_id, include_archived=False)
                 for record in records:
-                    self._repo.update_knowledge_state(
-                        record.id, "archived", commit=False
-                    )
+                    self._repo.update_knowledge_state(record.id, "archived", commit=False)
             # 3. Reconcile: no records in non-archived state.
-            remaining = self._repo.list_knowledge_for_type(
-                type_id, include_archived=False
-            )
+            remaining = self._repo.list_knowledge_for_type(type_id, include_archived=False)
             if remaining:
                 raise KnowledgeReconciliationError(
                     f"Retirement blocked: {len(remaining)} records not archived",
@@ -760,39 +760,76 @@ class AgentTypeService:
         )
         # Find the snapshot.
         snapshots = self._repo.list_snapshots(project_id)
-        target = next(
-            (s for s in snapshots if s.id == snapshot_id), None
-        )
+        target = next((s for s in snapshots if s.id == snapshot_id), None)
         if target is None:
             from zero.domain.agent_types import TopologyRollbackError
 
-            raise TopologyRollbackError(
-                f"Snapshot {snapshot_id} not found"
-            )
+            raise TopologyRollbackError(f"Snapshot {snapshot_id} not found")
         # Parse the snapshot state.
         state = json.loads(target.topology_state)
-        snapshot_type_ids = {t["id"] for t in state.get("types", [])}
-        snapshot_active_ids = {
-            t["id"]
-            for t in state.get("types", [])
-            if t["state"] == "active"
-        }
-        with self._repo._database.transaction():
+        snapshot_types = state.get("types", [])
+        snapshot_type_ids = {t["id"] for t in snapshot_types}
+        snapshot_active_ids = {t["id"] for t in snapshot_types if t["state"] == "active"}
+        # Record-id -> owning type id at snapshot time (older snapshots
+        # do not carry knowledge_ids and restore routing best-effort).
+        snapshot_knowledge_owner: dict[str, str] = {}
+        for t in snapshot_types:
+            owner_id = str(t.get("id") or "")
+            for record_id in t.get("knowledge_ids", ()):
+                snapshot_knowledge_owner[str(record_id)] = owner_id
+        with self._repo.database.transaction():
             # Take a new snapshot before rollback (for audit).
             rollback_snapshot = self._take_snapshot(
                 project_id, "rollback", actor_id, source, commit=False
             )
             # Reactivate types that were active at snapshot time but are
-            # now archived.
+            # now archived; retired types take the governed two-step
+            # path (retired -> archived -> active) now that the state
+            # machine allows the rollback escape hatch.
             current_types = self._repo.list_agent_types_for_project(
                 project_id, include_archived=True
             )
             for t in current_types:
-                if t.id.value in snapshot_active_ids and t.state == "archived":
+                if t.id.value not in snapshot_active_ids:
+                    if t.id.value not in snapshot_type_ids and t.state == "active":
+                        # This type was created after the snapshot;
+                        # archive it.
+                        self._repo.update_agent_type(t.id, state="archived", commit=False)
+                    continue
+                if t.state == "archived":
                     self._repo.update_agent_type(t.id, state="active", commit=False)
-                elif t.id.value not in snapshot_type_ids and t.state == "active":
-                    # This type was created after the snapshot; archive it.
+                elif t.state == "retired":
                     self._repo.update_agent_type(t.id, state="archived", commit=False)
+                    self._repo.update_agent_type(t.id, state="active", commit=False)
+            # Restore knowledge routing: any record that the snapshot
+            # attributes to a type but which has since been reassigned
+            # is moved back to its snapshot-time owner.
+            import logging
+
+            from zero.domain.agent_types import KnowledgeRecordId, KnowledgeRecordNotFoundError
+
+            _rollback_logger = logging.getLogger(__name__)
+            for record_id_value, owner_value in sorted(snapshot_knowledge_owner.items()):
+                try:
+                    record = self._repo.get_knowledge(KnowledgeRecordId(record_id_value))
+                except KnowledgeRecordNotFoundError:
+                    continue
+                current_owner = record.agent_type_id.value if record.agent_type_id else None
+                if current_owner != owner_value:
+                    try:
+                        self._repo.reassign_knowledge(
+                            record.id,
+                            AgentTypeId(owner_value),
+                            migrated_from=None,
+                            commit=False,
+                        )
+                    except Exception as reassign_exc:  # noqa: BLE001 - best-effort restore
+                        _rollback_logger.warning(
+                            "knowledge %s could not be restored to type %s: %s",
+                            record_id_value,
+                            owner_value,
+                            type(reassign_exc).__name__,
+                        )
             self._audit_repo.insert(
                 AuditEvent(
                     id=AuditEventId(generate_audit_event_id()),
@@ -824,10 +861,12 @@ class AgentTypeService:
         *,
         commit: bool = True,
     ) -> TopologySnapshot:
-        """Capture a topology snapshot."""
-        types = self._repo.list_agent_types_for_project(
-            project_id, include_archived=True
-        )
+        """Capture a topology snapshot.
+
+        Each type records its knowledge-record membership so a rollback
+        can restore knowledge routing, not only the type rows.
+        """
+        types = self._repo.list_agent_types_for_project(project_id, include_archived=True)
         state = {
             "types": [
                 {
@@ -835,8 +874,13 @@ class AgentTypeService:
                     "name": t.name,
                     "state": t.state,
                     "version": t.version,
-                    "knowledge_count": self._repo.count_knowledge_for_type(
-                        t.id
+                    "knowledge_count": self._repo.count_knowledge_for_type(t.id),
+                    "knowledge_ids": sorted(
+                        record.id.value
+                        for record in self._repo.list_knowledge_for_type(
+                            t.id,
+                            include_archived=True,
+                        )
                     ),
                 }
                 for t in types
@@ -855,12 +899,8 @@ class AgentTypeService:
         self._repo.insert_snapshot(snapshot, commit=commit)
         return snapshot
 
-    def get_latest_snapshot(
-        self, project_id: ProjectId
-    ) -> TopologySnapshot | None:
+    def get_latest_snapshot(self, project_id: ProjectId) -> TopologySnapshot | None:
         return self._repo.get_latest_snapshot(project_id)
 
-    def list_snapshots(
-        self, project_id: ProjectId
-    ) -> list[TopologySnapshot]:
+    def list_snapshots(self, project_id: ProjectId) -> list[TopologySnapshot]:
         return self._repo.list_snapshots(project_id)

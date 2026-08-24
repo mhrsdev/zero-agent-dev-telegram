@@ -63,12 +63,8 @@ def _row_to_injection_ledger(row: sqlite3.Row) -> InjectionLedger:
         project_id=ProjectId(row["project_id"]),
         execution_id=ExecutionId(row["execution_id"]),
         context_version=row["context_version"],
-        selected=tuple(
-            (s["source"], s["record_id"], s["token_count"]) for s in selected
-        ),
-        omitted=tuple(
-            (o["source"], o["record_id"], o["reason"]) for o in omitted
-        ),
+        selected=tuple((s["source"], s["record_id"], s["token_count"]) for s in selected),
+        omitted=tuple((o["source"], o["record_id"], o["reason"]) for o in omitted),
         total_candidates=row["total_candidates"],
         total_tokens=row["total_tokens"],
         budget_tokens=row["budget_tokens"],
@@ -84,14 +80,10 @@ def _row_to_compaction_record(row: sqlite3.Row) -> CompactionRecord:
         source_context_version=row["source_context_version"],
         target_context_version=row["target_context_version"],
         source_event_range=row["source_event_range"],
-        memory_delta_artifact_id=ArtifactId(
-            row["memory_delta_artifact_id"]
-        )
+        memory_delta_artifact_id=ArtifactId(row["memory_delta_artifact_id"])
         if row["memory_delta_artifact_id"]
         else None,
-        transcript_artifact_id=ArtifactId(
-            row["transcript_artifact_id"]
-        )
+        transcript_artifact_id=ArtifactId(row["transcript_artifact_id"])
         if row["transcript_artifact_id"]
         else None,
         summary=row["summary"],
@@ -108,6 +100,11 @@ class ContextRepository:
 
     def __init__(self, database: Database) -> None:
         self._database = database
+
+    @property
+    def database(self) -> Database:
+        """The underlying database (public transaction boundary)."""
+        return self._database
 
     # ------------------------------------------------------------------
     # Context versions
@@ -141,9 +138,7 @@ class ContextRepository:
                     cv.retrieved_context,
                     cv.conversation_tail,
                     cv.compaction_summary,
-                    cv.transcript_artifact_id.value
-                    if cv.transcript_artifact_id
-                    else None,
+                    cv.transcript_artifact_id.value if cv.transcript_artifact_id else None,
                     cv.token_count,
                 ),
             )
@@ -172,14 +167,11 @@ class ContextRepository:
         row = cursor.fetchone()
         if row is None:
             raise ContextVersionNotFoundError(
-                f"Context version {version} not found for execution "
-                f"{execution_id}"
+                f"Context version {version} not found for execution {execution_id}"
             )
         return _row_to_context_version(row)
 
-    def get_active_context_version(
-        self, execution_id: ExecutionId
-    ) -> ContextVersion | None:
+    def get_active_context_version(self, execution_id: ExecutionId) -> ContextVersion | None:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, execution_id, version, active, "
@@ -195,9 +187,7 @@ class ContextRepository:
             return None
         return _row_to_context_version(row)
 
-    def get_latest_context_version(
-        self, execution_id: ExecutionId
-    ) -> ContextVersion | None:
+    def get_latest_context_version(self, execution_id: ExecutionId) -> ContextVersion | None:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, execution_id, version, active, "
@@ -213,9 +203,7 @@ class ContextRepository:
             return None
         return _row_to_context_version(row)
 
-    def list_context_versions(
-        self, execution_id: ExecutionId
-    ) -> list[ContextVersion]:
+    def list_context_versions(self, execution_id: ExecutionId) -> list[ContextVersion]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, execution_id, version, active, "
@@ -237,8 +225,7 @@ class ContextRepository:
         """Set active=0 on all context versions for an execution."""
         conn = self._database.connect()
         conn.execute(
-            "UPDATE context_versions SET active = 0 "
-            "WHERE execution_id = ?",
+            "UPDATE context_versions SET active = 0 WHERE execution_id = ?",
             (execution_id.value,),
         )
         if commit:
@@ -258,26 +245,21 @@ class ContextRepository:
         """
         conn = self._database.connect()
         conn.execute(
-            "UPDATE context_versions SET active = 0 "
-            "WHERE execution_id = ?",
+            "UPDATE context_versions SET active = 0 WHERE execution_id = ?",
             (execution_id.value,),
         )
         cursor = conn.execute(
-            "UPDATE context_versions SET active = 1 "
-            "WHERE execution_id = ? AND version = ?",
+            "UPDATE context_versions SET active = 1 WHERE execution_id = ? AND version = ?",
             (execution_id.value, version),
         )
         if cursor.rowcount == 0:
             raise ContextVersionNotFoundError(
-                f"Context version {version} not found for execution "
-                f"{execution_id}"
+                f"Context version {version} not found for execution {execution_id}"
             )
         if commit:
             conn.commit()
 
-    def count_context_versions(
-        self, execution_id: ExecutionId
-    ) -> int:
+    def count_context_versions(self, execution_id: ExecutionId) -> int:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT COUNT(*) FROM context_versions WHERE execution_id = ?",
@@ -297,16 +279,10 @@ class ContextRepository:
     ) -> None:
         conn = self._database.connect()
         selected_json = json.dumps(
-            [
-                {"source": s, "record_id": r, "token_count": t}
-                for s, r, t in ledger.selected
-            ]
+            [{"source": s, "record_id": r, "token_count": t} for s, r, t in ledger.selected]
         )
         omitted_json = json.dumps(
-            [
-                {"source": s, "record_id": r, "reason": rea}
-                for s, r, rea in ledger.omitted
-            ]
+            [{"source": s, "record_id": r, "reason": rea} for s, r, rea in ledger.omitted]
         )
         conn.execute(
             "INSERT INTO context_injection_ledger "
@@ -376,9 +352,7 @@ class ContextRepository:
                     record.memory_delta_artifact_id.value
                     if record.memory_delta_artifact_id
                     else None,
-                    record.transcript_artifact_id.value
-                    if record.transcript_artifact_id
-                    else None,
+                    record.transcript_artifact_id.value if record.transcript_artifact_id else None,
                     record.summary,
                     record.fit_rung,
                     record.state,
@@ -405,15 +379,11 @@ class ContextRepository:
             (new_state, record_id.value),
         )
         if cursor.rowcount == 0:
-            raise ContextVersionNotFoundError(
-                f"Compaction record {record_id} not found"
-            )
+            raise ContextVersionNotFoundError(f"Compaction record {record_id} not found")
         if commit:
             conn.commit()
 
-    def list_compaction_records(
-        self, execution_id: ExecutionId
-    ) -> list[CompactionRecord]:
+    def list_compaction_records(self, execution_id: ExecutionId) -> list[CompactionRecord]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, execution_id, source_context_version, "
@@ -426,9 +396,7 @@ class ContextRepository:
         )
         return [_row_to_compaction_record(row) for row in cursor.fetchall()]
 
-    def get_latest_compaction_record(
-        self, execution_id: ExecutionId
-    ) -> CompactionRecord | None:
+    def get_latest_compaction_record(self, execution_id: ExecutionId) -> CompactionRecord | None:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, execution_id, source_context_version, "

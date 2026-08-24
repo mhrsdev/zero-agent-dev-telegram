@@ -82,13 +82,11 @@ def test_audit_event_has_actor_project_operation_result(
     services,
 ) -> None:
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Project A"
+    project = services.identity.create_project(owner_id=owner.id, name="Project A")
+    events = services.audit.list_for_project(
+        project_id=project.id, actor_id=project.owner_user_id, limit=10
     )
-    events = services.audit.list_for_project(project_id=project.id, actor_id=project.owner_user_id, limit=10)
-    create_event = next(
-        e for e in events if e.operation == "project.create"
-    )
+    create_event = next(e for e in events if e.operation == "project.create")
     assert create_event.actor_id == owner.id
     assert create_event.project_id == project.id
     assert create_event.operation == "project.create"
@@ -108,9 +106,7 @@ def test_audit_summary_with_secret_value_is_redacted(services) -> None:
     value in the summary, the audit service defensively redacts it.
     The primary control is careful construction at the call site."""
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Project A"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="Project A")
     services.audit.record(
         project_id=project.id,
         actor_id=owner.id,
@@ -118,14 +114,39 @@ def test_audit_summary_with_secret_value_is_redacted(services) -> None:
         operation="test.sensitive",
         redacted_summary="Used api_key=sk-abc123secretvalue",
     )
-    events = services.audit.list_for_project(project_id=project.id, actor_id=project.owner_user_id, limit=50)
-    event = next(
-        e for e in events if e.operation == "test.sensitive"
+    events = services.audit.list_for_project(
+        project_id=project.id, actor_id=project.owner_user_id, limit=50
     )
+    event = next(e for e in events if e.operation == "test.sensitive")
     # The summary should be replaced because it contained "sk-".
     assert event.redacted_summary is not None
     assert "sk-abc123secretvalue" not in event.redacted_summary
     assert "REDACTED" in event.redacted_summary
+
+
+def test_audit_summary_redacts_json_style_credentials(services) -> None:
+    owner = services.identity.create_user(display_name="JSON redaction owner")
+    project = services.identity.create_project(owner_id=owner.id, name="JSON redaction project")
+    services.audit.record(
+        project_id=project.id,
+        actor_id=owner.id,
+        source="web",
+        operation="test.json-sensitive",
+        redacted_summary=(
+            '{"token": "synthetic-json-credential", "nested": {"api_key": "synthetic-api-key"}}'
+        ),
+    )
+
+    event = next(
+        item
+        for item in services.audit.list_for_project(
+            project_id=project.id, actor_id=owner.id, limit=50
+        )
+        if item.operation == "test.json-sensitive"
+    )
+    assert event.redacted_summary is not None
+    assert "synthetic-json-credential" not in event.redacted_summary
+    assert "synthetic-api-key" not in event.redacted_summary
 
 
 def test_looks_sensitive_detects_common_patterns() -> None:
@@ -151,9 +172,7 @@ def test_list_for_correlation_returns_related_events_in_order(
     """Per zero-observability-evidence §"One correlation spine connects
     evidence": a correlation ID links related events."""
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Project A"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="Project A")
     correlation_id = "corr_test_12345"
     services.audit.record(
         project_id=project.id,
@@ -189,12 +208,8 @@ def test_list_for_project_returns_only_project_events(services) -> None:
     event from another project."""
     owner_a = services.identity.create_user(display_name="Owner A")
     owner_b = services.identity.create_user(display_name="Owner B")
-    project_a = services.identity.create_project(
-        owner_id=owner_a.id, name="Project A"
-    )
-    project_b = services.identity.create_project(
-        owner_id=owner_b.id, name="Project B"
-    )
+    project_a = services.identity.create_project(owner_id=owner_a.id, name="Project A")
+    project_b = services.identity.create_project(owner_id=owner_b.id, name="Project B")
     events_a = services.audit.list_for_project(
         project_id=project_a.id, actor_id=project_a.owner_user_id, limit=100
     )

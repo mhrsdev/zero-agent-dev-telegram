@@ -49,10 +49,7 @@ class ToolId:
         if not self.value or not isinstance(self.value, str):
             raise ValueError("ToolId must be a non-empty string")
         if not self.value.startswith(TOOL_ID_PREFIX):
-            raise ValueError(
-                f"ToolId must start with {TOOL_ID_PREFIX!r}; "
-                f"got {self.value!r}"
-            )
+            raise ValueError(f"ToolId must start with {TOOL_ID_PREFIX!r}; got {self.value!r}")
 
     def __str__(self) -> str:
         return self.value
@@ -69,8 +66,7 @@ class ToolGrantId:
             raise ValueError("ToolGrantId must be a non-empty string")
         if not self.value.startswith(TOOL_GRANT_ID_PREFIX):
             raise ValueError(
-                f"ToolGrantId must start with {TOOL_GRANT_ID_PREFIX!r}; "
-                f"got {self.value!r}"
+                f"ToolGrantId must start with {TOOL_GRANT_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -130,14 +126,14 @@ class ToolGrant:
     tool_id: ToolId
     agent_scope: AgentScope
     max_invocations: int | None = None
-    timeout_seconds: int | None = None
+    timeout_seconds: float | None = None
 
 
 # ----------------------------------------------------------------------
 # Tool result
 # ----------------------------------------------------------------------
 
-ToolResultStatus = Literal["success", "failure", "cancelled", "unknown"]
+ToolResultStatus = Literal["success", "failure", "cancelled", "unknown", "error"]
 
 
 @dataclass(frozen=True)

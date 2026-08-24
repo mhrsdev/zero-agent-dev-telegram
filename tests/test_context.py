@@ -43,30 +43,39 @@ def project_with_owner_and_plan(services):
     from zero.domain.plans import PlanRevisionContent
 
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Project A"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="Project A")
     event = services.plans.ingest_conversation_event(
-        project_id=project.id, actor_id=owner.id, source="web",
-        origin_kind="authenticated_human", content="Add a feature."
+        project_id=project.id,
+        actor_id=owner.id,
+        source="web",
+        origin_kind="authenticated_human",
+        content="Add a feature.",
     )
-    plan = services.plans.create_plan(
-        project_id=project.id, actor_id=owner.id
-    )
+    plan = services.plans.create_plan(project_id=project.id, actor_id=owner.id)
     content = PlanRevisionContent(
-        objective="Add a feature", scope=(), constraints=(),
-        acceptance_criteria=("Works",), risks=(), unresolved_questions=(),
-        source_event_ids=(event.id,))
+        objective="Add a feature",
+        scope=(),
+        constraints=(),
+        acceptance_criteria=("Works",),
+        risks=(),
+        unresolved_questions=(),
+        source_event_ids=(event.id,),
+    )
     services.plans.propose_revision(
-        plan_id=plan.id, actor_id=owner.id, content=content
+        plan_id=plan.id, project_id=project.id, actor_id=owner.id, content=content
     )
     _, handoff = services.plans.approve_revision(
-        plan_id=plan.id, actor_id=owner.id,
-        expected_revision_number=1, idempotency_key="a1"
+        plan_id=plan.id,
+        project_id=project.id,
+        actor_id=owner.id,
+        expected_revision_number=1,
+        idempotency_key="a1",
     )
     execution = services.worker.create_execution_from_handoff(
-        handoff_id=handoff.id, actor_id=owner.id,
-        task_specs=[TaskSpec(key="A", objective="Task A")]
+        handoff_id=handoff.id,
+        project_id=project.id,
+        actor_id=owner.id,
+        task_specs=[TaskSpec(key="A", objective="Task A")],
     )
     return owner, project, plan, execution
 
@@ -95,22 +104,19 @@ def test_exceeds_threshold_boundary() -> None:
 def test_context_remaining_preserves_output_reserve() -> None:
     """Per zero-claude-token-economics: output reserve is subtracted
     before filling input."""
-    assert context_remaining(
-        context_window=200000, used_tokens=150000,
-        reserved_output_tokens=20000
-    ) == 30000
-    assert context_remaining(
-        context_window=200000, used_tokens=190000,
-        reserved_output_tokens=20000
-    ) == 0  # clamped to 0
+    assert (
+        context_remaining(context_window=200000, used_tokens=150000, reserved_output_tokens=20000)
+        == 30000
+    )
+    assert (
+        context_remaining(context_window=200000, used_tokens=190000, reserved_output_tokens=20000)
+        == 0
+    )  # clamped to 0
 
 
 def test_context_remaining_rejects_reserve_exceeding_window() -> None:
     with pytest.raises(ValueError, match="exceeds"):
-        context_remaining(
-            context_window=1000, used_tokens=0,
-            reserved_output_tokens=2000
-        )
+        context_remaining(context_window=1000, used_tokens=0, reserved_output_tokens=2000)
 
 
 # ----------------------------------------------------------------------
@@ -118,15 +124,14 @@ def test_context_remaining_rejects_reserve_exceeding_window() -> None:
 # ----------------------------------------------------------------------
 
 
-def test_retrieval_returns_empty_for_no_match(
-    services, project_with_owner_and_plan
-) -> None:
+def test_retrieval_returns_empty_for_no_match(services, project_with_owner_and_plan) -> None:
     """Per PLAN.md M9: 'Empty retrieval preferred over unauthorized or
     irrelevant retrieval.'"""
-    _owner, project, _plan, execution = project_with_owner_and_plan
+    owner, project, _plan, execution = project_with_owner_and_plan
     candidates, ledger = services.retrieval.retrieve(
         project_id=project.id,
         execution_id=execution.id,
+        actor_id=owner.id,
         agent_type_id=None,
         query="nonexistent topic zzz",
         budget_tokens=1000,
@@ -137,16 +142,16 @@ def test_retrieval_returns_empty_for_no_match(
     assert ledger.total_tokens == 0
 
 
-def test_retrieval_respects_budget(
-    services, project_with_owner_and_plan
-) -> None:
+def test_retrieval_respects_budget(services, project_with_owner_and_plan) -> None:
     """Per PLAN.md M9: 'Exact budget boundaries and output reserve.'"""
     owner, project, _plan, execution = project_with_owner_and_plan
     # Ingest several documents.
     for i in range(5):
         services.artifacts.ingest_rag_document(
-            project_id=project.id, actor_id=owner.id,
-            source_type="manual", source_id=f"doc{i}",
+            project_id=project.id,
+            actor_id=owner.id,
+            source_type="manual",
+            source_id=f"doc{i}",
             title=f"Document {i}",
             content=f"Content about topic number {i} " + "x" * 100,
             state="approved",
@@ -155,6 +160,7 @@ def test_retrieval_respects_budget(
     candidates, ledger = services.retrieval.retrieve(
         project_id=project.id,
         execution_id=execution.id,
+        actor_id=owner.id,
         agent_type_id=None,
         query="topic",
         budget_tokens=50,  # very small
@@ -166,15 +172,15 @@ def test_retrieval_respects_budget(
     assert len(ledger.omitted) > 0 or len(candidates) == 0
 
 
-def test_retrieval_records_provenance_in_ledger(
-    services, project_with_owner_and_plan
-) -> None:
+def test_retrieval_records_provenance_in_ledger(services, project_with_owner_and_plan) -> None:
     """Per PLAN.md M9: 'Context contains provenance for injected
     records.'"""
     owner, project, _plan, execution = project_with_owner_and_plan
     services.artifacts.ingest_rag_document(
-        project_id=project.id, actor_id=owner.id,
-        source_type="manual", source_id="doc1",
+        project_id=project.id,
+        actor_id=owner.id,
+        source_type="manual",
+        source_id="doc1",
         title="Important Decision",
         content="We decided to use PostgreSQL for persistence.",
         state="approved",
@@ -182,6 +188,7 @@ def test_retrieval_records_provenance_in_ledger(
     candidates, ledger = services.retrieval.retrieve(
         project_id=project.id,
         execution_id=execution.id,
+        actor_id=owner.id,
         agent_type_id=None,
         query="PostgreSQL",
         budget_tokens=1000,
@@ -198,43 +205,52 @@ def test_retrieval_records_provenance_in_ledger(
 def test_retrieval_does_not_leak_across_projects(services) -> None:
     """Per PLAN.md M9: zero cross-project leakage."""
     owner_a = services.identity.create_user(display_name="Owner A")
-    project_a = services.identity.create_project(
-        owner_id=owner_a.id, name="Project A"
-    )
+    project_a = services.identity.create_project(owner_id=owner_a.id, name="Project A")
     owner_b = services.identity.create_user(display_name="Owner B")
-    project_b = services.identity.create_project(
-        owner_id=owner_b.id, name="Project B"
-    )
+    project_b = services.identity.create_project(owner_id=owner_b.id, name="Project B")
     from zero.app.worker_service import TaskSpec
     from zero.domain.plans import PlanRevisionContent
 
     # Create execution in project B.
     event = services.plans.ingest_conversation_event(
-        project_id=project_b.id, actor_id=owner_b.id, source="web",
-        origin_kind="authenticated_human", content="Add a feature."
+        project_id=project_b.id,
+        actor_id=owner_b.id,
+        source="web",
+        origin_kind="authenticated_human",
+        content="Add a feature.",
     )
-    plan = services.plans.create_plan(
-        project_id=project_b.id, actor_id=owner_b.id
-    )
+    plan = services.plans.create_plan(project_id=project_b.id, actor_id=owner_b.id)
     content = PlanRevisionContent(
-        objective="Add a feature", scope=(), constraints=(),
-        acceptance_criteria=("Works",), risks=(), unresolved_questions=(),
-        source_event_ids=(event.id,))
+        objective="Add a feature",
+        scope=(),
+        constraints=(),
+        acceptance_criteria=("Works",),
+        risks=(),
+        unresolved_questions=(),
+        source_event_ids=(event.id,),
+    )
     services.plans.propose_revision(
-        plan_id=plan.id, actor_id=owner_b.id, content=content
+        plan_id=plan.id, project_id=project_b.id, actor_id=owner_b.id, content=content
     )
     _, handoff = services.plans.approve_revision(
-        plan_id=plan.id, actor_id=owner_b.id,
-        expected_revision_number=1, idempotency_key="a1"
+        plan_id=plan.id,
+        project_id=project_b.id,
+        actor_id=owner_b.id,
+        expected_revision_number=1,
+        idempotency_key="a1",
     )
     execution_b = services.worker.create_execution_from_handoff(
-        handoff_id=handoff.id, actor_id=owner_b.id,
-        task_specs=[TaskSpec(key="A", objective="Task A")]
+        handoff_id=handoff.id,
+        project_id=project_b.id,
+        actor_id=owner_b.id,
+        task_specs=[TaskSpec(key="A", objective="Task A")],
     )
     # Ingest a document in project A with a unique phrase.
     services.artifacts.ingest_rag_document(
-        project_id=project_a.id, actor_id=owner_a.id,
-        source_type="manual", source_id="secret",
+        project_id=project_a.id,
+        actor_id=owner_a.id,
+        source_type="manual",
+        source_id="secret",
         title="Project A Secret",
         content="Unique secret phrase: rainbow thunderstorm.",
         state="approved",
@@ -243,6 +259,7 @@ def test_retrieval_does_not_leak_across_projects(services) -> None:
     candidates, _ = services.retrieval.retrieve(
         project_id=project_b.id,
         execution_id=execution_b.id,
+        actor_id=owner_b.id,
         agent_type_id=None,
         query="rainbow thunderstorm",
         budget_tokens=1000,
@@ -256,14 +273,14 @@ def test_retrieval_does_not_leak_across_projects(services) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_context_builder_produces_named_regions(
-    services, project_with_owner_and_plan
-) -> None:
+def test_context_builder_produces_named_regions(services, project_with_owner_and_plan) -> None:
     owner, project, _plan, execution = project_with_owner_and_plan
     # Ingest a document.
     services.artifacts.ingest_rag_document(
-        project_id=project.id, actor_id=owner.id,
-        source_type="manual", source_id="doc1",
+        project_id=project.id,
+        actor_id=owner.id,
+        source_type="manual",
+        source_id="doc1",
         title="Test Doc",
         content="Some relevant content about testing.",
         state="approved",
@@ -271,6 +288,7 @@ def test_context_builder_produces_named_regions(
     context_text, _ledger = services.context_builder.build_context(
         project_id=project.id,
         execution_id=execution.id,
+        actor_id=owner.id,
         agent_type_id=None,
         system_message="You are a helpful assistant.",
         user_prefix="Project: Project A",
@@ -292,18 +310,13 @@ def test_context_builder_produces_named_regions(
 # ----------------------------------------------------------------------
 
 
-def test_compact_creates_new_context_version(
-    services, project_with_owner_and_plan
-) -> None:
+def test_compact_creates_new_context_version(services, project_with_owner_and_plan) -> None:
     """Per PLAN.md M9: 'Compaction survives restart and retains plan,
     task graph, worktree, agents, tests, blockers, approvals, and
     recovery pointers.'"""
     owner, project, _plan, execution = project_with_owner_and_plan
     # Create a large conversation that exceeds the threshold.
-    messages = [
-        {"role": "user", "content": f"Message {i} " + "x" * 1000}
-        for i in range(50)
-    ]
+    messages = [{"role": "user", "content": f"Message {i} " + "x" * 1000} for i in range(50)]
     record = services.compaction.compact(
         project_id=project.id,
         execution_id=execution.id,
@@ -325,9 +338,7 @@ def test_compact_creates_new_context_version(
     assert active.transcript_artifact_id is not None
 
 
-def test_compact_preserves_execution_snapshot(
-    services, project_with_owner_and_plan
-) -> None:
+def test_compact_preserves_execution_snapshot(services, project_with_owner_and_plan) -> None:
     """Per zero-context-memory §9: compaction summary is NOT the sole
     copy of plan/task IDs, worktree IDs, etc. The typed execution
     snapshot survives compaction."""
@@ -352,9 +363,7 @@ def test_compact_preserves_execution_snapshot(
     assert active.execution_snapshot == snapshot  # preserved
 
 
-def test_compact_stores_transcript_artifact(
-    services, project_with_owner_and_plan
-) -> None:
+def test_compact_stores_transcript_artifact(services, project_with_owner_and_plan) -> None:
     """Per zero-context-memory: full source transcripts remain
     recoverable until losslessness and retrieval quality are proven."""
     owner, project, _plan, execution = project_with_owner_and_plan
@@ -385,9 +394,7 @@ def test_compact_stores_transcript_artifact(
     assert "important message 1" in transcript.content
 
 
-def test_compact_fit_ladder_used(
-    services, project_with_owner_and_plan
-) -> None:
+def test_compact_fit_ladder_used(services, project_with_owner_and_plan) -> None:
     """Per zero-context-memory: the fit ladder is used when the
     summarizer input doesn't fit verbatim."""
     owner, project, _plan, execution = project_with_owner_and_plan
@@ -412,8 +419,10 @@ def test_compact_fit_ladder_used(
     # The fit rung should not be "verbatim" because the messages
     # exceeded the summary budget.
     assert record.fit_rung in (
-        "history_turn_selected", "tool_truncated",
-        "step_turns_selected", "emergency"
+        "history_turn_selected",
+        "tool_truncated",
+        "step_turns_selected",
+        "emergency",
     )
 
 
@@ -456,22 +465,20 @@ def test_should_compact_returns_false_below_threshold(
 ) -> None:
     _owner, _project, _plan, execution = project_with_owner_and_plan
     # No active context yet.
-    assert services.compaction.should_compact(
-        execution.id, context_window=100000
-    ) is False
+    assert services.compaction.should_compact(execution.id, context_window=100000) is False
 
 
-def test_injection_ledger_records_omitted(
-    services, project_with_owner_and_plan
-) -> None:
+def test_injection_ledger_records_omitted(services, project_with_owner_and_plan) -> None:
     """Per PLAN.md M9: 'Context-injection ledger explaining selected and
     omitted records.'"""
     owner, project, _plan, execution = project_with_owner_and_plan
     # Ingest more documents than the budget can hold.
     for i in range(10):
         services.artifacts.ingest_rag_document(
-            project_id=project.id, actor_id=owner.id,
-            source_type="manual", source_id=f"doc{i}",
+            project_id=project.id,
+            actor_id=owner.id,
+            source_type="manual",
+            source_id=f"doc{i}",
             title=f"Document {i}",
             content=f"Content about topic {i} " + "x" * 200,
             state="approved",
@@ -479,6 +486,7 @@ def test_injection_ledger_records_omitted(
     _, ledger = services.retrieval.retrieve(
         project_id=project.id,
         execution_id=execution.id,
+        actor_id=owner.id,
         agent_type_id=None,
         query="topic",
         budget_tokens=100,  # tiny budget

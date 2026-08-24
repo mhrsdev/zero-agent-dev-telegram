@@ -57,9 +57,7 @@ class ToolRepository:
     # Tools
     # ------------------------------------------------------------------
 
-    def insert_tool(
-        self, tool: Tool, *, commit: bool = True
-    ) -> None:
+    def insert_tool(self, tool: Tool, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -81,9 +79,7 @@ class ToolRepository:
             if commit:
                 conn.rollback()
             if "UNIQUE" in str(exc) and "tools.name" in str(exc):
-                raise ToolAlreadyExistsError(
-                    f"Tool {tool.name!r} is already registered"
-                ) from exc
+                raise ToolAlreadyExistsError(f"Tool {tool.name!r} is already registered") from exc
             raise
 
     def get_tool_by_id(self, tool_id: ToolId) -> Tool:
@@ -122,9 +118,7 @@ class ToolRepository:
     # Tool grants
     # ------------------------------------------------------------------
 
-    def insert_grant(
-        self, grant: ToolGrant, *, commit: bool = True
-    ) -> None:
+    def insert_grant(self, grant: ToolGrant, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -174,14 +168,11 @@ class ToolRepository:
         row = cursor.fetchone()
         if row is None:
             raise ToolGrantNotFoundError(
-                f"No grant for tool {tool_id} in scope {agent_scope} "
-                f"in project {project_id}"
+                f"No grant for tool {tool_id} in scope {agent_scope} in project {project_id}"
             )
         return _row_to_tool_grant(row)
 
-    def list_grants_for_project(
-        self, project_id: ProjectId
-    ) -> list[ToolGrant]:
+    def list_grants_for_project(self, project_id: ProjectId) -> list[ToolGrant]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, tool_id, agent_scope, max_invocations, "
@@ -207,14 +198,12 @@ class ToolRepository:
         """
         conn = self._database.connect()
         cursor = conn.execute(
-            "DELETE FROM tool_grants "
-            "WHERE project_id = ? AND tool_id = ? AND agent_scope = ?",
+            "DELETE FROM tool_grants WHERE project_id = ? AND tool_id = ? AND agent_scope = ?",
             (project_id.value, tool_id.value, agent_scope),
         )
         if cursor.rowcount == 0:
             raise ToolGrantNotFoundError(
-                f"No grant for tool {tool_id} in scope {agent_scope} "
-                f"in project {project_id}"
+                f"No grant for tool {tool_id} in scope {agent_scope} in project {project_id}"
             )
         if commit:
             conn.commit()

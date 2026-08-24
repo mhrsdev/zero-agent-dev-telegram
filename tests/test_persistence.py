@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -30,9 +31,7 @@ def test_migrations_create_schema(test_settings: Settings) -> None:
     assert applied >= 1
     # The schema_migrations table exists.
     conn = database.connect()
-    cursor = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-    )
+    cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
     tables = {row[0] for row in cursor.fetchall()}
     assert "schema_migrations" in tables
     assert "projects" in tables
@@ -71,6 +70,18 @@ def test_foreign_keys_are_enforced(test_settings: Settings) -> None:
     conn = database.connect()
     cursor = conn.execute("PRAGMA foreign_keys")
     assert cursor.fetchone()[0] == 1
+
+
+def test_reused_connection_reasserts_foreign_keys(test_settings: Settings) -> None:
+    database = Database(test_settings)
+    apply_migrations(database)
+    conn = database.connect()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+
+    refreshed = database.connect()
+
+    assert refreshed.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
 def test_in_memory_database_is_shared_within_process(
@@ -141,3 +152,22 @@ def test_runtime_markers_unique_constraint_enforced(
             "INSERT INTO runtime_markers (name, value) VALUES (?, ?)",
             ("unique_test", "second"),
         )
+
+
+def test_file_connection_retries_transient_wal_lock(test_settings: Settings) -> None:
+    database = Database(test_settings)
+    connection = Mock()
+    calls = {"journal_mode": 0}
+
+    def execute(sql: str, *_args):
+        if sql == "PRAGMA journal_mode = WAL":
+            calls["journal_mode"] += 1
+            if calls["journal_mode"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+        return Mock()
+
+    connection.execute.side_effect = execute
+    configured = database._configure_connection(connection, wal=True)
+
+    assert configured is connection
+    assert calls["journal_mode"] == 2

@@ -90,9 +90,7 @@ class IdentityRepository:
     # Users
     # ------------------------------------------------------------------
 
-    def insert_user(
-        self, user: User, *, commit: bool = True
-    ) -> None:
+    def insert_user(self, user: User, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -105,9 +103,7 @@ class IdentityRepository:
             if commit:
                 conn.rollback()
             if "UNIQUE" in str(exc) and "users.id" in str(exc):
-                raise DuplicateUserError(
-                    f"User {user.id} already exists"
-                ) from exc
+                raise DuplicateUserError(f"User {user.id} already exists") from exc
             raise
 
     def get_user(self, user_id: UserId) -> User:
@@ -155,8 +151,7 @@ class IdentityRepository:
             )
             if owner_membership is not None:
                 conn.execute(
-                    "INSERT INTO project_memberships "
-                    "(project_id, user_id, role) VALUES (?, ?, ?)",
+                    "INSERT INTO project_memberships (project_id, user_id, role) VALUES (?, ?, ?)",
                     (
                         owner_membership.project_id.value,
                         owner_membership.user_id.value,
@@ -188,18 +183,28 @@ class IdentityRepository:
         except ProjectNotFoundError:
             return False
 
+    def list_projects(self) -> list[Project]:
+        """Return every project, ordered by creation.
+
+        Used by the managed background workers to host autonomous work
+        for the whole deployment. Authorization still happens per
+        project through the normal service boundary.
+        """
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "SELECT id, name, owner_user_id, created_at FROM projects ORDER BY created_at"
+        )
+        return [_row_to_project(row) for row in cursor.fetchall()]
+
     # ------------------------------------------------------------------
     # Memberships
     # ------------------------------------------------------------------
 
-    def insert_membership(
-        self, membership: ProjectMembership, *, commit: bool = True
-    ) -> None:
+    def insert_membership(self, membership: ProjectMembership, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
-                "INSERT INTO project_memberships (project_id, user_id, role) "
-                "VALUES (?, ?, ?)",
+                "INSERT INTO project_memberships (project_id, user_id, role) VALUES (?, ?, ?)",
                 (
                     membership.project_id.value,
                     membership.user_id.value,
@@ -232,15 +237,11 @@ class IdentityRepository:
             (project_id.value, user_id.value),
         )
         if cursor.rowcount == 0:
-            raise MembershipNotFoundError(
-                f"User {user_id} is not a member of project {project_id}"
-            )
+            raise MembershipNotFoundError(f"User {user_id} is not a member of project {project_id}")
         if commit:
             conn.commit()
 
-    def get_membership(
-        self, project_id: ProjectId, user_id: UserId
-    ) -> ProjectMembership | None:
+    def get_membership(self, project_id: ProjectId, user_id: UserId) -> ProjectMembership | None:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT project_id, user_id, role, created_at "
@@ -252,9 +253,7 @@ class IdentityRepository:
             return None
         return _row_to_membership(row)
 
-    def list_memberships_for_project(
-        self, project_id: ProjectId
-    ) -> list[ProjectMembership]:
+    def list_memberships_for_project(self, project_id: ProjectId) -> list[ProjectMembership]:
         """List all memberships in a project.
 
         Per ``zero-project-isolation-evidence`` §"Scope begins before
@@ -270,9 +269,7 @@ class IdentityRepository:
         )
         return [_row_to_membership(row) for row in cursor.fetchall()]
 
-    def list_memberships_for_user(
-        self, user_id: UserId
-    ) -> list[ProjectMembership]:
+    def list_memberships_for_user(self, user_id: UserId) -> list[ProjectMembership]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT project_id, user_id, role, created_at "
@@ -282,9 +279,7 @@ class IdentityRepository:
         )
         return [_row_to_membership(row) for row in cursor.fetchall()]
 
-    def resolve_scope(
-        self, project_id: ProjectId, actor_id: UserId
-    ) -> ProjectScope:
+    def resolve_scope(self, project_id: ProjectId, actor_id: UserId) -> ProjectScope:
         """Resolve the actor's role in a project.
 
         Returns a :class:`ProjectScope` with ``is_member=True`` and the
@@ -298,17 +293,13 @@ class IdentityRepository:
         membership = self.get_membership(project_id, actor_id)
         if membership is None:
             return ProjectScope.for_non_member(project_id, actor_id)
-        return ProjectScope.for_member(
-            project_id, actor_id, membership.role
-        )
+        return ProjectScope.for_member(project_id, actor_id, membership.role)
 
     # ------------------------------------------------------------------
     # External identities
     # ------------------------------------------------------------------
 
-    def insert_external_identity(
-        self, identity: ExternalIdentity, *, commit: bool = True
-    ) -> None:
+    def insert_external_identity(self, identity: ExternalIdentity, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -353,9 +344,7 @@ class IdentityRepository:
             return None
         return _row_to_external_identity(row)
 
-    def list_external_identities_for_user(
-        self, user_id: UserId
-    ) -> list[ExternalIdentity]:
+    def list_external_identities_for_user(self, user_id: UserId) -> list[ExternalIdentity]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, user_id, platform, external_id, external_username, "
@@ -378,9 +367,7 @@ class IdentityRepository:
             (verified_at, identity_id.value),
         )
         if cursor.rowcount == 0:
-            raise UserNotFoundError(
-                f"External identity {identity_id} not found"
-            )
+            raise UserNotFoundError(f"External identity {identity_id} not found")
         if commit:
             conn.commit()
 
@@ -397,9 +384,7 @@ class IdentityRepository:
         """
         identity = self.get_external_identity(platform, external_id)
         if identity is None:
-            raise UserNotFoundError(
-                f"No external identity found for {platform}:{external_id}"
-            )
+            raise UserNotFoundError(f"No external identity found for {platform}:{external_id}")
         if identity.verified_at is None:
             raise ExternalIdentityNotVerifiedError(
                 f"External identity {platform}:{external_id} is not verified"

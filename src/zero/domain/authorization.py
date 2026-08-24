@@ -117,9 +117,7 @@ ROLE_PERMISSIONS: dict[ProjectRole, frozenset[Permission]] = {
             "cost.view",
         }
     ),
-    "viewer": frozenset(
-        {"project.view", "execution.view_diffs", "cost.view"}
-    ),
+    "viewer": frozenset({"project.view", "execution.view_diffs", "cost.view"}),
 }
 
 

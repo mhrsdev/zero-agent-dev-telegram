@@ -6,6 +6,7 @@ all queries filter by ``project_id`` before any row is loaded.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 
@@ -75,17 +76,20 @@ def _row_to_command_run(row: sqlite3.Row) -> CommandRun:
 
 
 def _row_to_artifact(row: sqlite3.Row) -> TaskArtifact:
+    content = row["content"]
+    content_hash = row["content_hash"]
+    expected_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if content_hash != expected_hash:
+        raise ValueError(f"task artifact {row['id']} has invalid content_hash")
     return TaskArtifact(
         id=TaskArtifactId(row["id"]),
         project_id=ProjectId(row["project_id"]),
         worktree_id=WorktreeId(row["worktree_id"]),
         task_id=TaskId(row["task_id"]),
-        command_run_id=CommandRunId(row["command_run_id"])
-        if row["command_run_id"]
-        else None,
+        command_run_id=CommandRunId(row["command_run_id"]) if row["command_run_id"] else None,
         kind=row["kind"],  # type: ignore[arg-type]
-        content=row["content"],
-        content_hash=row["content_hash"],
+        content=content,
+        content_hash=content_hash,
         created_at=row["created_at"],
     )
 
@@ -101,9 +105,7 @@ class WorktreeRepository:
     # Repositories
     # ------------------------------------------------------------------
 
-    def insert_repository(
-        self, repo: Repository, *, commit: bool = True
-    ) -> None:
+    def insert_repository(self, repo: Repository, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -125,9 +127,7 @@ class WorktreeRepository:
                 conn.rollback()
             raise
 
-    def get_repository(
-        self, project_id: ProjectId, repo_id: RepositoryId
-    ) -> Repository:
+    def get_repository(self, project_id: ProjectId, repo_id: RepositoryId) -> Repository:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, name, local_path, "
@@ -137,14 +137,10 @@ class WorktreeRepository:
         )
         row = cursor.fetchone()
         if row is None:
-            raise RepositoryNotFoundError(
-                f"Repository {repo_id} not found in project {project_id}"
-            )
+            raise RepositoryNotFoundError(f"Repository {repo_id} not found in project {project_id}")
         return _row_to_repository(row)
 
-    def list_repositories_for_project(
-        self, project_id: ProjectId
-    ) -> list[Repository]:
+    def list_repositories_for_project(self, project_id: ProjectId) -> list[Repository]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, name, local_path, "
@@ -158,9 +154,7 @@ class WorktreeRepository:
     # Worktrees
     # ------------------------------------------------------------------
 
-    def insert_worktree(
-        self, worktree: Worktree, *, commit: bool = True
-    ) -> None:
+    def insert_worktree(self, worktree: Worktree, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -189,14 +183,11 @@ class WorktreeRepository:
                 from zero.domain.worktrees import WorktreeAlreadyExistsError
 
                 raise WorktreeAlreadyExistsError(
-                    f"An active worktree already exists for task "
-                    f"{worktree.task_id}"
+                    f"An active worktree already exists for task {worktree.task_id}"
                 ) from exc
             raise
 
-    def get_worktree(
-        self, project_id: ProjectId, worktree_id: WorktreeId
-    ) -> Worktree:
+    def get_worktree(self, project_id: ProjectId, worktree_id: WorktreeId) -> Worktree:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, repository_id, execution_id, task_id, "
@@ -207,46 +198,86 @@ class WorktreeRepository:
         )
         row = cursor.fetchone()
         if row is None:
-            raise WorktreeNotFoundError(
-                f"Worktree {worktree_id} not found in project {project_id}"
-            )
+            raise WorktreeNotFoundError(f"Worktree {worktree_id} not found in project {project_id}")
         return _row_to_worktree(row)
 
     def get_worktree_for_task(
-        self, task_id: TaskId
+        self,
+        task_id: TaskId,
+        *,
+        project_id: ProjectId | None = None,
     ) -> Worktree | None:
         """Return the active worktree for a task, or None."""
         conn = self._database.connect()
-        cursor = conn.execute(
+        query = (
             "SELECT id, project_id, repository_id, execution_id, task_id, "
             "branch_name, worktree_path, base_revision, state, "
             "cleanup_eligible_at, created_at, updated_at FROM worktrees "
-            "WHERE task_id = ? AND state IN "
-            "('allocated','active','interrupted') "
-            "ORDER BY created_at DESC LIMIT 1",
-            (task_id.value,),
         )
+        if project_id is None:
+            cursor = conn.execute(
+                f"{query}WHERE task_id = ? AND state IN "
+                "('allocated','active','interrupted') "
+                "ORDER BY created_at DESC LIMIT 1",
+                (task_id.value,),
+            )
+        else:
+            cursor = conn.execute(
+                f"{query}WHERE task_id = ? AND project_id = ? AND state IN "
+                "('allocated','active','interrupted') "
+                "ORDER BY created_at DESC LIMIT 1",
+                (task_id.value, project_id.value),
+            )
         row = cursor.fetchone()
         if row is None:
             return None
         return _row_to_worktree(row)
 
-    def list_worktrees_for_execution(
-        self, execution_id: ExecutionId
-    ) -> list[Worktree]:
+    def get_worktree_for_task_in_execution(
+        self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+        task_id: TaskId,
+    ) -> Worktree | None:
+        """Resolve a worktree only across the complete lineage tuple."""
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, repository_id, execution_id, task_id, "
             "branch_name, worktree_path, base_revision, state, "
             "cleanup_eligible_at, created_at, updated_at FROM worktrees "
-            "WHERE execution_id = ? ORDER BY created_at ASC",
-            (execution_id.value,),
+            "WHERE project_id = ? AND execution_id = ? AND task_id = ? "
+            "AND state IN ('allocated','active','interrupted','succeeded','failed') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (project_id.value, execution_id.value, task_id.value),
         )
+        row = cursor.fetchone()
+        return _row_to_worktree(row) if row is not None else None
+
+    def list_worktrees_for_execution(
+        self,
+        execution_id: ExecutionId,
+        *,
+        project_id: ProjectId | None = None,
+    ) -> list[Worktree]:
+        conn = self._database.connect()
+        query = (
+            "SELECT id, project_id, repository_id, execution_id, task_id, "
+            "branch_name, worktree_path, base_revision, state, "
+            "cleanup_eligible_at, created_at, updated_at FROM worktrees "
+        )
+        if project_id is None:
+            cursor = conn.execute(
+                f"{query}WHERE execution_id = ? ORDER BY created_at ASC",
+                (execution_id.value,),
+            )
+        else:
+            cursor = conn.execute(
+                f"{query}WHERE execution_id = ? AND project_id = ? ORDER BY created_at ASC",
+                (execution_id.value, project_id.value),
+            )
         return [_row_to_worktree(row) for row in cursor.fetchall()]
 
-    def list_worktrees_for_project(
-        self, project_id: ProjectId
-    ) -> list[Worktree]:
+    def list_worktrees_for_project(self, project_id: ProjectId) -> list[Worktree]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, repository_id, execution_id, task_id, "
@@ -290,9 +321,7 @@ class WorktreeRepository:
     # Command runs
     # ------------------------------------------------------------------
 
-    def insert_command_run(
-        self, run: CommandRun, *, commit: bool = True
-    ) -> None:
+    def insert_command_run(self, run: CommandRun, *, commit: bool = True) -> None:
         conn = self._database.connect()
         try:
             conn.execute(
@@ -323,9 +352,7 @@ class WorktreeRepository:
                 conn.rollback()
             raise
 
-    def get_command_run(
-        self, run_id: CommandRunId
-    ) -> CommandRun:
+    def get_command_run(self, run_id: CommandRunId) -> CommandRun:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, worktree_id, task_id, command, args, "
@@ -374,25 +401,38 @@ class WorktreeRepository:
             conn.commit()
 
     def list_command_runs_for_worktree(
-        self, worktree_id: WorktreeId
+        self,
+        worktree_id: WorktreeId,
+        *,
+        project_id: ProjectId | None = None,
     ) -> list[CommandRun]:
         conn = self._database.connect()
-        cursor = conn.execute(
-            "SELECT id, project_id, worktree_id, task_id, command, args, "
-            "exit_code, timed_out, timeout_seconds, started_at, "
-            "completed_at, state FROM command_runs "
-            "WHERE worktree_id = ? ORDER BY started_at ASC",
-            (worktree_id.value,),
-        )
+        if project_id is None:
+            cursor = conn.execute(
+                "SELECT id, project_id, worktree_id, task_id, command, args, "
+                "exit_code, timed_out, timeout_seconds, started_at, "
+                "completed_at, state FROM command_runs "
+                "WHERE worktree_id = ? ORDER BY started_at ASC",
+                (worktree_id.value,),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT id, project_id, worktree_id, task_id, command, args, "
+                "exit_code, timed_out, timeout_seconds, started_at, "
+                "completed_at, state FROM command_runs "
+                "WHERE worktree_id = ? AND project_id = ? ORDER BY started_at ASC",
+                (worktree_id.value, project_id.value),
+            )
         return [_row_to_command_run(row) for row in cursor.fetchall()]
 
     # ------------------------------------------------------------------
     # Task artifacts
     # ------------------------------------------------------------------
 
-    def insert_artifact(
-        self, artifact: TaskArtifact, *, commit: bool = True
-    ) -> None:
+    def insert_artifact(self, artifact: TaskArtifact, *, commit: bool = True) -> None:
+        expected_hash = hashlib.sha256(artifact.content.encode("utf-8")).hexdigest()
+        if artifact.content_hash != expected_hash:
+            raise ValueError("content_hash does not match artifact content")
         conn = self._database.connect()
         try:
             conn.execute(
@@ -405,9 +445,7 @@ class WorktreeRepository:
                     artifact.project_id.value,
                     artifact.worktree_id.value,
                     artifact.task_id.value,
-                    artifact.command_run_id.value
-                    if artifact.command_run_id
-                    else None,
+                    artifact.command_run_id.value if artifact.command_run_id else None,
                     artifact.kind,
                     artifact.content,
                     artifact.content_hash,
@@ -424,31 +462,59 @@ class WorktreeRepository:
         self,
         task_id: TaskId,
         *,
+        project_id: ProjectId | None = None,
         kind: ArtifactKind | None = None,
     ) -> list[TaskArtifact]:
         """List artifacts for a task, optionally filtered by kind."""
         conn = self._database.connect()
+        sql = (
+            "SELECT id, project_id, worktree_id, task_id, "
+            "command_run_id, kind, content, content_hash, created_at "
+            "FROM task_artifacts WHERE task_id = ?"
+        )
+        params: list[str] = [task_id.value]
+        if project_id is not None:
+            sql += " AND project_id = ?"
+            params.append(project_id.value)
         if kind is not None:
-            cursor = conn.execute(
-                "SELECT id, project_id, worktree_id, task_id, "
-                "command_run_id, kind, content, content_hash, created_at "
-                "FROM task_artifacts WHERE task_id = ? AND kind = ? "
-                "ORDER BY created_at ASC",
-                (task_id.value, kind),
-            )
-        else:
-            cursor = conn.execute(
-                "SELECT id, project_id, worktree_id, task_id, "
-                "command_run_id, kind, content, content_hash, created_at "
-                "FROM task_artifacts WHERE task_id = ? "
-                "ORDER BY created_at ASC",
-                (task_id.value,),
-            )
+            sql += " AND kind = ?"
+            params.append(kind)
+        sql += " ORDER BY created_at ASC"
+        cursor = conn.execute(sql, params)
         return [_row_to_artifact(row) for row in cursor.fetchall()]
 
-    def list_artifacts_for_worktree(
-        self, worktree_id: WorktreeId
+    def list_artifacts_for_task_in_lineage(
+        self,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+        task_id: TaskId,
+        worktree_id: WorktreeId,
+        *,
+        kind: ArtifactKind | None = None,
     ) -> list[TaskArtifact]:
+        """List artifacts only when project/execution/task/worktree agree."""
+        conn = self._database.connect()
+        sql = (
+            "SELECT a.id, a.project_id, a.worktree_id, a.task_id, "
+            "a.command_run_id, a.kind, a.content, a.content_hash, a.created_at "
+            "FROM task_artifacts a JOIN worktrees w ON w.id = a.worktree_id "
+            "WHERE a.project_id = ? AND w.execution_id = ? AND a.task_id = ? "
+            "AND a.worktree_id = ?"
+        )
+        params: list[str] = [
+            project_id.value,
+            execution_id.value,
+            task_id.value,
+            worktree_id.value,
+        ]
+        if kind is not None:
+            sql += " AND a.kind = ?"
+            params.append(kind)
+        sql += " ORDER BY a.created_at ASC"
+        cursor = conn.execute(sql, params)
+        return [_row_to_artifact(row) for row in cursor.fetchall()]
+
+    def list_artifacts_for_worktree(self, worktree_id: WorktreeId) -> list[TaskArtifact]:
         conn = self._database.connect()
         cursor = conn.execute(
             "SELECT id, project_id, worktree_id, task_id, "

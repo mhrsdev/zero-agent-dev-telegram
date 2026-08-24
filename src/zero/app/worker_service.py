@@ -27,13 +27,19 @@ per scheduled attempt ID.
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict, deque
 from datetime import UTC, datetime
+from threading import Event, Lock
+from typing import Any, cast
 
 from zero.app.authorization_service import AuthorizationService
+from zero.domain.artifacts import ArtifactId, ArtifactNotFoundError
 from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
+from zero.domain.authorization import AuthorizationDecision, AuthorizationError, Permission
 from zero.domain.execution import (
     BLOCKING_TASK_STATES,
+    AttemptIdentityError,
     CycleError,
     Execution,
     ExecutionId,
@@ -41,7 +47,9 @@ from zero.domain.execution import (
     ExecutionSnapshotId,
     InvalidExecutionTransitionError,
     InvalidTaskTransitionError,
+    LeaseOwnershipError,
     MissingDependencyError,
+    MissingEvidenceError,
     PlanNotApprovedError,
     Task,
     TaskAttempt,
@@ -52,7 +60,7 @@ from zero.domain.execution import (
     is_terminal_task_state,
     is_valid_execution_transition,
 )
-from zero.domain.identity import UserId
+from zero.domain.identity import ProjectId, UserId
 from zero.domain.ids import (
     generate_audit_event_id,
     generate_execution_id,
@@ -63,6 +71,7 @@ from zero.domain.ids import (
 from zero.domain.plans import (
     PlanHandoffId,
 )
+from zero.persistence.repositories.artifact_repository import ArtifactRepository
 from zero.persistence.repositories.audit_repository import AuditRepository
 from zero.persistence.repositories.execution_repository import (
     ExecutionRepository,
@@ -74,7 +83,31 @@ def _now_utc_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-# ----------------------------------------------------------------------
+_EVIDENCE_KINDS: dict[str, frozenset[str]] = {
+    "provider_response": frozenset({"transcript", "other"}),
+    "transcript": frozenset({"transcript"}),
+    "artifact": frozenset(
+        {
+            "stdout",
+            "stderr",
+            "diff",
+            "test_report",
+            "exit_status",
+            "other",
+            "source_snapshot",
+            "transcript",
+        }
+    ),
+    "diff": frozenset({"diff"}),
+    "test_report": frozenset({"test_report"}),
+    "exit_status": frozenset({"exit_status"}),
+    "stdout": frozenset({"stdout"}),
+    "stderr": frozenset({"stderr"}),
+    "source_snapshot": frozenset({"source_snapshot"}),
+}
+
+
+# ------------------------------------------------------------------
 # Task specification (input to the Worker)
 # ----------------------------------------------------------------------
 
@@ -89,7 +122,13 @@ class TaskSpec:
     records.
     """
 
-    __slots__ = ("expected_evidence", "key", "objective", "permitted_scope")
+    __slots__ = (
+        "agent_type_id",
+        "expected_evidence",
+        "key",
+        "objective",
+        "permitted_scope",
+    )
 
     def __init__(
         self,
@@ -98,6 +137,7 @@ class TaskSpec:
         permitted_scope: tuple[str, ...] = (),
         expected_evidence: tuple[str, ...] = (),
         key: str | None = None,
+        agent_type_id: str | None = None,
     ) -> None:
         self.objective = objective
         self.permitted_scope = permitted_scope
@@ -106,6 +146,10 @@ class TaskSpec:
         # dependencies before the task has a stable ID. The Worker
         # resolves keys to TaskIds when creating the graph.
         self.key = key
+        # Optional Sub Agent Type assigned to this task. When set, the
+        # runtime enforces the type's permitted tools, model policy,
+        # context budget, and concurrency limit for this task.
+        self.agent_type_id = agent_type_id
 
 
 class DependencySpec:
@@ -119,9 +163,7 @@ class DependencySpec:
 
     def __init__(self, *, task_key: str, depends_on_key: str) -> None:
         if task_key == depends_on_key:
-            raise CycleError(
-                f"Task {task_key!r} cannot depend on itself"
-            )
+            raise CycleError(f"Task {task_key!r} cannot depend on itself")
         self.task_key = task_key
         self.depends_on_key = depends_on_key
 
@@ -152,12 +194,75 @@ class WorkerService:
         execution_repo: ExecutionRepository,
         plan_repo: PlanRepository,
         audit_repo: AuditRepository,
+        artifact_repo: ArtifactRepository,
         authorization_service: AuthorizationService,
+        *,
+        metrics: Any | None = None,
+        task_max_attempts: int = 0,
     ) -> None:
         self._execution_repo = execution_repo
         self._plan_repo = plan_repo
         self._audit_repo = audit_repo
+        self._artifact_repo = artifact_repo
         self._authz = authorization_service
+        self._metrics = metrics
+        # Total attempts allowed per task (first run + retries). When a
+        # failed task still holds retry budget, the execution pauses
+        # ("awaiting automatic retry") instead of terminating as failed,
+        # so the scheduler can requeue and reclaim it. 0 disables.
+        self._task_max_attempts = max(0, int(task_max_attempts))
+        self._cancellation_events: dict[str, Event] = {}
+        self._cancellation_events_lock = Lock()
+
+    def get_cancellation_event(self, execution_id: ExecutionId) -> Event:
+        """Return the process-local cancellation signal for an execution."""
+        with self._cancellation_events_lock:
+            return self._cancellation_events.setdefault(execution_id.value, Event())
+
+    def _discard_cancellation_event(self, execution_id: ExecutionId) -> None:
+        """Drop the process-local cancellation signal for a terminal execution.
+
+        The map is bounded: every finished execution releases its event so a
+        long-lived process cannot accumulate one ``Event`` per execution.
+        Threads already holding the old object are unaffected; a terminal
+        execution never runs tasks again, so a fresh (unset) event can never
+        be observed by new work.
+        """
+        with self._cancellation_events_lock:
+            self._cancellation_events.pop(execution_id.value, None)
+
+    def _require_project_scope(
+        self,
+        *,
+        project_id: ProjectId | None,
+        actor_id: UserId | None,
+        permission: str,
+        source: AuditSource,
+    ) -> ProjectId:
+        """Authorize before any globally-addressed execution lookup.
+
+        ``None`` is deliberately rejected rather than treated as an internal
+        caller.  Recovery and scheduler code must carry an explicit actor
+        and project scope too.
+        """
+        if project_id is None or actor_id is None:
+            denied_project = project_id or ProjectId("p_missing")
+            raise AuthorizationError(
+                AuthorizationDecision.deny(
+                    actor_id=actor_id,
+                    project_id=denied_project,
+                    permission=cast(Permission, permission),
+                    role=None,
+                    reason="no_actor",
+                )
+            )
+        self._authz.require_permission(
+            actor_id=actor_id,
+            project_id=project_id,
+            permission=permission,  # type: ignore[arg-type]
+            source=source,
+        )
+        return project_id
 
     # ------------------------------------------------------------------
     # Execution creation
@@ -168,6 +273,7 @@ class WorkerService:
         *,
         handoff_id: PlanHandoffId,
         actor_id: UserId,
+        project_id: ProjectId,
         task_specs: list[TaskSpec],
         dependency_specs: list[DependencySpec] = (),
         source: AuditSource = "system",
@@ -189,14 +295,20 @@ class WorkerService:
         """
         dependency_specs = list(dependency_specs)
 
-        # Look up the handoff.
-        handoff = self._plan_repo.get_handoff(handoff_id)
+        self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
+
+        # Look up the handoff inside the caller's project boundary.
+        handoff = self._plan_repo.get_handoff(handoff_id, project_id=project_id)
         # Verify the plan is approved.
-        plan = self._plan_repo.get_plan(handoff.plan_id)
+        plan = self._plan_repo.get_plan(handoff.plan_id, project_id=project_id)
         if plan.current_state != "approved":
             raise PlanNotApprovedError(
-                f"Plan {plan.id} is in state {plan.current_state!r}, "
-                f"not 'approved'"
+                f"Plan {plan.id} is in state {plan.current_state!r}, not 'approved'"
             )
 
         # Authorize: the actor must have execution.start permission.
@@ -208,9 +320,7 @@ class WorkerService:
         )
 
         # Check for an existing execution (idempotency).
-        existing = self._execution_repo.get_execution_for_revision(
-            handoff.revision_id
-        )
+        existing = self._execution_repo.get_execution_for_revision(handoff.revision_id)
         if existing is not None:
             return existing
 
@@ -233,6 +343,13 @@ class WorkerService:
             updated_at=_now_utc_iso(),
         )
         with self._execution_repo._database.transaction():
+            # The transaction starts with BEGIN IMMEDIATE, so this re-read
+            # is the authoritative exactly-once handoff claim. A concurrent
+            # caller returns the persisted graph rather than its uncommitted
+            # locally-generated identity.
+            persisted = self._execution_repo.get_execution_for_revision(handoff.revision_id)
+            if persisted is not None:
+                return persisted
             self._execution_repo.insert_execution(execution, commit=False)
 
             # Create tasks.
@@ -249,6 +366,7 @@ class WorkerService:
                     permitted_scope=spec.permitted_scope,
                     expected_evidence=spec.expected_evidence,
                     state="pending",  # will compute readiness below
+                    agent_type_id=spec.agent_type_id,
                     created_at=_now_utc_iso(),
                     updated_at=_now_utc_iso(),
                 )
@@ -262,8 +380,7 @@ class WorkerService:
                     )
                 if dep_spec.depends_on_key not in key_to_task_id:
                     raise MissingDependencyError(
-                        f"Dependency depends_on_key "
-                        f"{dep_spec.depends_on_key!r} not found"
+                        f"Dependency depends_on_key {dep_spec.depends_on_key!r} not found"
                     )
                 dependency = TaskDependency(
                     task_id=key_to_task_id[dep_spec.task_key],
@@ -276,9 +393,7 @@ class WorkerService:
             self._recompute_readiness(execution.id, commit=False)
 
             # Link the handoff to the execution.
-            self._plan_repo.set_handoff_execution_id(
-                handoff.id, execution.id.value, commit=False
-            )
+            self._plan_repo.set_handoff_execution_id(handoff.id, execution.id.value, commit=False)
 
             # Take a snapshot for restart safety.
             self._snapshot(execution.id, "before_fan_out", commit=False)
@@ -295,8 +410,7 @@ class WorkerService:
                     target_id=execution.id.value,
                     result="success",
                     redacted_summary=(
-                        f"Created execution {execution.id.value} from plan "
-                        f"{plan.id.value}"
+                        f"Created execution {execution.id.value} from plan {plan.id.value}"
                     ),
                     correlation_id=execution.id.value,
                     created_at=_now_utc_iso(),
@@ -313,15 +427,33 @@ class WorkerService:
     ) -> None:
         if not task_specs:
             raise ValueError("task_specs must not be empty")
+        if len(task_specs) > 256:
+            raise ValueError("task_specs exceeds the maximum graph size")
+        if len(dependency_specs) > 1024:
+            raise ValueError("dependency_specs exceeds the maximum graph size")
+        for spec in task_specs:
+            if not isinstance(spec.objective, str) or not spec.objective.strip():
+                raise ValueError("task objective must be a non-empty string")
+            if len(spec.objective) > 8192:
+                raise ValueError("task objective exceeds the maximum length")
+            if spec.key is not None and len(spec.key) > 256:
+                raise ValueError("task key exceeds the maximum length")
+            if len(spec.permitted_scope) > 64 or any(
+                not isinstance(path, str) or len(path) > 1024 for path in spec.permitted_scope
+            ):
+                raise ValueError("task permitted_scope exceeds the policy limit")
+            if len(spec.expected_evidence) > 64 or any(
+                not isinstance(item, str) or not item.strip() or len(item) > 1024
+                for item in spec.expected_evidence
+            ):
+                raise ValueError("task expected_evidence exceeds the policy limit")
         # Check for duplicate keys.
         keys = [s.key or s.objective for s in task_specs]
         if len(set(keys)) != len(keys):
             raise ValueError("duplicate task keys in task_specs")
         for dep in dependency_specs:
             if dep.task_key == dep.depends_on_key:
-                raise CycleError(
-                    f"Task {dep.task_key!r} cannot depend on itself"
-                )
+                raise CycleError(f"Task {dep.task_key!r} cannot depend on itself")
 
     def _detect_cycles(
         self,
@@ -340,13 +472,10 @@ class WorkerService:
         in_degree: dict[str, int] = {k: 0 for k in keys}
         for dep in dependency_specs:
             if dep.task_key not in key_set:
-                raise MissingDependencyError(
-                    f"Dependency task_key {dep.task_key!r} not found"
-                )
+                raise MissingDependencyError(f"Dependency task_key {dep.task_key!r} not found")
             if dep.depends_on_key not in key_set:
                 raise MissingDependencyError(
-                    f"Dependency depends_on_key "
-                    f"{dep.depends_on_key!r} not found"
+                    f"Dependency depends_on_key {dep.depends_on_key!r} not found"
                 )
             adj[dep.depends_on_key].append(dep.task_key)
             in_degree[dep.task_key] += 1
@@ -364,8 +493,7 @@ class WorkerService:
             # Find the cycle for the error message.
             remaining = [k for k in keys if in_degree[k] > 0]
             raise CycleError(
-                f"Cycle detected in task dependency graph; "
-                f"nodes in cycles: {remaining}",
+                f"Cycle detected in task dependency graph; nodes in cycles: {remaining}",
                 cycle=remaining,
             )
 
@@ -385,20 +513,47 @@ class WorkerService:
           cancelled), the task stays pending (it will be blocked by
           the caller).
 
-        Per PLAN.md M5 validation: "Independent tasks become ready
-        together. Dependent tasks remain blocked until prerequisites
-        succeed. Failed prerequisites block dependents safely."
+        Dependency-``blocked`` tasks are also revisited: when every
+        dependency has recovered to ``completed`` (for example after a
+        requeued retry succeeded), a dependency-blocked task returns to
+        ``ready``. Human/provider-unknown blocks are left untouched.
         """
         tasks = self._execution_repo.list_tasks_for_execution(execution_id)
         for task in tasks:
+            if task.state == "blocked":
+                reason = task.blocker_reason or ""
+                if not reason.startswith("dependency"):
+                    # Human decisions and provider reconciliation are
+                    # not auto-revivable here.
+                    continue
+                deps = self._execution_repo.list_dependencies_for_task(task.id)
+                dep_states = [
+                    self._execution_repo.get_task(dep.depends_on_task_id).state for dep in deps
+                ]
+                if dep_states and all(state == "completed" for state in dep_states):
+                    self._execution_repo.update_task_state(
+                        task.id,
+                        "ready",
+                        blocker_reason="",
+                        commit=commit,
+                    )
+                elif dep_states and not any(state in BLOCKING_TASK_STATES for state in dep_states):
+                    # Dependencies recovered but are not all complete;
+                    # return to pending so the normal readiness pass
+                    # governs.
+                    self._execution_repo.update_task_state(
+                        task.id,
+                        "pending",
+                        blocker_reason="",
+                        commit=commit,
+                    )
+                continue
             if task.state != "pending":
                 continue
             deps = self._execution_repo.list_dependencies_for_task(task.id)
             if not deps:
                 # No dependencies: ready.
-                self._execution_repo.update_task_state(
-                    task.id, "ready", commit=commit
-                )
+                self._execution_repo.update_task_state(task.id, "ready", commit=commit)
                 continue
             all_completed = True
             any_blocking = False
@@ -409,9 +564,7 @@ class WorkerService:
                 if dep_task.state in BLOCKING_TASK_STATES:
                     any_blocking = True
             if all_completed:
-                self._execution_repo.update_task_state(
-                    task.id, "ready", commit=commit
-                )
+                self._execution_repo.update_task_state(task.id, "ready", commit=commit)
             elif any_blocking:
                 # A dependency failed/blocked/cancelled: this task
                 # cannot proceed. Mark it as blocked.
@@ -427,22 +580,153 @@ class WorkerService:
     # ------------------------------------------------------------------
 
     def list_ready_tasks(
-        self, execution_id: ExecutionId
+        self,
+        execution_id: ExecutionId,
+        *,
+        project_id: ProjectId | None = None,
+        actor_id: UserId | None = None,
+        source: AuditSource = "system",
     ) -> list[Task]:
-        """List all tasks in the ``ready`` state.
-
-        Per PLAN.md M5: "Independent tasks become ready together."
-        """
-        tasks = self._execution_repo.list_tasks_for_execution(execution_id)
+        """List ready tasks only after project authorization."""
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        self._execution_repo.get_execution(execution_id, project_id=project_id)
+        tasks = self._execution_repo.list_tasks_for_execution(
+            execution_id,
+            project_id=project_id,
+        )
         return [t for t in tasks if t.state == "ready"]
+
+    def _validate_evidence_artifacts(
+        self,
+        *,
+        task: Task,
+        attempt_id: TaskAttemptId,
+        evidence_artifact_ids: tuple[ArtifactId, ...],
+    ) -> tuple[str, ...]:
+        unique_ids = tuple(dict.fromkeys(evidence_artifact_ids))
+        if task.expected_evidence and len(unique_ids) < len(task.expected_evidence):
+            raise MissingEvidenceError(
+                f"task {task.id} requires {len(task.expected_evidence)} "
+                "distinct durable evidence artifacts"
+            )
+
+        validated: list[str] = []
+        satisfied: set[str] = set()
+        freeform_patterns = {
+            expected: re.compile(rf"\b{re.escape(expected)}\b", re.IGNORECASE)
+            for expected in task.expected_evidence
+            if expected not in _EVIDENCE_KINDS
+        }
+        expected_provenance = {
+            "execution_id": task.execution_id.value,
+            "task_id": task.id.value,
+            "attempt_id": attempt_id.value,
+        }
+        for artifact_id in unique_ids:
+            try:
+                artifact = self._artifact_repo.get_artifact(task.project_id, artifact_id)
+            except ArtifactNotFoundError as exc:
+                raise MissingEvidenceError(
+                    f"evidence artifact {artifact_id.value} is not in the task project"
+                ) from exc
+            try:
+                provenance = json.loads(artifact.provenance or "")
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise MissingEvidenceError(
+                    f"evidence artifact {artifact_id.value} has invalid provenance"
+                ) from exc
+            if not isinstance(provenance, dict) or any(
+                provenance.get(key) != value for key, value in expected_provenance.items()
+            ):
+                raise MissingEvidenceError(
+                    f"evidence artifact {artifact_id.value} does not belong to "
+                    f"task {task.id.value} and attempt {attempt_id.value}"
+                )
+            labels = provenance.get("evidence_labels", ())
+            if not isinstance(labels, (list, tuple, set)):
+                labels = ()
+            label_set = {str(label) for label in labels}
+            # Model-produced transcript artifacts are excluded from legacy
+            # freeform matching: a model could otherwise satisfy any
+            # human-acceptance label by echoing its text into a response.
+            freeform_eligible_kind = artifact.kind not in {"transcript"}
+            for expected in task.expected_evidence:
+                if expected in satisfied:
+                    continue
+                kind_matches = (
+                    expected in _EVIDENCE_KINDS and artifact.kind in _EVIDENCE_KINDS[expected]
+                )
+                explicit_match = expected in label_set
+                # Legacy human acceptance text remains supported only when
+                # the artifact itself asserts that exact term as a word and
+                # the artifact is not model-authored prose. It is still not
+                # enough for a caller to pass an unrelated label.
+                freeform_match = (
+                    expected not in _EVIDENCE_KINDS
+                    and freeform_eligible_kind
+                    and bool(freeform_patterns[expected].search(artifact.content))
+                )
+                if kind_matches or explicit_match or freeform_match:
+                    satisfied.add(expected)
+                    break
+            validated.append(artifact_id.value)
+        missing = tuple(item for item in task.expected_evidence if item not in satisfied)
+        if missing:
+            raise MissingEvidenceError(
+                f"task {task.id} evidence artifacts do not prove: {', '.join(missing)}"
+            )
+        return tuple(validated)
+
+    def _validate_attempt_identity(
+        self,
+        *,
+        task: Task,
+        attempt_id: TaskAttemptId,
+        lease_owner: str | None,
+        require_live_lease: bool = True,
+    ) -> TaskAttempt:
+        """Fence task transitions to the exact attempt lease.
+
+        ``require_live_lease=False`` still demands the recorded owner
+        but tolerates an expired clock: recording a terminal FAILURE or
+        CANCELLATION by the same owner is safer than leaving a zombie
+        ``running`` attempt that only restart recovery could reconcile.
+        Completion keeps the strict live-lease requirement.
+        """
+        attempt = self._execution_repo.get_attempt(attempt_id)
+        if attempt.task_id != task.id or attempt.project_id != task.project_id:
+            raise AttemptIdentityError(f"attempt {attempt_id} does not belong to task {task.id}")
+        if attempt.state != "running":
+            raise InvalidTaskTransitionError(f"attempt {attempt_id} is not running")
+        if not lease_owner or attempt.lease_owner != lease_owner:
+            raise LeaseOwnershipError(f"lease owner is not current for attempt {attempt_id}")
+        if not require_live_lease:
+            return attempt
+        if not attempt.lease_expires_at:
+            raise LeaseOwnershipError(f"attempt {attempt_id} has no active lease")
+        try:
+            expires = datetime.fromisoformat(attempt.lease_expires_at)
+        except ValueError as exc:
+            raise LeaseOwnershipError(f"attempt {attempt_id} has an invalid lease") from exc
+        if expires <= datetime.now(UTC):
+            raise LeaseOwnershipError(f"lease expired for attempt {attempt_id}")
+        return attempt
 
     def claim_task(
         self,
         *,
         execution_id: ExecutionId,
         task_id: TaskId,
+        project_id: ProjectId | None = None,
+        actor_id: UserId | None = None,
         lease_owner: str,
         lease_duration_seconds: int = 300,
+        source: AuditSource = "system",
     ) -> TaskAttempt:
         """Claim a ready task for execution.
 
@@ -459,29 +743,47 @@ class WorkerService:
         ``succeeded`` or ``failed`` and for transitioning the task to
         ``completed`` or ``failed``.
         """
-        task = self._execution_repo.get_task(task_id)
-        if task.execution_id != execution_id:
-            raise TaskNotFoundError(
-                f"Task {task_id} does not belong to execution {execution_id}"
-            )
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
+        if not lease_owner or len(lease_owner) > 256:
+            raise LeaseOwnershipError("lease_owner must be a bounded non-empty value")
+        if lease_duration_seconds < 1 or lease_duration_seconds > 86_400:
+            raise LeaseOwnershipError("lease duration is outside the allowed range")
+        task = self._execution_repo.get_task(task_id, project_id=project_id)
+        execution = self._execution_repo.get_execution(execution_id, project_id=project_id)
+        if task.execution_id != execution_id or task.project_id != execution.project_id:
+            raise TaskNotFoundError(f"Task {task_id} does not belong to execution {execution_id}")
         if task.state != "ready":
             raise InvalidTaskTransitionError(
                 f"Task {task_id} is in state {task.state!r}, not 'ready'"
             )
         with self._execution_repo._database.transaction():
-            # Transition task to running.
-            self._execution_repo.update_task_state(
-                task.id, "running", commit=False
+            # Conditional UPDATE is the claim.  Two workers racing here
+            # cannot both create a running attempt for the same ready task.
+            self._execution_repo.claim_task_atomically(
+                execution_id=execution_id,
+                task_id=task.id,
+                project_id=task.project_id,
+                commit=False,
             )
-            # Compute the next attempt number.
             existing_attempts = self._execution_repo.list_attempts_for_task(
-                task.id
+                task.id,
+                project_id=project_id,
             )
-            attempt_number = len(existing_attempts) + 1
-            lease_expires = datetime.now(UTC)
+            attempt_number = (
+                max(
+                    (attempt.attempt_number for attempt in existing_attempts),
+                    default=0,
+                )
+                + 1
+            )
             from datetime import timedelta
 
-            lease_expires += timedelta(seconds=lease_duration_seconds)
+            lease_expires = datetime.now(UTC) + timedelta(seconds=lease_duration_seconds)
             attempt = TaskAttempt(
                 id=TaskAttemptId(generate_task_attempt_id()),
                 task_id=task.id,
@@ -489,67 +791,124 @@ class WorkerService:
                 attempt_number=attempt_number,
                 state="running",
                 lease_owner=lease_owner,
-                lease_expires_at=lease_expires.strftime(
-                    "%Y-%m-%dT%H:%M:%S.%fZ"
-                ),
+                lease_expires_at=lease_expires.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
                 started_at=_now_utc_iso(),
             )
             self._execution_repo.insert_attempt(attempt, commit=False)
-            # Transition execution to running if it was pending.
-            execution = self._execution_repo.get_execution(execution_id)
-            if execution.state == "pending":
-                self._execution_repo.update_execution_state(
-                    execution_id, "running", commit=False
-                )
+            # A recovered/paused execution with ready work resumes when a
+            # scheduler successfully claims the work.
+            if execution.state in {"pending", "paused"}:
+                self._execution_repo.update_execution_state(execution_id, "running", commit=False)
         return attempt
 
-    def complete_task(
+    def renew_task_lease(
         self,
         *,
         execution_id: ExecutionId,
         task_id: TaskId,
         attempt_id: TaskAttemptId,
+        project_id: ProjectId | None = None,
         actor_id: UserId,
+        lease_owner: str,
+        lease_duration_seconds: int = 300,
+        source: AuditSource = "system",
+    ) -> TaskAttempt:
+        """Renew a live task lease without changing its owner."""
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
+        execution = self._execution_repo.get_execution(execution_id, project_id=project_id)
+        task = self._execution_repo.get_task(task_id, project_id=project_id)
+        if task.execution_id != execution.id:
+            raise TaskNotFoundError(f"Task {task_id} does not belong to execution {execution_id}")
+        attempt = self._execution_repo.get_attempt(attempt_id)
+        if attempt.task_id != task.id or attempt.project_id != project_id:
+            raise AttemptIdentityError(f"attempt {attempt_id} does not belong to task {task_id}")
+        self._execution_repo.renew_attempt_lease(
+            attempt_id,
+            task_id=task.id,
+            project_id=project_id,
+            lease_owner=lease_owner,
+            lease_duration_seconds=lease_duration_seconds,
+        )
+        return self._execution_repo.get_attempt(attempt_id)
+
+    def complete_task(
+        self,
+        *,
+        execution_id: ExecutionId,
+        project_id: ProjectId | None = None,
+        task_id: TaskId,
+        attempt_id: TaskAttemptId,
+        actor_id: UserId,
+        lease_owner: str | None = None,
+        evidence: tuple[str, ...] = (),
+        evidence_artifact_ids: tuple[ArtifactId, ...] = (),
         source: AuditSource = "system",
     ) -> Task:
-        """Mark a task as completed.
-
-        Per ``zero-recovery-consistency`` §"Idempotency makes retries
-        ordinary": if the task is already completed, this is a no-op.
-
-        Per PLAN.md M5: "Restart reconstructs the same graph and
-        statuses." After completion, dependents' readiness is
-        recomputed.
-        """
-        task = self._execution_repo.get_task(task_id)
-        if task.execution_id != execution_id:
-            raise TaskNotFoundError(
-                f"Task {task_id} does not belong to execution {execution_id}"
-            )
+        """Mark a task complete only under its current attempt lease."""
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
+        execution = self._execution_repo.get_execution(execution_id, project_id=project_id)
+        task = self._execution_repo.get_task(task_id, project_id=project_id)
+        if task.execution_id != execution_id or task.project_id != execution.project_id:
+            raise TaskNotFoundError(f"Task {task_id} does not belong to execution {execution_id}")
+        provided = tuple(dict.fromkeys(evidence))
+        missing = tuple(item for item in task.expected_evidence if item not in provided)
         if is_terminal_task_state(task.state):
-            return task  # idempotent
-        if task.state != "running":
-            raise InvalidTaskTransitionError(
-                f"Task {task_id} is in state {task.state!r}, "
-                f"cannot transition to 'completed'"
-            )
+            completed_attempt = self._execution_repo.get_attempt(attempt_id)
+            if (
+                completed_attempt.task_id != task.id
+                or completed_attempt.project_id != task.project_id
+            ):
+                raise AttemptIdentityError(
+                    f"attempt {attempt_id} does not belong to task {task.id}"
+                )
+            return task
         with self._execution_repo._database.transaction():
-            # Mark the attempt succeeded.
+            self._validate_attempt_identity(
+                task=task,
+                attempt_id=attempt_id,
+                lease_owner=lease_owner,
+            )
+            durable_evidence = self._validate_evidence_artifacts(
+                task=task,
+                attempt_id=attempt_id,
+                evidence_artifact_ids=evidence_artifact_ids,
+            )
+            if missing:
+                raise MissingEvidenceError(
+                    f"task {task_id} is missing expected evidence: {', '.join(missing)}"
+                )
+            if task.state != "running":
+                raise InvalidTaskTransitionError(
+                    f"Task {task_id} is in state {task.state!r}, cannot transition to 'completed'"
+                )
             self._execution_repo.update_attempt_state(
-                attempt_id, "succeeded", commit=False
+                attempt_id,
+                "succeeded",
+                expected_task_id=task.id,
+                expected_project_id=task.project_id,
+                expected_lease_owner=lease_owner,
+                require_active_lease=True,
+                commit=False,
             )
-            # Mark the task completed.
             self._execution_repo.update_task_state(
-                task.id, "completed", commit=False
+                task.id,
+                "completed",
+                completion_evidence=durable_evidence or provided,
+                commit=False,
             )
-            # Recompute dependents' readiness.
             self._recompute_readiness(execution_id, commit=False)
-            # Check if the execution is now complete.
             self._maybe_complete_execution(execution_id, commit=False)
-            # Snapshot.
             self._snapshot(execution_id, "after_task_complete", commit=False)
-            # Audit.
-            execution = self._execution_repo.get_execution(execution_id)
             self._audit_repo.insert(
                 AuditEvent(
                     id=AuditEventId(generate_audit_event_id()),
@@ -565,58 +924,67 @@ class WorkerService:
                 ),
                 commit=False,
             )
-        return self._execution_repo.get_task(task_id)
+        if self._metrics is not None:
+            self._metrics.increment("task_transitions_total", result="success", source=source)
+        return self._execution_repo.get_task(task_id, project_id=project_id)
 
     def fail_task(
         self,
         *,
         execution_id: ExecutionId,
+        project_id: ProjectId | None = None,
         task_id: TaskId,
         attempt_id: TaskAttemptId,
         error_message: str,
         actor_id: UserId,
+        lease_owner: str | None = None,
         source: AuditSource = "system",
     ) -> Task:
-        """Mark a task as failed.
+        """Mark a task failed under its attempt lease.
 
-        Per PLAN.md M5: "Failed prerequisites block dependents safely."
-        After marking the task failed, we recompute dependents'
-        readiness — they will be marked ``blocked`` because a
-        dependency is in a blocking state.
+        The lease owner must match, but an expired clock does not block
+        failure recording: the alternative is a zombie ``running``
+        attempt that only restart recovery could reconcile.
         """
-        task = self._execution_repo.get_task(task_id)
-        if task.execution_id != execution_id:
-            raise TaskNotFoundError(
-                f"Task {task_id} does not belong to execution {execution_id}"
-            )
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
+        execution = self._execution_repo.get_execution(execution_id, project_id=project_id)
+        task = self._execution_repo.get_task(task_id, project_id=project_id)
+        if task.execution_id != execution_id or task.project_id != execution.project_id:
+            raise TaskNotFoundError(f"Task {task_id} does not belong to execution {execution_id}")
+        if len(error_message) > 4096:
+            error_message = error_message[:4096] + " [truncated]"
         if is_terminal_task_state(task.state):
             return task
         if task.state != "running":
             raise InvalidTaskTransitionError(
-                f"Task {task_id} is in state {task.state!r}, "
-                f"cannot transition to 'failed'"
+                f"Task {task_id} is in state {task.state!r}, cannot transition to 'failed'"
             )
         with self._execution_repo._database.transaction():
-            # Mark the attempt failed (error message must not contain secrets).
+            self._validate_attempt_identity(
+                task=task,
+                attempt_id=attempt_id,
+                lease_owner=lease_owner,
+                require_live_lease=False,
+            )
             self._execution_repo.update_attempt_state(
                 attempt_id,
                 "failed",
                 error_message=error_message,
+                expected_task_id=task.id,
+                expected_project_id=task.project_id,
+                expected_lease_owner=lease_owner,
+                require_active_lease=False,
                 commit=False,
             )
-            # Mark the task failed.
-            self._execution_repo.update_task_state(
-                task.id, "failed", commit=False
-            )
-            # Recompute dependents — they will be blocked.
+            self._execution_repo.update_task_state(task.id, "failed", commit=False)
             self._recompute_readiness(execution_id, commit=False)
-            # Check if the execution should pause (failed task with no
-            # running/ready work).
             self._maybe_complete_execution(execution_id, commit=False)
-            # Snapshot.
             self._snapshot(execution_id, "after_task_fail", commit=False)
-            # Audit.
-            execution = self._execution_repo.get_execution(execution_id)
             self._audit_repo.insert(
                 AuditEvent(
                     id=AuditEventId(generate_audit_event_id()),
@@ -633,7 +1001,86 @@ class WorkerService:
                 ),
                 commit=False,
             )
-        return self._execution_repo.get_task(task_id)
+        if self._metrics is not None:
+            self._metrics.increment("task_transitions_total", result="failure", source=source)
+        return self._execution_repo.get_task(task_id, project_id=project_id)
+
+    def mark_provider_outcome_unknown(
+        self,
+        *,
+        execution_id: ExecutionId,
+        project_id: ProjectId | None = None,
+        task_id: TaskId,
+        attempt_id: TaskAttemptId,
+        error_message: str,
+        actor_id: UserId,
+        lease_owner: str | None = None,
+        source: AuditSource = "system",
+    ) -> Task:
+        """Block a task when a provider may have accepted the request."""
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
+        execution = self._execution_repo.get_execution(execution_id, project_id=project_id)
+        task = self._execution_repo.get_task(task_id, project_id=project_id)
+        if task.execution_id != execution_id or task.project_id != execution.project_id:
+            raise TaskNotFoundError(f"Task {task_id} does not belong to execution {execution_id}")
+        if len(error_message) > 4096:
+            error_message = error_message[:4096] + " [truncated]"
+        if is_terminal_task_state(task.state):
+            return task
+        if task.state != "running":
+            raise InvalidTaskTransitionError(
+                f"Task {task_id} is in state {task.state!r}, cannot mark unknown"
+            )
+        blocker_reason = "provider outcome unknown; reconciliation required"
+        with self._execution_repo._database.transaction():
+            self._validate_attempt_identity(
+                task=task,
+                attempt_id=attempt_id,
+                lease_owner=lease_owner,
+            )
+            self._execution_repo.update_attempt_state(
+                attempt_id,
+                "unknown",
+                error_message=error_message,
+                expected_task_id=task.id,
+                expected_project_id=task.project_id,
+                expected_lease_owner=lease_owner,
+                require_active_lease=True,
+                commit=False,
+            )
+            self._execution_repo.update_task_state(
+                task.id,
+                "blocked",
+                blocker_reason=blocker_reason,
+                commit=False,
+            )
+            self._recompute_readiness(execution_id, commit=False)
+            self._maybe_complete_execution(execution_id, commit=False)
+            self._snapshot(execution_id, "after_provider_unknown", commit=False)
+            self._audit_repo.insert(
+                AuditEvent(
+                    id=AuditEventId(generate_audit_event_id()),
+                    project_id=execution.project_id,
+                    actor_id=actor_id,
+                    source=source,
+                    operation="task.provider_unknown",
+                    target_type="task",
+                    target_id=task.id.value,
+                    result="error",
+                    redacted_summary=f"Task {task.id.value} requires provider reconciliation",
+                    correlation_id=execution_id.value,
+                    created_at=_now_utc_iso(),
+                ),
+                commit=False,
+            )
+        if self._metrics is not None:
+            self._metrics.increment("task_transitions_total", result="error", source=source)
+        return self._execution_repo.get_task(task_id, project_id=project_id)
 
     def _maybe_complete_execution(
         self,
@@ -641,10 +1088,16 @@ class WorkerService:
         *,
         commit: bool = True,
     ) -> None:
-        """If all tasks are completed, transition the execution to
-        completed. If any task is in a blocking state (failed, blocked,
-        cancelled) and no tasks are running/ready, transition to
-        failed/paused."""
+        """Advance the execution to its terminal or resting state.
+
+        - all tasks completed -> ``completed``;
+        - nothing runnable remains, blocked/failed work exists, no
+          retry budget remains, and no provider-unknown reconciliation
+          is pending -> ``failed`` (a graph that can never proceed must
+          not pause forever);
+        - otherwise -> ``paused`` (provider-unknown reconciliation or
+          automatic task retry still possible).
+        """
         tasks = self._execution_repo.list_tasks_for_execution(execution_id)
         if not tasks:
             return
@@ -655,22 +1108,68 @@ class WorkerService:
                 self._execution_repo.update_execution_state(
                     execution_id, "completed", commit=commit
                 )
+                self._discard_cancellation_event(execution_id)
             return
-        # If any task is blocked and no tasks are running or ready,
-        # pause the execution.
-        any_running_or_ready = any(
-            t.state in ("running", "ready") for t in tasks
-        )
-        any_blocked = any(t.state in ("failed", "blocked") for t in tasks)
-        if any_blocked and not any_running_or_ready:
-            execution = self._execution_repo.get_execution(execution_id)
+        any_running_or_ready = any(t.state in ("running", "ready") for t in tasks)
+        any_pending = any(t.state == "pending" for t in tasks)
+        blocking_states = ("failed", "blocked", "cancelled")
+        any_blocked = any(t.state in blocking_states for t in tasks)
+        if not (any_blocked and not any_running_or_ready):
+            return
+        execution = self._execution_repo.get_execution(execution_id)
+        # Automatic retry budget: a failed task that has not consumed
+        # its attempt allowance keeps the execution paused so the
+        # scheduler can requeue it (a terminal ``failed`` execution can
+        # never be claimed again).
+        if self._auto_retry_pending(tasks):
             if is_valid_execution_transition(execution.state, "paused"):
                 self._execution_repo.update_execution_state(
                     execution_id,
                     "paused",
-                    blocker_reason="task failed or blocked",
+                    blocker_reason="awaiting automatic task retry",
                     commit=commit,
                 )
+            return
+        # Provider-unknown blocks await operator reconciliation: keep the
+        # execution paused rather than declaring it permanently failed.
+        awaiting_reconciliation = any(
+            t.state == "blocked"
+            and t.blocker_reason
+            and "provider outcome unknown" in t.blocker_reason
+            for t in tasks
+        )
+        if (
+            not awaiting_reconciliation
+            and not any_pending
+            and is_valid_execution_transition(execution.state, "failed")
+        ):
+            self._execution_repo.update_execution_state(
+                execution_id,
+                "failed",
+                blocker_reason="task failed; graph cannot proceed",
+                commit=commit,
+            )
+            self._discard_cancellation_event(execution_id)
+            return
+        if is_valid_execution_transition(execution.state, "paused"):
+            self._execution_repo.update_execution_state(
+                execution_id,
+                "paused",
+                blocker_reason="task failed or blocked",
+                commit=commit,
+            )
+
+    def _auto_retry_pending(self, tasks: list[Task]) -> bool:
+        """Whether any failed task still holds unused attempt budget."""
+        if self._task_max_attempts <= 0:
+            return False
+        for task in tasks:
+            if task.state != "failed":
+                continue
+            attempts = self._execution_repo.list_attempts_for_task(task.id)
+            if len(attempts) < self._task_max_attempts:
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Cancellation
@@ -680,6 +1179,7 @@ class WorkerService:
         self,
         *,
         execution_id: ExecutionId,
+        project_id: ProjectId | None = None,
         actor_id: UserId,
         source: AuditSource = "system",
     ) -> Execution:
@@ -703,14 +1203,13 @@ class WorkerService:
           blocked) are transitioned to ``cancelled``.
         - Running attempts are transitioned to ``cancelled``.
         """
-        execution = self._execution_repo.get_execution(execution_id)
-        # Authorize.
-        self._authz.require_permission(
+        project_id = self._require_project_scope(
+            project_id=project_id,
             actor_id=actor_id,
-            project_id=execution.project_id,
             permission="execution.stop",
             source=source,
         )
+        execution = self._execution_repo.get_execution(execution_id, project_id=project_id)
         if not is_valid_execution_transition(execution.state, "cancelled"):
             raise InvalidExecutionTransitionError(
                 f"Cannot cancel execution in state {execution.state!r}"
@@ -720,22 +1219,16 @@ class WorkerService:
             tasks = self._execution_repo.list_tasks_for_execution(execution_id)
             for task in tasks:
                 if not is_terminal_task_state(task.state):
-                    self._execution_repo.update_task_state(
-                        task.id, "cancelled", commit=False
-                    )
+                    self._execution_repo.update_task_state(task.id, "cancelled", commit=False)
                     # Cancel any running attempts.
-                    attempts = self._execution_repo.list_attempts_for_task(
-                        task.id
-                    )
+                    attempts = self._execution_repo.list_attempts_for_task(task.id)
                     for attempt in attempts:
                         if attempt.state == "running":
                             self._execution_repo.update_attempt_state(
                                 attempt.id, "cancelled", commit=False
                             )
             # Transition execution.
-            self._execution_repo.update_execution_state(
-                execution_id, "cancelled", commit=False
-            )
+            self._execution_repo.update_execution_state(execution_id, "cancelled", commit=False)
             # Snapshot.
             self._snapshot(execution_id, "after_cancel", commit=False)
             # Audit.
@@ -755,7 +1248,136 @@ class WorkerService:
                 ),
                 commit=False,
             )
-        return self._execution_repo.get_execution(execution_id)
+        self.get_cancellation_event(execution_id).set()
+        self._discard_cancellation_event(execution_id)
+        return self._execution_repo.get_execution(execution_id, project_id=project_id)
+
+    def requeue_failed_task(
+        self,
+        *,
+        execution_id: ExecutionId,
+        project_id: ProjectId | None = None,
+        task_id: TaskId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> Task:
+        """Requeue a failed task for another attempt (``failed -> ready``).
+
+        The state machine permits this transition explicitly for retry;
+        the scheduler bounds how many attempts may be consumed by
+        ``ZERO_TASK_MAX_ATTEMPTS`` (default 0 = auto-retry disabled).
+        """
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
+        execution = self._execution_repo.get_execution(execution_id, project_id=project_id)
+        task = self._execution_repo.get_task(task_id, project_id=project_id)
+        if task.execution_id != execution_id or task.project_id != execution.project_id:
+            raise TaskNotFoundError(f"Task {task_id} does not belong to execution {execution_id}")
+        if is_terminal_task_state(task.state):
+            raise InvalidTaskTransitionError(
+                f"Task {task_id} is terminal ({task.state!r}); cannot requeue"
+            )
+        if task.state != "failed":
+            raise InvalidTaskTransitionError(
+                f"Task {task_id} is in state {task.state!r}, cannot requeue"
+            )
+        with self._execution_repo._database.transaction():
+            self._execution_repo.update_task_state(task.id, "ready", commit=False)
+            self._snapshot(execution_id, "task_requeue", commit=False)
+            self._audit_repo.insert(
+                AuditEvent(
+                    id=AuditEventId(generate_audit_event_id()),
+                    project_id=execution.project_id,
+                    actor_id=actor_id,
+                    source=source,
+                    operation="task.requeue",
+                    target_type="task",
+                    target_id=task.id.value,
+                    result="success",
+                    redacted_summary=f"Task {task.id.value} requeued for retry",
+                    correlation_id=execution_id.value,
+                    created_at=_now_utc_iso(),
+                ),
+                commit=False,
+            )
+        return self._execution_repo.get_task(task_id, project_id=project_id)
+
+    def cancel_task(
+        self,
+        *,
+        execution_id: ExecutionId,
+        project_id: ProjectId | None = None,
+        task_id: TaskId,
+        attempt_id: TaskAttemptId,
+        actor_id: UserId,
+        lease_owner: str | None = None,
+        reason: str = "task cancelled",
+        source: AuditSource = "system",
+    ) -> Task:
+        """Cancel one running task under its current attempt lease.
+
+        Cancellation is a first-class state transition (not a failure):
+        the attempt and the task both end ``cancelled``, dependents are
+        re-evaluated, and the graph snapshot records ``after_cancel``.
+        """
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.stop",
+            source=source,
+        )
+        execution = self._execution_repo.get_execution(execution_id, project_id=project_id)
+        task = self._execution_repo.get_task(task_id, project_id=project_id)
+        if task.execution_id != execution_id or task.project_id != execution.project_id:
+            raise TaskNotFoundError(f"Task {task_id} does not belong to execution {execution_id}")
+        if len(reason) > 4096:
+            reason = reason[:4096] + " [truncated]"
+        if is_terminal_task_state(task.state):
+            return task
+        with self._execution_repo._database.transaction():
+            self._validate_attempt_identity(
+                task=task,
+                attempt_id=attempt_id,
+                lease_owner=lease_owner,
+                require_live_lease=False,
+            )
+            self._execution_repo.update_attempt_state(
+                attempt_id,
+                "cancelled",
+                error_message=reason,
+                expected_task_id=task.id,
+                expected_project_id=task.project_id,
+                expected_lease_owner=lease_owner,
+                require_active_lease=False,
+                commit=False,
+            )
+            self._execution_repo.update_task_state(task.id, "cancelled", commit=False)
+            self._recompute_readiness(execution_id, commit=False)
+            self._maybe_complete_execution(execution_id, commit=False)
+            self._snapshot(execution_id, "after_cancel", commit=False)
+            self._audit_repo.insert(
+                AuditEvent(
+                    id=AuditEventId(generate_audit_event_id()),
+                    project_id=execution.project_id,
+                    actor_id=actor_id,
+                    source=source,
+                    operation="task.cancel",
+                    target_type="task",
+                    target_id=task.id.value,
+                    result="success",
+                    redacted_summary=f"Task {task.id.value} cancelled",
+                    correlation_id=execution_id.value,
+                    created_at=_now_utc_iso(),
+                ),
+                commit=False,
+            )
+        if self._metrics is not None:
+            self._metrics.increment("task_transitions_total", result="cancelled", source=source)
+        return self._execution_repo.get_task(task_id, project_id=project_id)
 
     # ------------------------------------------------------------------
     # Restart recovery
@@ -765,6 +1387,7 @@ class WorkerService:
         self,
         *,
         execution_id: ExecutionId,
+        project_id: ProjectId | None = None,
         actor_id: UserId,
         source: AuditSource = "system",
     ) -> Execution:
@@ -794,53 +1417,81 @@ class WorkerService:
           and no tasks are running, in which case it transitions to
           ``paused``.
         """
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
         with self._execution_repo._database.transaction():
-            execution = self._execution_repo.get_execution(execution_id)
-            self._authz.require_permission(
-                actor_id=actor_id,
-                project_id=execution.project_id,
-                permission="execution.start",
-                source=source,
+            execution = self._execution_repo.get_execution(
+                execution_id,
+                project_id=project_id,
             )
-            tasks = self._execution_repo.list_tasks_for_execution(execution_id)
+            tasks = self._execution_repo.list_tasks_for_execution(
+                execution_id,
+                project_id=project_id,
+            )
             now = _now_utc_iso()
             for task in tasks:
-                if task.state == "running":
-                    # Find the latest attempt.
-                    attempts = self._execution_repo.list_attempts_for_task(
-                        task.id
-                    )
-                    running_attempts = [
-                        a for a in attempts if a.state == "running"
-                    ]
-                    if running_attempts:
-                        latest = running_attempts[-1]
-                        # Mark the attempt as unknown (we don't know if it
-                        # succeeded or failed).
-                        self._execution_repo.update_attempt_state(
-                            latest.id, "unknown", commit=False
-                        )
-                    # Transition the task back to ready for re-claiming.
-                    self._execution_repo.update_task_state(
-                        task.id, "ready", commit=False
-                    )
-            # Recompute readiness for pending tasks.
+                if task.state != "running":
+                    continue
+                attempts = self._execution_repo.list_attempts_for_task(
+                    task.id,
+                    project_id=project_id,
+                )
+                running_attempts = [attempt for attempt in attempts if attempt.state == "running"]
+                live_attempts = []
+                for attempt in running_attempts:
+                    if attempt.lease_expires_at:
+                        try:
+                            expires = datetime.fromisoformat(attempt.lease_expires_at)
+                            if expires > datetime.now(UTC):
+                                live_attempts.append(attempt)
+                        except ValueError:
+                            # A malformed lease is not evidence of live
+                            # ownership; recover conservatively as unknown.
+                            pass
+                if live_attempts:
+                    # A live owner is still authoritative.  Never reclaim
+                    # or pause its task merely because this process restarted.
+                    continue
+                if running_attempts:
+                    latest = running_attempts[-1]
+                    self._execution_repo.update_attempt_state(latest.id, "unknown", commit=False)
+                self._execution_repo.update_task_state(task.id, "ready", commit=False)
+            # Recompute readiness for pending tasks and reconcile the
+            # execution state from the durable task graph. Ready work is
+            # schedulable and therefore resumes a paused execution; only a
+            # graph with neither running nor ready work is paused.
             self._recompute_readiness(execution_id, commit=False)
-            # If the execution was running and no tasks are running now,
-            # pause it.
-            execution = self._execution_repo.get_execution(execution_id)
-            if execution.state == "running":
+            self._maybe_complete_execution(execution_id, commit=False)
+            execution = self._execution_repo.get_execution(
+                execution_id,
+                project_id=project_id,
+            )
+            if execution.state not in {"completed", "failed", "cancelled"}:
                 tasks = self._execution_repo.list_tasks_for_execution(
-                    execution_id
+                    execution_id,
+                    project_id=project_id,
                 )
                 any_running = any(t.state == "running" for t in tasks)
-                if not any_running:
+                any_ready = any(t.state == "ready" for t in tasks)
+                if any_ready and execution.state in {"paused", "pending"}:
+                    self._execution_repo.update_execution_state(
+                        execution_id,
+                        "running",
+                        blocker_reason="",
+                        commit=False,
+                    )
+                elif not any_running and not any_ready and execution.state == "running":
                     self._execution_repo.update_execution_state(
                         execution_id,
                         "paused",
-                        blocker_reason="recovered after restart; no running tasks",
+                        blocker_reason="recovered after restart; no running or ready tasks",
                         commit=False,
                     )
+
             # Snapshot.
             self._snapshot(execution_id, "restart_recovery", commit=False)
             # Audit.
@@ -854,15 +1505,13 @@ class WorkerService:
                     target_type="execution",
                     target_id=execution.id.value,
                     result="success",
-                    redacted_summary=(
-                        f"Recovered execution {execution.id.value} after restart"
-                    ),
+                    redacted_summary=(f"Recovered execution {execution.id.value} after restart"),
                     correlation_id=execution_id.value,
                     created_at=now,
                 ),
                 commit=False,
             )
-        return self._execution_repo.get_execution(execution_id)
+        return self._execution_repo.get_execution(execution_id, project_id=project_id)
 
     # ------------------------------------------------------------------
     # Snapshots
@@ -884,11 +1533,7 @@ class WorkerService:
         """
         execution = self._execution_repo.get_execution(execution_id)
         tasks = self._execution_repo.list_tasks_for_execution(execution_id)
-        dependencies = (
-            self._execution_repo.list_all_dependencies_for_execution(
-                execution_id
-            )
-        )
+        dependencies = self._execution_repo.list_all_dependencies_for_execution(execution_id)
         # Build the graph state as JSON.
         graph = {
             "execution_id": execution_id.value,
@@ -913,44 +1558,142 @@ class WorkerService:
                 for d in dependencies
             ],
         }
-        # Compute the next snapshot version.
-        existing = self._execution_repo.get_latest_snapshot(execution_id)
-        version = (existing.snapshot_version + 1) if existing else 1
-        snapshot = ExecutionSnapshot(
-            id=ExecutionSnapshotId(generate_execution_snapshot_id()),
-            execution_id=execution_id,
-            project_id=execution.project_id,
-            snapshot_version=version,
-            graph_state=json.dumps(graph, sort_keys=True),
-            snapshot_reason=reason,
-            created_at=_now_utc_iso(),
-        )
-        self._execution_repo.insert_snapshot(snapshot, commit=commit)
-        return snapshot
+
+        # Compute the next snapshot version inside the same write
+        # transaction as the insert so concurrent transitions cannot
+        # collide on the version number.
+        def _capture() -> ExecutionSnapshot:
+            existing = self._execution_repo.get_latest_snapshot(execution_id)
+            version = (existing.snapshot_version + 1) if existing else 1
+            snapshot = ExecutionSnapshot(
+                id=ExecutionSnapshotId(generate_execution_snapshot_id()),
+                execution_id=execution_id,
+                project_id=execution.project_id,
+                snapshot_version=version,
+                graph_state=json.dumps(graph, sort_keys=True),
+                snapshot_reason=reason,
+                created_at=_now_utc_iso(),
+            )
+            self._execution_repo.insert_snapshot(snapshot, commit=commit)
+            return snapshot
+
+        if commit:
+            with self._execution_repo._database.transaction():
+                return _capture()
+        return _capture()
 
     def get_latest_snapshot(
-        self, execution_id: ExecutionId
+        self,
+        execution_id: ExecutionId,
+        *,
+        project_id: ProjectId | None = None,
+        actor_id: UserId | None = None,
+        source: AuditSource = "system",
     ) -> ExecutionSnapshot | None:
-        return self._execution_repo.get_latest_snapshot(execution_id)
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        self._execution_repo.get_execution(execution_id, project_id=project_id)
+        return self._execution_repo.get_latest_snapshot(
+            execution_id,
+            project_id=project_id,
+        )
 
     # ------------------------------------------------------------------
     # Read operations
     # ------------------------------------------------------------------
 
-    def get_execution(self, execution_id: ExecutionId) -> Execution:
-        return self._execution_repo.get_execution(execution_id)
+    def get_execution(
+        self,
+        execution_id: ExecutionId,
+        *,
+        project_id: ProjectId | None = None,
+        actor_id: UserId | None = None,
+        source: AuditSource = "system",
+    ) -> Execution:
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        return self._execution_repo.get_execution(execution_id, project_id=project_id)
 
     def list_tasks(
-        self, execution_id: ExecutionId
+        self,
+        execution_id: ExecutionId,
+        *,
+        project_id: ProjectId | None = None,
+        actor_id: UserId | None = None,
+        source: AuditSource = "system",
     ) -> list[Task]:
-        return self._execution_repo.list_tasks_for_execution(execution_id)
-
-    def list_dependencies(
-        self, execution_id: ExecutionId
-    ) -> list[TaskDependency]:
-        return self._execution_repo.list_all_dependencies_for_execution(
-            execution_id
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        self._execution_repo.get_execution(execution_id, project_id=project_id)
+        return self._execution_repo.list_tasks_for_execution(
+            execution_id,
+            project_id=project_id,
         )
 
-    def list_attempts(self, task_id: TaskId) -> list[TaskAttempt]:
-        return self._execution_repo.list_attempts_for_task(task_id)
+    def list_dependencies(
+        self,
+        execution_id: ExecutionId,
+        *,
+        project_id: ProjectId | None = None,
+        actor_id: UserId | None = None,
+        source: AuditSource = "system",
+    ) -> list[TaskDependency]:
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        self._execution_repo.get_execution(execution_id, project_id=project_id)
+        return self._execution_repo.list_all_dependencies_for_execution(
+            execution_id,
+            project_id=project_id,
+        )
+
+    def list_attempts(
+        self,
+        task_id: TaskId,
+        *,
+        project_id: ProjectId | None = None,
+        actor_id: UserId | None = None,
+        source: AuditSource = "system",
+    ) -> list[TaskAttempt]:
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        self._execution_repo.get_task(task_id, project_id=project_id)
+        return self._execution_repo.list_attempts_for_task(
+            task_id,
+            project_id=project_id,
+        )
+
+    def list_project_executions(
+        self,
+        *,
+        project_id: ProjectId | None = None,
+        actor_id: UserId | None = None,
+        source: AuditSource = "system",
+    ) -> list[Execution]:
+        """Authorized listing of a project's executions (scheduler entry)."""
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.view_diffs",
+            source=source,
+        )
+        return self._execution_repo.list_executions_for_project(project_id)

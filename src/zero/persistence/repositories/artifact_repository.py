@@ -13,6 +13,7 @@ Per ``zero-context-memory``:
 from __future__ import annotations
 
 import hashlib
+import re
 import sqlite3
 
 from zero.domain.artifacts import (
@@ -20,17 +21,37 @@ from zero.domain.artifacts import (
     ArtifactId,
     ArtifactKind,
     ArtifactNotFoundError,
+    ArtifactProvenance,
+    ArtifactProvenanceId,
     RagDocument,
     RagDocumentId,
     RagDocumentNotFoundError,
     RagDocumentState,
 )
-from zero.domain.identity import ProjectId
+from zero.domain.identity import ProjectId, UserId
 from zero.persistence.connection import Database
 
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_FTS_SPECIAL = re.compile(r'["\'()*:^{}\[\]|,.\-]')
+
+
+def _fts_safe_query(query: str) -> str:
+    """Sanitize a user query for FTS5 MATCH.
+
+    Strips FTS5 operator/syntax characters and quotes, then joins the
+    remaining terms with OR. Returns an empty string when nothing
+    searchable remains so callers can short-circuit instead of raising.
+    """
+    terms = [
+        term
+        for term in _FTS_SPECIAL.sub(" ", query or "").split()
+        if term and term.upper() not in {"AND", "OR", "NOT", "NEAR"}
+    ]
+    return " OR ".join(terms)
 
 
 def _row_to_artifact(row: sqlite3.Row) -> Artifact:
@@ -48,6 +69,18 @@ def _row_to_artifact(row: sqlite3.Row) -> Artifact:
     )
 
 
+def _row_to_artifact_provenance(row: sqlite3.Row) -> ArtifactProvenance:
+    return ArtifactProvenance(
+        id=ArtifactProvenanceId(row["id"]),
+        project_id=ProjectId(row["project_id"]),
+        artifact_id=ArtifactId(row["artifact_id"]),
+        actor_id=UserId(row["actor_id"]),
+        producer=row["producer"],
+        provenance=row["provenance"],
+        created_at=row["created_at"],
+    )
+
+
 def _row_to_rag_document(row: sqlite3.Row) -> RagDocument:
     return RagDocument(
         id=RagDocumentId(row["id"]),
@@ -58,9 +91,7 @@ def _row_to_rag_document(row: sqlite3.Row) -> RagDocument:
         content=row["content"],
         content_hash=row["content_hash"],
         state=row["state"],  # type: ignore[arg-type]
-        superseded_by=RagDocumentId(row["superseded_by"])
-        if row["superseded_by"]
-        else None,
+        superseded_by=RagDocumentId(row["superseded_by"]) if row["superseded_by"] else None,
         index_version=row["index_version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -72,6 +103,10 @@ class ArtifactRepository:
 
     def __init__(self, database: Database) -> None:
         self._database = database
+
+    @property
+    def database(self) -> Database:
+        return self._database
 
     # ------------------------------------------------------------------
     # Artifacts
@@ -136,9 +171,7 @@ class ArtifactRepository:
         )
         row = cursor.fetchone()
         if row is None:
-            raise ArtifactNotFoundError(
-                f"Artifact {artifact_id} not found in project {project_id}"
-            )
+            raise ArtifactNotFoundError(f"Artifact {artifact_id} not found in project {project_id}")
         return _row_to_artifact(row)
 
     def get_artifact_by_hash(
@@ -185,9 +218,42 @@ class ArtifactRepository:
             )
         return [_row_to_artifact(row) for row in cursor.fetchall()]
 
-    # ------------------------------------------------------------------
-    # RAG documents
-    # ------------------------------------------------------------------
+    def insert_provenance(
+        self,
+        record: ArtifactProvenance,
+        *,
+        commit: bool = True,
+    ) -> None:
+        conn = self._database.connect()
+        conn.execute(
+            "INSERT INTO artifact_provenance "
+            "(id, project_id, artifact_id, actor_id, producer, provenance) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                record.id.value,
+                record.project_id.value,
+                record.artifact_id.value,
+                record.actor_id.value,
+                record.producer,
+                record.provenance,
+            ),
+        )
+        if commit:
+            conn.commit()
+
+    def list_provenance(
+        self,
+        project_id: ProjectId,
+        artifact_id: ArtifactId,
+    ) -> list[ArtifactProvenance]:
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "SELECT id, project_id, artifact_id, actor_id, producer, provenance, created_at "
+            "FROM artifact_provenance "
+            "WHERE project_id = ? AND artifact_id = ? ORDER BY created_at ASC",
+            (project_id.value, artifact_id.value),
+        )
+        return [_row_to_artifact_provenance(row) for row in cursor.fetchall()]
 
     def insert_rag_document(
         self,
@@ -279,28 +345,33 @@ class ArtifactRepository:
         doc_id: RagDocumentId,
         new_state: RagDocumentState,
         *,
+        project_id: ProjectId | None = None,
         superseded_by: RagDocumentId | None = None,
         commit: bool = True,
     ) -> None:
         conn = self._database.connect()
+        where = "id = ?"
+        where_params: list[str] = [doc_id.value]
+        if project_id is not None:
+            where += " AND project_id = ?"
+            where_params.append(project_id.value)
         if superseded_by is not None:
             cursor = conn.execute(
                 "UPDATE rag_documents SET state = ?, superseded_by = ?, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
-                "WHERE id = ?",
-                (new_state, superseded_by.value, doc_id.value),
+                f"WHERE {where}",
+                (new_state, superseded_by.value, *where_params),
             )
         else:
             cursor = conn.execute(
                 "UPDATE rag_documents SET state = ?, "
                 "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
-                "WHERE id = ?",
-                (new_state, doc_id.value),
+                f"WHERE {where}",
+                (new_state, *where_params),
             )
         if cursor.rowcount == 0:
-            raise RagDocumentNotFoundError(
-                f"RAG document {doc_id} not found"
-            )
+            scope = f" in project {project_id}" if project_id is not None else ""
+            raise RagDocumentNotFoundError(f"RAG document {doc_id} not found{scope}")
         if commit:
             conn.commit()
 
@@ -319,9 +390,7 @@ class ArtifactRepository:
             (index_version, doc_id.value),
         )
         if cursor.rowcount == 0:
-            raise RagDocumentNotFoundError(
-                f"RAG document {doc_id} not found"
-            )
+            raise RagDocumentNotFoundError(f"RAG document {doc_id} not found")
         if commit:
             conn.commit()
 
@@ -356,12 +425,18 @@ class ArtifactRepository:
         self,
         doc_id: RagDocumentId,
         *,
+        project_id: ProjectId | None = None,
         commit: bool = True,
     ) -> None:
         conn = self._database.connect()
+        where = "rag_document_id = ?"
+        where_params: list[str] = [doc_id.value]
+        if project_id is not None:
+            where += " AND project_id = ?"
+            where_params.append(project_id.value)
         conn.execute(
-            "DELETE FROM rag_index_entries WHERE rag_document_id = ?",
-            (doc_id.value,),
+            f"DELETE FROM rag_index_entries WHERE {where}",
+            where_params,
         )
         if commit:
             conn.commit()
@@ -379,23 +454,26 @@ class ArtifactRepository:
         access": the query filters by project_id before any row is
         loaded. Documents from other projects are never returned.
 
+        The raw user query is never passed to FTS MATCH directly:
+        operator/quote characters are stripped and the remaining terms
+        are joined with OR so malformed input degrades to a plain term
+        search instead of raising or silently returning nothing.
+
         Returns a list of (document, score) tuples, highest score first.
         """
         conn = self._database.connect()
-        # FTS5 MATCH query. We use a simple OR query on the user's
-        # terms. The bm25() function returns a score; lower is better,
-        # so we negate it.
-        try:
-            cursor = conn.execute(
-                "SELECT rag_document_id, bm25(rag_index_entries) as score "
-                "FROM rag_index_entries "
-                "WHERE project_id = ? AND rag_index_entries MATCH ? "
-                "ORDER BY score ASC LIMIT ?",
-                (project_id.value, query, limit),
-            )
-        except sqlite3.OperationalError:
-            # FTS query syntax error (e.g. empty query). Return empty.
+        safe_query = _fts_safe_query(query)
+        if not safe_query:
             return []
+        # FTS5 MATCH query over sanitized terms. bm25() returns a score;
+        # lower is better, so we negate it.
+        cursor = conn.execute(
+            "SELECT rag_document_id, bm25(rag_index_entries) as score "
+            "FROM rag_index_entries "
+            "WHERE project_id = ? AND rag_index_entries MATCH ? "
+            "ORDER BY score ASC LIMIT ?",
+            (project_id.value, safe_query, limit),
+        )
         results: list[tuple[RagDocument, float]] = []
         for row in cursor.fetchall():
             doc_id = RagDocumentId(row["rag_document_id"])
@@ -430,9 +508,7 @@ class ArtifactRepository:
             (project_id.value,),
         )
         # Get all approved documents for this project.
-        docs = self.list_rag_documents_for_project(
-            project_id, state="approved"
-        )
+        docs = self.list_rag_documents_for_project(project_id, state="approved")
         count = 0
         for doc in docs:
             conn.execute(

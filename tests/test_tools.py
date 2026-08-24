@@ -19,12 +19,16 @@ Per PLAN.md M3 validation:
 
 from __future__ import annotations
 
+import os
+import time
+
 import pytest
 
 from zero.app.services import build_services
 from zero.config import Settings
 from zero.domain.tools import (
     ToolAlreadyExistsError,
+    ToolError,
     ToolInputValidationError,
     ToolInvocationDeniedError,
     ToolNotFoundError,
@@ -43,10 +47,24 @@ def services(test_settings: Settings):
 @pytest.fixture
 def project_with_owner(services):
     owner = services.identity.create_user(display_name="Owner")
-    project = services.identity.create_project(
-        owner_id=owner.id, name="Tool Test Project"
-    )
+    project = services.identity.create_project(owner_id=owner.id, name="Tool Test Project")
     return owner, project
+
+
+def _pid_handler(_input_data, _context):
+    return {"pid": os.getpid()}
+
+
+def _slow_handler(_input_data, _context):
+    time.sleep(1.0)
+    return {"ok": True}
+
+
+def _large_handler(_input_data, _context):
+    return {"payload": "x" * 100_000}
+
+
+_EMPTY_INPUT = {"type": "object", "additionalProperties": False}
 
 
 # ----------------------------------------------------------------------
@@ -96,7 +114,8 @@ def test_grant_tool_creates_grant(services, project_with_owner) -> None:
     _owner, project = project_with_owner
     tool = services.tools.register_echo_tool()
     grant = services.tools.grant_tool(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
@@ -106,22 +125,39 @@ def test_grant_tool_creates_grant(services, project_with_owner) -> None:
     assert grant.agent_scope == "main_worker"
 
 
+def test_grant_tool_rejects_unbounded_timeout(services, project_with_owner) -> None:
+    owner, project = project_with_owner
+    tool = services.tools.register_echo_tool()
+    with pytest.raises(ValueError, match="maximum"):
+        services.tools.grant_tool(
+            project_id=project.id,
+            actor_id=owner.id,
+            tool_id=tool.id,
+            agent_scope="main_worker",
+            timeout_seconds=10**12,
+        )
+
+
 def test_tool_invocation_cap_is_enforced(services, project_with_owner) -> None:
     owner, project = project_with_owner
     tool = services.tools.register_echo_tool()
     services.tools.grant_tool(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
         max_invocations=1,
     )
-    assert services.tools.invoke(
-        project_id=project.id,
-        actor_id=owner.id,
-        agent_scope="main_worker",
-        tool_name="echo",
-        input_data={"message": "once"},
-    ).status == "success"
+    assert (
+        services.tools.invoke(
+            project_id=project.id,
+            actor_id=owner.id,
+            agent_scope="main_worker",
+            tool_name="echo",
+            input_data={"message": "once"},
+        ).status
+        == "success"
+    )
     with pytest.raises(ToolInvocationDeniedError, match="limit reached"):
         services.tools.invoke(
             project_id=project.id,
@@ -130,24 +166,97 @@ def test_tool_invocation_cap_is_enforced(services, project_with_owner) -> None:
             tool_name="echo",
             input_data={"message": "twice"},
         )
-    count = services.database.connect().execute(
-        "SELECT invocation_count FROM tool_grants WHERE id = ?",
-        (services.tools.list_grants_for_project(project.id, actor_id=project.owner_user_id)[0].id.value,),
-    ).fetchone()[0]
+    count = (
+        services.database.connect()
+        .execute(
+            "SELECT invocation_count FROM tool_grants WHERE id = ?",
+            (
+                services.tools.list_grants_for_project(project.id, actor_id=project.owner_user_id)[
+                    0
+                ].id.value,
+            ),
+        )
+        .fetchone()[0]
+    )
     assert count == 1
 
 
-def test_unenforceable_tool_timeout_is_rejected(
-    services, project_with_owner
-) -> None:
-    _, project = project_with_owner
-    tool = services.tools.register_echo_tool()
-    with pytest.raises(ValueError, match="isolated tool runner"):
-        services.tools.grant_tool(
-            project_id=project.id, actor_id=project.owner_user_id,
-            tool_id=tool.id,
+def test_tool_timeout_is_supported_by_isolated_runner(services, project_with_owner) -> None:
+    owner, project = project_with_owner
+    tool = services.tools.register_tool(
+        name="slow",
+        description="A deliberately slow test handler",
+        input_schema=_EMPTY_INPUT,
+        output_schema={"type": "object", "required": ["ok"]},
+        handler_key="slow",
+        handler=_slow_handler,
+    )
+    services.tools.grant_tool(
+        project_id=project.id,
+        actor_id=project.owner_user_id,
+        tool_id=tool.id,
+        agent_scope="main_worker",
+        timeout_seconds=0.05,
+    )
+    with pytest.raises(ToolError, match="timed out"):
+        services.tools.invoke(
+            project_id=project.id,
+            actor_id=owner.id,
             agent_scope="main_worker",
-            timeout_seconds=1,
+            tool_name="slow",
+            input_data={},
+        )
+
+
+def test_tool_handler_runs_in_child_process(services, project_with_owner) -> None:
+    owner, project = project_with_owner
+    tool = services.tools.register_tool(
+        name="pid",
+        description="Returns the handler process ID",
+        input_schema=_EMPTY_INPUT,
+        output_schema={"type": "object", "required": ["pid"]},
+        handler_key="pid",
+        handler=_pid_handler,
+    )
+    services.tools.grant_tool(
+        project_id=project.id,
+        actor_id=project.owner_user_id,
+        tool_id=tool.id,
+        agent_scope="main_worker",
+    )
+    result = services.tools.invoke(
+        project_id=project.id,
+        actor_id=owner.id,
+        agent_scope="main_worker",
+        tool_name="pid",
+        input_data={},
+    )
+    assert result.output["pid"] != os.getpid()
+
+
+def test_tool_output_is_bounded_before_result_creation(services, project_with_owner) -> None:
+    owner, project = project_with_owner
+    tool = services.tools.register_tool(
+        name="large",
+        description="Returns an oversized payload",
+        input_schema=_EMPTY_INPUT,
+        output_schema={"type": "object", "required": ["payload"]},
+        handler_key="large",
+        handler=_large_handler,
+    )
+    services.tools.grant_tool(
+        project_id=project.id,
+        actor_id=project.owner_user_id,
+        tool_id=tool.id,
+        agent_scope="main_worker",
+    )
+    with pytest.raises(ToolError, match="output exceeds"):
+        services.tools.invoke(
+            project_id=project.id,
+            actor_id=owner.id,
+            agent_scope="main_worker",
+            tool_name="large",
+            input_data={},
         )
 
 
@@ -156,13 +265,15 @@ def test_grant_is_idempotent(services, project_with_owner) -> None:
     _owner, project = project_with_owner
     tool = services.tools.register_echo_tool()
     services.tools.grant_tool(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
     # Second grant should succeed silently (idempotent).
     services.tools.grant_tool(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
@@ -170,15 +281,14 @@ def test_grant_is_idempotent(services, project_with_owner) -> None:
     assert len(grants) == 1
 
 
-def test_revoke_tool_grant_takes_effect_immediately(
-    services, project_with_owner
-) -> None:
+def test_revoke_tool_grant_takes_effect_immediately(services, project_with_owner) -> None:
     """Per PLAN.md M3: 'Revocation takes effect through all implemented
     interfaces.'"""
     owner, project = project_with_owner
     tool = services.tools.register_echo_tool()
     services.tools.grant_tool(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
@@ -192,7 +302,8 @@ def test_revoke_tool_grant_takes_effect_immediately(
     )
     # Revoke.
     services.tools.revoke_tool_grant(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
@@ -216,7 +327,8 @@ def test_invoke_echo_succeeds(services, project_with_owner) -> None:
     owner, project = project_with_owner
     tool = services.tools.register_echo_tool()
     services.tools.grant_tool(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
@@ -262,9 +374,7 @@ def test_invoke_with_unknown_tool_raises(services, project_with_owner) -> None:
         )
 
 
-def test_invoke_with_invalid_input_raises_validation_error(
-    services, project_with_owner
-) -> None:
+def test_invoke_with_invalid_input_raises_validation_error(services, project_with_owner) -> None:
     """Per zero-tool-capability-runtime §"Tool schemas are trust
     boundaries": model output is untrusted input. Validation covers
     type, shape, length, allowed values, project ownership, path
@@ -273,7 +383,8 @@ def test_invoke_with_invalid_input_raises_validation_error(
     owner, project = project_with_owner
     tool = services.tools.register_echo_tool()
     services.tools.grant_tool(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
@@ -319,7 +430,8 @@ def test_invoke_audits_success(services, project_with_owner) -> None:
     owner, project = project_with_owner
     tool = services.tools.register_echo_tool()
     services.tools.grant_tool(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
@@ -330,10 +442,10 @@ def test_invoke_audits_success(services, project_with_owner) -> None:
         tool_name="echo",
         input_data={"message": "audit me"},
     )
-    events = services.audit.list_for_project(project_id=project.id, actor_id=project.owner_user_id, limit=50)
-    invoke_events = [
-        e for e in events if e.operation == "tool.invoke"
-    ]
+    events = services.audit.list_for_project(
+        project_id=project.id, actor_id=project.owner_user_id, limit=50
+    )
+    invoke_events = [e for e in events if e.operation == "tool.invoke"]
     assert len(invoke_events) >= 1
     event = invoke_events[0]
     assert event.target_id == "echo"
@@ -356,12 +468,10 @@ def test_invoke_audits_denial(services, project_with_owner) -> None:
             tool_name="echo",
             input_data={"message": "should be denied"},
         )
-    events = services.audit.list_for_project(project_id=project.id, actor_id=project.owner_user_id, limit=50)
-    denial_events = [
-        e
-        for e in events
-        if e.operation == "tool.invoke" and e.result == "denied"
-    ]
+    events = services.audit.list_for_project(
+        project_id=project.id, actor_id=project.owner_user_id, limit=50
+    )
+    denial_events = [e for e in events if e.operation == "tool.invoke" and e.result == "denied"]
     assert len(denial_events) >= 1
     assert denial_events[0].target_id == "echo"
     # The audit event MUST NOT contain the raw input.
@@ -372,7 +482,8 @@ def test_invoke_audits_validation_failure(services, project_with_owner) -> None:
     owner, project = project_with_owner
     tool = services.tools.register_echo_tool()
     services.tools.grant_tool(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
@@ -384,12 +495,10 @@ def test_invoke_audits_validation_failure(services, project_with_owner) -> None:
             tool_name="echo",
             input_data={},
         )
-    events = services.audit.list_for_project(project_id=project.id, actor_id=project.owner_user_id, limit=50)
-    failure_events = [
-        e
-        for e in events
-        if e.operation == "tool.invoke" and e.result == "failure"
-    ]
+    events = services.audit.list_for_project(
+        project_id=project.id, actor_id=project.owner_user_id, limit=50
+    )
+    failure_events = [e for e in events if e.operation == "tool.invoke" and e.result == "failure"]
     assert len(failure_events) >= 1
 
 
@@ -403,17 +512,14 @@ def test_grant_in_project_a_not_usable_in_project_b(services) -> None:
     available through a different interface or child agent": a grant
     in project A is not usable from project B."""
     owner_a = services.identity.create_user(display_name="Owner A")
-    project_a = services.identity.create_project(
-        owner_id=owner_a.id, name="Project A"
-    )
+    project_a = services.identity.create_project(owner_id=owner_a.id, name="Project A")
     owner_b = services.identity.create_user(display_name="Owner B")
-    project_b = services.identity.create_project(
-        owner_id=owner_b.id, name="Project B"
-    )
+    project_b = services.identity.create_project(owner_id=owner_b.id, name="Project B")
     tool = services.tools.register_echo_tool()
     # Grant only in project A.
     services.tools.grant_tool(
-        project_id=project_a.id, actor_id=project_a.owner_user_id,
+        project_id=project_a.id,
+        actor_id=project_a.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
@@ -441,9 +547,7 @@ def test_grant_in_project_a_not_usable_in_project_b(services) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_grant_for_one_scope_does_not_apply_to_other_scopes(
-    services, project_with_owner
-) -> None:
+def test_grant_for_one_scope_does_not_apply_to_other_scopes(services, project_with_owner) -> None:
     """Per zero-tool-capability-runtime §"Registry metadata and runtime
     capability differ": a grant describes who may invoke one bounded
     part of a tool in one context. Granting to main_worker does NOT
@@ -451,7 +555,8 @@ def test_grant_for_one_scope_does_not_apply_to_other_scopes(
     owner, project = project_with_owner
     tool = services.tools.register_echo_tool()
     services.tools.grant_tool(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
@@ -486,7 +591,8 @@ def test_model_facing_rendering_is_bounded(services, project_with_owner) -> None
     owner, project = project_with_owner
     tool = services.tools.register_echo_tool()
     services.tools.grant_tool(
-        project_id=project.id, actor_id=project.owner_user_id,
+        project_id=project.id,
+        actor_id=project.owner_user_id,
         tool_id=tool.id,
         agent_scope="main_worker",
     )
@@ -503,3 +609,47 @@ def test_model_facing_rendering_is_bounded(services, project_with_owner) -> None
     assert result.output["echoed"] == big_message
     # The model-facing rendering is bounded.
     assert len(result.model_facing) <= 500
+
+
+def test_tool_result_redacts_sensitive_handler_output(services, project_with_owner) -> None:
+    owner, project = project_with_owner
+
+    def sensitive_handler(_input_data, _context):
+        return {
+            "content": "Bearer " + "fixture-token" + " password=" + "fixture-password",
+            "api_key": "fixture-api-key",
+        }
+
+    tool = services.tools.register_tool(
+        name="sensitive-fixture",
+        description="Returns a redaction fixture",
+        input_schema={"type": "object", "additionalProperties": False},
+        output_schema={
+            "type": "object",
+            "properties": {"content": {"type": "string"}, "api_key": {"type": "string"}},
+            "required": ["content", "api_key"],
+            "additionalProperties": False,
+        },
+        handler_key="sensitive-fixture",
+        handler=sensitive_handler,
+        inline=True,
+    )
+    services.tools.grant_tool(
+        project_id=project.id,
+        actor_id=owner.id,
+        tool_id=tool.id,
+        agent_scope="main_worker",
+    )
+
+    result = services.tools.invoke(
+        project_id=project.id,
+        actor_id=owner.id,
+        agent_scope="main_worker",
+        tool_name="sensitive-fixture",
+        input_data={},
+    )
+
+    assert result.output["content"] == "[REDACTED] [REDACTED]"
+    assert result.output["api_key"] == "[REDACTED]"
+    assert "fixture-token" not in result.model_facing
+    assert "fixture-api-key" not in result.model_facing

@@ -138,12 +138,29 @@ ZERO_ENV=development uvicorn zero.main:app --reload
 ### Run the verification suite
 
 ```bash
-ZERO_ENV=test pytest
-ruff check --select E9,F63,F7,F82 src tests
+ZERO_ENV=test PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
+  python -m pytest -rA -p no:cacheprovider
+ruff check --no-cache src tests scripts
+ruff format --check --no-cache src tests scripts
+PYTHONDONTWRITEBYTECODE=1 python -m compileall -q src tests scripts
 ```
 
 The test suite uses isolated SQLite state and exercises the same application factory used by the
-runtime.
+runtime. A release build must also pass the clean-artifact gate. Build from a clean committed Git
+tree so untracked or dirty checkout files cannot enter the release:
+
+```bash
+release_source="$(mktemp -d)"
+rm -rf dist
+mkdir -p "$release_source"
+test -z "$(git status --porcelain --untracked-files=all)"
+git archive --format=tar HEAD | tar -x -C "$release_source"
+python -m build --outdir dist "$release_source"
+python "$release_source/scripts/validate_release_artifacts.py" dist
+```
+
+That gate checks the wheel and source distribution independently for all 30 migration files and
+the runtime modules required by the application entry point.
 
 ## Configuration
 
@@ -194,10 +211,10 @@ Production rollout is deliberately blocked until at least the following are comp
 - concurrency and linearizability hardening around plan approval, task claiming/completion,
   agent limits, provider idempotency, and topology rollback;
 - production deployment, TLS, supervision, external persistence, and disaster-recovery rehearsal;
-- repository-wide formatting and the remaining non-critical Ruff findings.
+- a clean tracked-artifact build and installed-wheel startup gate;
 
-The current `BackupService` produces a **plaintext SQL dump**. Do not treat it as an encrypted
-backup solution.
+The current `BackupService` produces an authenticated encrypted backup only when a stable configured
+`ZERO_SECRET_KEY` is available. Without that encryption authority, backup and restore fail closed.
 
 ## Repository layout
 
