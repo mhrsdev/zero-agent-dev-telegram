@@ -360,11 +360,33 @@ class TestRouterFailoverAndAccounting:
         assert usage == 1, "fallback must charge exactly once"
         assert calls["secondary"] == 1
 
-    def test_rate_limit_retry_after_honored_then_success(self, upstream, tmp_path):
+    def test_rate_limit_retry_after_honored_then_success(self, upstream, tmp_path, monkeypatch):
+        # Assert the mechanism instead of wall-clock time: under heavy
+        # machine load even a zero-backoff request chain can exceed any
+        # fixed time budget, but honoring Retry-After: 0 must feed
+        # exactly 0 seconds into the sleep call. Ignoring the header
+        # would record >= 3s of exponential sleeps here.
+        import zero.app.provider_service as provider_service_module
+
+        real_time = time
+
+        class _RecordingTime:
+            def __init__(self) -> None:
+                self.sleeps: list[float] = []
+
+            def sleep(self, seconds: float) -> None:
+                self.sleeps.append(seconds)
+                real_time.sleep(seconds)
+
+            def __getattr__(self, name: str):
+                return getattr(real_time, name)
+
+        recorder = _RecordingTime()
+        monkeypatch.setattr(provider_service_module, "time", recorder)
+
         svc, owner, project = build_provider_service(tmp_path, max_attempts=3)
         FakeUpstream.plan.clear()
         hits = {"n": 0}
-        start = time.monotonic()
 
         def handler(method, body, headers):
             hits["n"] += 1
@@ -383,10 +405,10 @@ class TestRouterFailoverAndAccounting:
             request=chat_request("only"),
             source="system",
         )
-        elapsed = time.monotonic() - start
         assert resp.content == "final"
         assert hits["n"] == 3
-        assert elapsed < 2.0, "Retry-After: 0 must not add exponential sleeps"
+        assert len(recorder.sleeps) == 2, "both retries must go through the backoff path"
+        assert sum(recorder.sleeps) == 0.0, "Retry-After: 0 must produce zero backoff sleep"
         conn = svc._repo.database.connect()
         assert conn.execute("SELECT COUNT(*) c FROM usage_records").fetchone()["c"] == 1
 
