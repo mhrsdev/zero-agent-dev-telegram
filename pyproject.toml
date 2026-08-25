@@ -47,6 +47,10 @@ session = [
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    # starlette >=1.0 TestClient prefers httpx2 and only warns when it
+    # falls back to httpx; the repo's fail-closed warnings policy turns
+    # that warning into a collection error unless httpx2 is installed.
+    "httpx2>=2.0.0",
     "ruff>=0.7",
 ]
 
