@@ -9,6 +9,7 @@ app) and by tests.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,8 @@ from zero.app.tool_service import ToolService
 from zero.app.worker_service import WorkerService
 from zero.app.worktree_service import WorktreeService
 from zero.config import ConfigError, Settings
+
+logger = logging.getLogger(__name__)
 from zero.persistence.connection import Database
 from zero.persistence.repositories.agent_type_repository import (
     AgentTypeRepository,
@@ -206,6 +209,27 @@ def _build_sandbox_executor(settings):
         raise ConfigError(str(exc)) from exc
 
 
+def _load_extensions(tool_service) -> None:
+    """Wire MCP servers and plugins (GAP 7); failures are logged only."""
+    try:
+        from zero.manage.core.mcp_client import get_mcp_manager
+
+        manager = get_mcp_manager()
+        if manager.load_from_env():
+            registered = manager.register_tools(tool_service)
+            logger.info("MCP extension tools registered: %s", registered)
+    except Exception as exc:  # noqa: BLE001 - extensions must not crash startup
+        logger.warning("MCP extension loading skipped: %s", type(exc).__name__)
+    try:
+        from zero.manage.plugins.registry import load_plugins
+
+        loaded = load_plugins(tool_service)
+        if loaded:
+            logger.info("plugins loaded: %s", loaded)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("plugin loading skipped: %s", type(exc).__name__)
+
+
 def build_services(
     settings: Settings,
     database: Database,
@@ -258,6 +282,10 @@ def build_services(
     )
     if not settings.is_test:
         tool_service.register_worktree_tools(worktree_service)
+        # GAP 7: extension loading is opt-in and never fatal. MCP servers
+        # require explicit ZERO_MCP_SERVERS entries; plugins load from
+        # $ZERO_HOME/plugins and /opt/zero/plugins when present.
+        _load_extensions(tool_service)
     agent_type_service = AgentTypeService(agent_type_repo, audit_repo, authorization_service)
     artifact_service = ArtifactService(
         artifact_repo, agent_type_repo, audit_repo, authorization_service
