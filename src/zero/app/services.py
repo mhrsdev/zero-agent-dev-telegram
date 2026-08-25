@@ -252,7 +252,12 @@ def build_services(
         artifact_repo, agent_type_repo, context_repo, authorization_service
     )
     context_builder = ContextBuilder(retrieval_router, context_repo)
-    compaction_service = CompactionService(context_repo, artifact_service, authorization_service)
+    compaction_service = CompactionService(
+        context_repo,
+        artifact_service,
+        authorization_service,
+        agent_type_service=agent_type_service,
+    )
     provider_service = ProviderService(
         provider_repo,
         artifact_service,

@@ -121,6 +121,7 @@ class CompactionService:
         authorization_service: AuthorizationService,
         *,
         summarizer=None,
+        agent_type_service=None,
     ) -> None:
         self._context_repo = context_repo
         self._artifact_service = artifact_service
@@ -131,6 +132,9 @@ class CompactionService:
         # structured fallback always remains when it fails or is
         # missing.
         self._summarizer = summarizer
+        # Optional GAP 9 collaborator: writes accepted memory deltas
+        # from LLM summaries into durable knowledge records.
+        self._agent_type_service = agent_type_service
 
     @property
     def summarizer(self):
@@ -182,6 +186,8 @@ class CompactionService:
         threshold_percent: int = 85,
         summary: str | None = None,
         model_name: str | None = None,
+        agent_type_id=None,
+        memory_delta_enabled: bool = False,
     ) -> CompactionRecord:
         """Compact the conversation into a new context version.
 
@@ -396,6 +402,34 @@ class CompactionService:
         self._context_repo.activate_context_version(execution_id, target_version)
         # 11. Update compaction record to 'activated'.
         self._context_repo.update_compaction_state(record.id, "activated")
+        # 12. GAP 9: extract accepted memory deltas from LLM-produced
+        # summaries into durable knowledge records. The deterministic
+        # fallback template is never extracted (header detection inside
+        # the writer), and failures degrade without failing compaction.
+        if memory_delta_enabled and agent_type_id is not None and self._agent_type_service:
+            from zero.app.memory_delta import MemoryDeltaWriter
+
+            writer = MemoryDeltaWriter(
+                artifact_service=self._artifact_service,
+                agent_type_service=self._agent_type_service,
+            )
+            delta_artifact_id = writer.write(
+                project_id=project_id,
+                execution_id=execution_id,
+                actor_id=actor_id,
+                agent_type_id=agent_type_id,
+                compaction_record_id=record.id,
+                summary=summary,
+            )
+            if delta_artifact_id is not None:
+                try:
+                    self._context_repo.set_compaction_memory_delta(record.id, delta_artifact_id)
+                except Exception as link_exc:  # noqa: BLE001 - degraded, not fatal
+                    logging.getLogger(__name__).warning(
+                        "memory delta link skipped for compaction %s: %s",
+                        record.id.value,
+                        type(link_exc).__name__,
+                    )
         return self._context_repo.get_latest_compaction_record(execution_id)
 
     def _fit_messages(

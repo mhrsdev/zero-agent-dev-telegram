@@ -56,6 +56,7 @@ ArtifactKind = Literal[
     "transcript",
     "compaction_segment",
     "source_snapshot",
+    "memory_delta",
     "other",
 ]
 

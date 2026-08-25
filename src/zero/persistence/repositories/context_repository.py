@@ -383,6 +383,24 @@ class ContextRepository:
         if commit:
             conn.commit()
 
+    def set_compaction_memory_delta(
+        self,
+        record_id: CompactionRecordId,
+        artifact_id: ArtifactId,
+        *,
+        commit: bool = True,
+    ) -> None:
+        """Attach the accepted memory-delta artifact to a compaction (GAP 9)."""
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "UPDATE compaction_records SET memory_delta_artifact_id = ? WHERE id = ?",
+            (artifact_id.value, record_id.value),
+        )
+        if cursor.rowcount == 0:
+            raise ContextVersionNotFoundError(f"Compaction record {record_id} not found")
+        if commit:
+            conn.commit()
+
     def list_compaction_records(self, execution_id: ExecutionId) -> list[CompactionRecord]:
         conn = self._database.connect()
         cursor = conn.execute(

@@ -558,6 +558,12 @@ class AgentRuntime:
                             conversation_messages=conversation_messages,
                             context_window=context_window,
                             model_name=model_name,
+                            agent_type_id=policy.type_id,
+                            memory_delta_enabled=(
+                                policy.agent_type is not None
+                                and policy.agent_type.model_policy.get("memory_delta_enabled")
+                                == "1"
+                            ),
                         )
                 except Exception as compact_exc:  # noqa: BLE001 - degraded, not fatal
                     _LOGGER.warning(
@@ -662,6 +668,12 @@ class AgentRuntime:
                             conversation_messages=[_message_to_record(m) for m in messages_final],
                             context_window=context_window,
                             model_name=model_name,
+                            agent_type_id=policy.type_id,
+                            memory_delta_enabled=(
+                                policy.agent_type is not None
+                                and policy.agent_type.model_policy.get("memory_delta_enabled")
+                                == "1"
+                            ),
                         )
                 except Exception as compact_exc:  # noqa: BLE001 - degraded, not fatal
                     _LOGGER.debug(

@@ -18,13 +18,20 @@ from zero.app.integration_service import IntegrationService
 from zero.app.plan_service import PlanService
 from zero.app.result_delivery_service import ResultDeliveryService
 from zero.app.retry_backoff import compute_retry_delay
-from zero.app.worker_service import TaskSpec, WorkerService
+from zero.app.worker_service import DependencySpec, TaskSpec, WorkerService
 from zero.domain.audit import AuditSource, redact_sensitive_text
 from zero.domain.execution import Task, TaskId
 from zero.domain.identity import ProjectId, UserId
 from zero.domain.worktrees import RepositoryId
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    """Read a boolean env flag (GAP 10 opt-ins)."""
+    import os
+
+    return (os.environ.get(name, "").strip().lower()) in {"1", "true", "yes", "on"}
 
 
 def _parse_iso_utc(value: str) -> datetime | None:
@@ -69,6 +76,8 @@ class SchedulerService:
         result_delivery: ResultDeliveryService | None = None,
         agent_type_repo=None,
         task_max_attempts: int = 0,
+        decomposer=None,
+        decomposition_enabled: bool | None = None,
     ) -> None:
         self._plans = plans
         self._worker = worker
@@ -80,6 +89,81 @@ class SchedulerService:
         # Total attempts allowed per task (first run + retries).
         # 0 disables automatic requeueing of failed tasks.
         self._task_max_attempts = max(0, int(task_max_attempts))
+        # GAP 10: optional LLM task decomposition. Disabled unless the
+        # composition root passes a decomposer AND the flag is on.
+        self._decomposer = decomposer
+        if decomposition_enabled is None:
+            decomposition_enabled = _env_flag("ZERO_DECOMPOSITION_ENABLED")
+        self._decomposition_enabled = bool(decomposition_enabled)
+
+    def _task_specs_for_revision(
+        self,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        revision,
+        provider: str,
+        model_name: str,
+        source: AuditSource,
+        default_agent_type_id: str | None,
+        expected_evidence: tuple[str, ...],
+    ) -> tuple[list[TaskSpec], list[DependencySpec]]:
+        """Build task specs for one approved revision (GAP 10 seam).
+
+        Default: the historical single ``implementation`` task. When a
+        decomposer is wired and enabled, an LLM-produced validated graph
+        replaces it; any failure falls back to the single task.
+        """
+        single = [
+            TaskSpec(
+                key="implementation",
+                objective=revision.content.objective,
+                permitted_scope=revision.content.scope,
+                expected_evidence=expected_evidence,
+                agent_type_id=default_agent_type_id,
+            )
+        ]
+        if not self._decomposition_enabled or self._decomposer is None:
+            return single, []
+        try:
+            graph = self._decomposer.decompose(
+                project_id=project_id,
+                actor_id=actor_id,
+                revision_id=revision.id.value,
+                revision_content=revision.content,
+                provider=provider,
+                model_name=model_name,
+                source=source,
+            )
+        except Exception as exc:
+            logger.warning(
+                "decomposer raised for revision %s: %s",
+                revision.id.value,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return single, []
+        if graph is None or not graph.specs:
+            return single, []
+        specs: list[TaskSpec] = []
+        for spec in graph.specs:
+            specs.append(
+                TaskSpec(
+                    key=spec.key,
+                    objective=spec.objective,
+                    permitted_scope=spec.permitted_scope or revision.content.scope,
+                    expected_evidence=expected_evidence,
+                    agent_type_id=default_agent_type_id,
+                )
+            )
+        dependencies = list(graph.dependencies)
+        logger.info(
+            "plan revision %s decomposed into %d tasks / %d edges",
+            revision.id.value,
+            len(specs),
+            len(dependencies),
+        )
+        return specs, dependencies
 
     def _default_agent_type_id(self, project_id: ProjectId) -> str | None:
         """Select the project's first active agent type for new tasks.
@@ -170,20 +254,23 @@ class SchedulerService:
                     if repository_id is not None
                     else ("provider_response",)
                 )
+                task_specs, dependency_specs = self._task_specs_for_revision(
+                    project_id=project_id,
+                    actor_id=actor_id,
+                    revision=revision,
+                    provider=provider,
+                    model_name=model_name,
+                    source=source,
+                    default_agent_type_id=default_agent_type_id,
+                    expected_evidence=evidence,
+                )
                 was_unclaimed = getattr(handoff, "execution_id", None) is None
                 execution = self._worker.create_execution_from_handoff(
                     handoff_id=handoff.id,
                     actor_id=actor_id,
                     project_id=project_id,
-                    task_specs=[
-                        TaskSpec(
-                            key="implementation",
-                            objective=revision.content.objective,
-                            permitted_scope=revision.content.scope,
-                            expected_evidence=evidence,
-                            agent_type_id=default_agent_type_id,
-                        )
-                    ],
+                    task_specs=task_specs,
+                    dependency_specs=dependency_specs,
                     source=source,
                 )
                 # Count a claim only when this tick actually created the
