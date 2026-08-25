@@ -38,7 +38,7 @@ import subprocess
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
@@ -320,6 +320,7 @@ class WorktreeService:
         isolation_mode: Literal["disabled", "host_bounded"] = "host_bounded",
         max_timeout_seconds: int = 300,
         max_output_bytes: int = 64 * 1024,
+        command_executor: Any = None,
     ) -> None:
         self._repo = worktree_repo
         self._audit_repo = audit_repo
@@ -336,6 +337,9 @@ class WorktreeService:
         self._isolation_mode = isolation_mode
         self._max_timeout_seconds = max_timeout_seconds
         self._max_output_bytes = max_output_bytes
+        # GAP 3: pluggable sandbox backend; None keeps the historical
+        # host-bounded path.
+        self._command_executor = command_executor
 
     @property
     def max_command_timeout_seconds(self) -> int:
@@ -464,90 +468,34 @@ class WorktreeService:
         cwd: str,
         timeout_seconds: int,
     ) -> tuple[int | None, bool, str, str]:
-        """Run one allowlisted command with bounded output and group cleanup."""
-        clean_env = {
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
-            "HOME": cwd,
-            "LANG": "C",
-            "LC_ALL": "C",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-        }
-        try:
-            proc = subprocess.Popen(
+        """Run one allowlisted command with bounded output and group cleanup.
+
+        GAP 3: when a sandbox executor is configured the command runs
+        through it; callers never know the backend.
+        """
+        if self._command_executor is not None:
+            result = self._command_executor.execute(
                 argv,
                 cwd=cwd,
-                env=clean_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
+                timeout_seconds=timeout_seconds,
+                output_limit=self._max_output_bytes,
             )
-        except FileNotFoundError:
-            return 127, False, "", f"Command not found: {argv[0]}"
+            return result.exit_code, result.timed_out, result.stdout, result.stderr
+        from zero.app.executors.sandbox import run_bounded_process, scrubbed_env
 
-        output: dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
-
-        def drain(name: str, stream) -> None:
-            while True:
-                chunk = stream.read(8192)
-                if not chunk:
-                    return
-                remaining = self._max_output_bytes - len(output[name])
-                if remaining > 0:
-                    output[name].extend(chunk[:remaining])
-
-        readers = [
-            threading.Thread(
-                target=drain,
-                args=(name, stream),
-                daemon=True,
-            )
-            for name, stream in (
-                ("stdout", proc.stdout),
-                ("stderr", proc.stderr),
-            )
-            if stream is not None
-        ]
-        for reader in readers:
-            reader.start()
-        timed_out = False
-        try:
-            exit_code = proc.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            exit_code = None
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
-        for reader in readers:
-            reader.join(timeout=2)
-        if proc.stdout is not None:
-            proc.stdout.close()
-        if proc.stderr is not None:
-            proc.stderr.close()
-
-        marker = f"\n[output truncated after {self._max_output_bytes} bytes]"
-
-        def decode(name: str) -> str:
-            raw = bytes(output[name])
-            truncated = len(raw) >= self._max_output_bytes
-            if truncated:
-                raw = raw[: max(0, self._max_output_bytes - len(marker))]
-                return raw.decode("utf-8", errors="replace") + marker
-            return raw.decode("utf-8", errors="replace")
-
-        stderr = decode("stderr")
-        if timed_out:
-            timeout_marker = f"\n[Command timed out after {timeout_seconds}s]"
-            if (
-                len(stderr.encode("utf-8")) + len(timeout_marker.encode("utf-8"))
-                <= self._max_output_bytes
-            ):
-                stderr += timeout_marker
-        return exit_code, timed_out, decode("stdout"), stderr
+        exec_result = run_bounded_process(
+            argv,
+            cwd=cwd,
+            env=scrubbed_env(cwd),
+            timeout_seconds=timeout_seconds,
+            output_limit=self._max_output_bytes,
+        )
+        return (
+            exec_result.exit_code,
+            exec_result.timed_out,
+            exec_result.stdout,
+            exec_result.stderr,
+        )
 
     # ------------------------------------------------------------------
     # Repository registration

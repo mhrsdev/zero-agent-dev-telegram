@@ -28,7 +28,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from zero import __version__
 from zero.adapters.messaging import UnsupportedUpdateError, WebhookAuthError
@@ -103,7 +103,10 @@ class LinkExternalIdentityRequest(BaseModel):
 class StoreSecretRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     secret_type: str = Field(..., pattern="^(api_key|token|password|other)$")
-    value: str = Field(..., min_length=1, repr=False)  # never repr'd in logs
+    # SecretStr keeps the plaintext out of reprs/logs by construction
+    # (the same convention as Settings) without version-fragile
+    # Field(repr=...) metadata.
+    value: SecretStr = Field(..., min_length=1)
 
 
 class GrantToolRequest(BaseModel):
@@ -503,7 +506,7 @@ def _register_auth_routes(app: FastAPI, services: Services) -> None:
         return response
 
     @app.delete("/auth/tokens/current", tags=["auth"], status_code=204)
-    def revoke_current_token(request: Request) -> None:
+    def revoke_current_token(request: Request):
         services.auth.revoke(request.state.access_token, request_actor(request))
 
 
@@ -700,7 +703,7 @@ def _register_identity_routes(app: FastAPI, services: Services) -> None:
         tags=["identity"],
         status_code=status.HTTP_204_NO_CONTENT,
     )
-    def remove_member(project_id: str, user_id: str) -> None:
+    def remove_member(project_id: str, user_id: str):
         from zero.domain.identity import ProjectId, UserId
 
         try:
@@ -845,7 +848,7 @@ def _register_secret_routes(app: FastAPI, services: Services) -> None:
                 project_id=ProjectId(project_id),
                 name=req.name,
                 secret_type=req.secret_type,  # type: ignore[arg-type]
-                value=req.value,
+                value=req.value.get_secret_value(),
                 actor_id=_request_project_actor(request, services, project_id),
                 source="web",
             )
@@ -892,7 +895,7 @@ def _register_secret_routes(app: FastAPI, services: Services) -> None:
         tags=["secrets"],
         status_code=status.HTTP_204_NO_CONTENT,
     )
-    def revoke_secret(request: Request, project_id: str, secret_id: str) -> None:
+    def revoke_secret(request: Request, project_id: str, secret_id: str):
         from zero.domain.identity import ProjectId
         from zero.domain.secrets import SecretReferenceId
 
@@ -967,7 +970,7 @@ def _register_tool_routes(app: FastAPI, services: Services) -> None:
         project_id: str,
         tool_id: str,
         agent_scope: str,
-    ) -> None:
+    ):
         """Revoke a project tool grant; takes effect immediately."""
         from zero.domain.identity import ProjectId
         from zero.domain.tools import ToolId

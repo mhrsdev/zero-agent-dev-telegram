@@ -46,33 +46,48 @@ def database_backend_capability(settings: Settings) -> Capability:
 
 
 def worktree_execution_capability(settings: Settings) -> Capability:
-    """Host-bounded execution availability.
+    """Worktree command execution availability (GAP 3 aware).
 
-    Production refuses host-bounded command execution because no
-    container/VM isolation backend exists yet. This is fail-closed, and
-    it is reported here as an explicit unavailable capability instead of
-    surfacing only as a late configuration error.
+    Production refusal dominates: without a genuine sandbox backend no
+    command execution is reported available, matching the config-layer
+    fail-closed rule. The reported detail names the active backend so
+    the capability report never overstates isolation.
     """
     if settings.is_production:
+        if settings.sandbox_executor in {"docker", "firejail"}:
+            return Capability(
+                name="worktree_execution",
+                status=CAPABILITY_AVAILABLE,
+                detail=(
+                    f"sandbox={settings.sandbox_executor} (image={settings.sandbox_image})"
+                    if settings.sandbox_executor == "docker"
+                    else f"sandbox={settings.sandbox_executor}"
+                ),
+            )
         return Capability(
             name="worktree_execution",
             status=CAPABILITY_UNAVAILABLE,
             detail=(
-                "no production isolation backend is configured; host_bounded "
-                "execution is refused in production until a sandbox executor "
-                "is implemented"
+                "no production isolation backend is configured; set "
+                "ZERO_SANDBOX_EXECUTOR=docker|firejail to enable sandboxed commands"
             ),
         )
-    if settings.worktree_isolation_mode == "host_bounded":
+    if settings.worktree_isolation_mode == "disabled":
+        return Capability(
+            name="worktree_execution",
+            status=CAPABILITY_UNAVAILABLE,
+            detail="worktree isolation mode is disabled by configuration",
+        )
+    if settings.sandbox_executor in {"docker", "firejail"}:
         return Capability(
             name="worktree_execution",
             status=CAPABILITY_AVAILABLE,
-            detail="host_bounded (test/development isolation mode)",
+            detail=f"sandbox={settings.sandbox_executor}",
         )
     return Capability(
         name="worktree_execution",
-        status=CAPABILITY_UNAVAILABLE,
-        detail="worktree isolation mode is disabled by configuration",
+        status=CAPABILITY_AVAILABLE,
+        detail="host_bounded (test/development isolation mode)",
     )
 
 

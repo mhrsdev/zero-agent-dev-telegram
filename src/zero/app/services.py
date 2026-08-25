@@ -47,7 +47,7 @@ from zero.app.secret_service import SecretService
 from zero.app.tool_service import ToolService
 from zero.app.worker_service import WorkerService
 from zero.app.worktree_service import WorktreeService
-from zero.config import Settings
+from zero.config import ConfigError, Settings
 from zero.persistence.connection import Database
 from zero.persistence.repositories.agent_type_repository import (
     AgentTypeRepository,
@@ -193,6 +193,19 @@ def _build_policy_gate(identity_repo, settings):
     return _build(_cfg_getter, _owner_external)
 
 
+def _build_sandbox_executor(settings):
+    """Resolve the GAP 3 sandbox backend, probing availability fail-closed."""
+    from zero.app.executors.sandbox import SandboxUnavailableError, build_command_executor
+
+    try:
+        return build_command_executor(
+            settings.sandbox_executor,
+            sandbox_image=settings.sandbox_image,
+        )
+    except (SandboxUnavailableError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
+
+
 def build_services(
     settings: Settings,
     database: Database,
@@ -241,6 +254,7 @@ def build_services(
         worktree_root=settings.worktree_root,
         allowed_commands=settings.worktree_allowed_commands,
         isolation_mode=settings.worktree_isolation_mode,
+        command_executor=_build_sandbox_executor(settings),
     )
     if not settings.is_test:
         tool_service.register_worktree_tools(worktree_service)

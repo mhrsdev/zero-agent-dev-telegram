@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, SecretStr
 Environment = Literal["development", "test", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 WorktreeIsolationMode = Literal["disabled", "host_bounded"]
+SandboxExecutor = Literal["none", "docker", "firejail"]
 
 #: The only database backend this release implements and tests.
 #: PostgreSQL/MySQL/etc. URLs are refused at configuration load time so
@@ -98,6 +99,11 @@ class Settings(BaseModel):
     # Host-bounded execution is deliberately test/development-only. Production
     # remains disabled until a genuine sandbox backend is configured.
     worktree_isolation_mode: WorktreeIsolationMode = "disabled"
+    #: GAP 3: the genuine isolation backend used for worktree commands.
+    #: ``none`` keeps production refusal; ``docker``/``firejail`` enable
+    #: sandboxed execution (probed at composition, fail closed).
+    sandbox_executor: SandboxExecutor = "none"
+    sandbox_image: str = "python:3.12-slim"
     worktree_allowed_commands: tuple[str, ...] = ()
     worktree_root: str = DEFAULT_WORKTREE_ROOT
 
@@ -244,6 +250,13 @@ class Settings(BaseModel):
         if isolation_mode not in {"disabled", "host_bounded"}:
             raise ConfigError("ZERO_WORKTREE_ISOLATION_MODE must be 'disabled' or 'host_bounded'.")
 
+        sandbox_executor = raw.get("ZERO_SANDBOX_EXECUTOR", "none").strip().lower()
+        if sandbox_executor not in {"none", "docker", "firejail"}:
+            raise ConfigError("ZERO_SANDBOX_EXECUTOR must be one of none, docker, firejail.")
+        sandbox_image = raw.get("ZERO_SANDBOX_IMAGE", "python:3.12-slim").strip()
+        if not sandbox_image:
+            raise ConfigError("ZERO_SANDBOX_IMAGE must not be empty.")
+
         openai_key_raw = raw.get("ZERO_OPENAI_API_KEY")
         openai_api_key = SecretStr(openai_key_raw) if openai_key_raw else None
         openai_base_url = raw.get("ZERO_OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -342,6 +355,8 @@ class Settings(BaseModel):
             telegram_webhook_secret=telegram_webhook_secret,
             discord_application_public_key=discord_application_public_key,
             worktree_isolation_mode=isolation_mode,  # type: ignore[arg-type]
+            sandbox_executor=sandbox_executor,  # type: ignore[arg-type]
+            sandbox_image=sandbox_image,
             worktree_allowed_commands=allowed_commands,
             worktree_root=raw.get("ZERO_WORKTREE_ROOT", DEFAULT_WORKTREE_ROOT),
             workers_enabled=workers_enabled,
@@ -435,10 +450,14 @@ class Settings(BaseModel):
                 raise ConfigError(
                     f"ZERO_BOOTSTRAP_TOKEN must be at least {_MIN_SECRET_KEY_BYTES} bytes."
                 )
-        if self.worktree_isolation_mode == "host_bounded":
+        # GAP 3: production permits host_bounded *mode* only when a
+        # genuine sandbox backend is selected; the backend itself is
+        # probed (fail closed) at composition time.
+        if self.worktree_isolation_mode == "host_bounded" and self.sandbox_executor == "none":
             raise ConfigError(
                 "host-bounded worktree execution is not permitted in production; "
-                "configure a genuine isolation backend before enabling commands."
+                "configure a genuine isolation backend "
+                "(ZERO_SANDBOX_EXECUTOR=docker|firejail) before enabling commands."
             )
 
     def _enforce_test_rules(self) -> None:

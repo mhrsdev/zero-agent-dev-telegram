@@ -66,7 +66,12 @@ def test_openai_compatible_adapter_maps_chat_completion_over_http() -> None:
     assert seen["method"] == "POST"
     assert seen["url"] == "https://provider.invalid/v1/chat/completions"
     assert seen["authorization"] == "Bearer " + "synthetic-" + "test-key"
-    assert b'"model":"test-model"' in seen["payload"]  # type: ignore[operator]
+    # The model name must travel in the JSON body; serialization
+    # whitespace is a transport detail (httpx separators vary by version).
+    import json as _json
+
+    payload = _json.loads(seen["payload"])  # type: ignore[arg-type]
+    assert payload["model"] == "test-model"
     assert response.content == "Hello from HTTP"
     assert response.provider_message_id == "chatcmpl_test_123"
     assert response.usage.input_tokens == 8
