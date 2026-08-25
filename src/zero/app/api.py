@@ -23,7 +23,6 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
@@ -35,13 +34,13 @@ from zero.app.auth_service import (
     reset_actor,
 )
 from zero.app.background_workers import BackgroundWorkerHost
-from zero.app.capabilities import capabilities_payload
 from zero.app.health import HealthService
 from zero.app.routers.artifact import register_artifact_routes
 from zero.app.routers.audit import register_audit_routes
 from zero.app.routers.auth import register_auth_routes
 from zero.app.routers.authorization import register_authorization_routes
 from zero.app.routers.execution import register_execution_routes
+from zero.app.routers.health import register_health_routes
 from zero.app.routers.identity import register_identity_routes
 from zero.app.routers.integration import register_integration_routes
 from zero.app.routers.interface import register_interface_routes
@@ -149,7 +148,7 @@ def create_app(settings: Settings) -> FastAPI:
     if static_dir.is_dir():
         app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-    _register_health_routes(app, health_service, services=services, settings=settings)
+    register_health_routes(app, health_service, services=services, settings=settings)
     register_auth_routes(app, services)
     register_identity_routes(app, services)
     register_authorization_routes(app, services)
@@ -303,84 +302,3 @@ def _register_auth_middleware(app: FastAPI, services: Services, settings: Settin
             return await call_next(request)
         finally:
             reset_actor(actor_context)
-
-
-# ----------------------------------------------------------------------
-# Health routes
-# ----------------------------------------------------------------------
-
-
-def _register_health_routes(
-    app: FastAPI,
-    health_service: HealthService,
-    *,
-    services: Services,
-    settings: Settings,
-) -> None:
-    @app.get("/healthz", tags=["health"])
-    def healthz() -> dict[str, Any]:
-        report = health_service.report()
-        return report.to_dict()
-
-    @app.get("/readyz", tags=["health"])
-    def readyz() -> JSONResponse:
-        report = health_service.report()
-        if report.status == "ok":
-            return JSONResponse(status_code=status.HTTP_200_OK, content=report.to_dict())
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content=report.to_dict(),
-        )
-
-    @app.get("/capabilities", tags=["health"])
-    def capabilities() -> dict[str, Any]:
-        """Declare what this deployment can and cannot do, and why."""
-        payload = capabilities_payload(settings)
-        worker_host: BackgroundWorkerHost | None = getattr(app.state, "worker_host", None)
-        if worker_host is not None:
-            payload["workers"] = worker_host.status.to_dict()
-        return payload
-
-    @app.get("/metrics", tags=["observability"])
-    def metrics() -> dict[str, Any]:
-        """Export low-cardinality runtime metrics.
-
-        Per PLAN.md M14: counters and duration summaries only; raw
-        prompts, source files, tool parameters/results, credentials,
-        and private messages are excluded by construction (the label
-        vocabulary is closed).
-        """
-        counters = services.metrics.get_counters()
-        histograms = {
-            name: services.metrics.get_histogram_summary(name)
-            for name in services.metrics.histogram_names()
-        }
-        worker_host_status: dict[str, object] | None = None
-        host: BackgroundWorkerHost | None = getattr(app.state, "worker_host", None)
-        if host is not None:
-            worker_host_status = host.status.to_dict()
-        return {
-            "counters": counters,
-            "histograms": histograms,
-            "workers": worker_host_status,
-        }
-
-    @app.get("/", tags=["root"])
-    def root() -> dict[str, str]:
-        return {
-            "name": "Zero Develop",
-            "version": __version__,
-            "environment": app.state.settings.zero_env,
-            "docs": "/docs",
-            "health": "/healthz",
-        }
-
-
-# ----------------------------------------------------------------------
-# Identity routes
-# ----------------------------------------------------------------------
-
-
-# ----------------------------------------------------------------------
-# Authorization routes
-# ----------------------------------------------------------------------
