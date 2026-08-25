@@ -316,12 +316,10 @@ def create_app(settings: Settings) -> FastAPI:
         except ImportError:  # pragma: no cover - manage layer optional
             pass
         try:
-            from pathlib import Path as _P
-
-            from zero.manage.core.config import ConfigService
+            from zero.manage.core.config import ConfigService, zero_home
             from zero.manage.services.backup_daemon import BackupDaemon
 
-            home = _P(os.environ.get("ZERO_HOME", Path.home() / ".zero"))
+            home = zero_home()
             cfgsvc = ConfigService(home)
             mcfg = cfgsvc.load() if cfgsvc.exists() else None
             if mcfg is not None and mcfg.backups.schedule != "off":

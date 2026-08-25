@@ -12,11 +12,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from zero.manage.core.config import ConfigService
+from zero.manage.core.config import ConfigService, zero_home
 
-
-def _home() -> Path:
-    return Path(os.environ.get("ZERO_HOME", Path.home() / ".zero"))
+# Private alias keeping the module-local call sites short; the canonical
+# $ZERO_HOME resolver lives in manage.core.config.
+_home = zero_home
 
 
 def _cfgsvc() -> ConfigService:

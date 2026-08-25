@@ -10,9 +10,7 @@ app) and by tests.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
-from pathlib import Path
 
 import httpx
 
@@ -126,7 +124,9 @@ def _build_policy_gate(identity_repo, settings):
     Returns None when no managed config exists, keeping legacy env-only
     behavior untouched. Live-reloads on every call (cheap YAML read).
     """
-    home = Path(os.environ.get("ZERO_HOME", Path.home() / ".zero"))
+    from zero.manage.core.config import zero_home
+
+    home = zero_home()
     cfg_path = home / "config.yaml"
     if not cfg_path.exists():
         return None
@@ -258,12 +258,9 @@ def _load_extensions(tool_service, *, secret_service=None, identity=None) -> Non
         config = None
         facade = None
         try:
-            import os as _os
-            from pathlib import Path as _Path
+            from zero.manage.core.config import ConfigService, zero_home
 
-            from zero.manage.core.config import ConfigService
-
-            home = _Path(_os.environ.get("ZERO_HOME", _Path.home() / ".zero"))
+            home = zero_home()
             cfgsvc = ConfigService(home)
             if cfgsvc.exists():
                 config = cfgsvc.load()

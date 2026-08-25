@@ -21,7 +21,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
-from zero.manage.core.config import ConfigService, GroupPolicy, ZeroConfig
+from zero.manage.core.config import ConfigService, GroupPolicy, ZeroConfig, zero_home
 from zero.manage.services.wizard_forms import WIZARD_STEPS
 
 
@@ -105,8 +105,9 @@ def _clear_login_failures(ip: str) -> None:
     _login_failures.pop(ip, None)
 
 
-def _home() -> Path:
-    return Path(os.environ.get("ZERO_HOME", Path.home() / ".zero"))
+# Private alias keeping module-local call sites short; the canonical
+# $ZERO_HOME resolver lives in manage.core.config.
+_home = zero_home
 
 
 def _cfgsvc() -> ConfigService:

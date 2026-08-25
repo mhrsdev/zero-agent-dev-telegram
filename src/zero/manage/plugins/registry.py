@@ -19,6 +19,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from zero.manage.core.config import zero_home
+
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PLUGIN_DIR = Path("/opt/zero/plugins")
@@ -34,8 +36,9 @@ class ManageContext:
     plugin_name: str = ""
 
 
-def _home_dir() -> Path:
-    return Path(os.environ.get("ZERO_HOME", str(Path.home() / ".zero")))
+# Private alias; the canonical $ZERO_HOME resolver lives in
+# manage.core.config.
+_home_dir = zero_home
 
 
 def plugin_dirs() -> list[tuple[str, Path]]:

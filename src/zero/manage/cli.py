@@ -20,12 +20,11 @@ import time
 from pathlib import Path
 
 from zero import __version__
-from zero.manage.core.config import ConfigError, ConfigService, ZeroConfig
+from zero.manage.core.config import ConfigError, ConfigService, ZeroConfig, zero_home
 
-
-def _home() -> Path:
-    """$ZERO_HOME resolved per call so runtime env changes apply."""
-    return Path(os.environ.get("ZERO_HOME", str(Path.home() / ".zero")))
+# Private alias so this module's many call sites stay untouched; the
+# single canonical $ZERO_HOME resolver lives in manage.core.config.
+_home = zero_home
 
 
 SERVICE_NAME = "zero"

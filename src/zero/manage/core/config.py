@@ -23,6 +23,11 @@ SCHEMA_VERSION = 1
 REF_RE = re.compile(r"^sec_[a-z0-9_]+$")
 
 
+def zero_home() -> Path:
+    """Resolve $ZERO_HOME per call so runtime env changes apply."""
+    return Path(os.environ.get("ZERO_HOME", str(Path.home() / ".zero")))
+
+
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
