@@ -36,9 +36,14 @@ class MigrationError(RuntimeError):
     """Raised when a migration cannot be applied."""
 
 
-def _migration_files() -> list[Path]:
-    """Return the list of ``.sql`` files under ``migrations/``, sorted."""
-    migrations_dir = Path(__file__).parent / "migrations"
+def _migration_files(dialect: str = "sqlite") -> list[Path]:
+    """Return the sorted ``.sql`` files for the requested dialect.
+
+    SQLite reads ``migrations/`` (canonical); PostgreSQL reads
+    ``migrations_pg/`` (generated translations, GAP 2).
+    """
+    subdir = "migrations_pg" if dialect == "postgresql" else "migrations"
+    migrations_dir = Path(__file__).parent / subdir
     if not migrations_dir.is_dir():
         return []
     return sorted(migrations_dir.glob("*.sql"))
@@ -58,6 +63,10 @@ def _ensure_schema_migrations_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    if getattr(conn, "dialect", None) == "postgresql":
+        # PostgreSQL enforces FKs natively and has no PRAGMA.
+        conn.commit()
+        return
     columns = {row[1] for row in conn.execute("PRAGMA table_info(schema_migrations)")}
     if "checksum" not in columns:
         # Existing installations predate checksums.  The nullable column is
@@ -85,19 +94,25 @@ _IDEMPOTENT_ERROR_PATTERNS = (
 )
 
 
-def _is_idempotent_error(exc: sqlite3.Error) -> bool:
+def _is_idempotent_error(exc: sqlite3.Error, dialect: str = "sqlite") -> bool:
     msg = str(exc).strip().lower()
+    if dialect == "postgresql":
+        from zero.persistence.dialect import statement_is_idempotent_error
+
+        return statement_is_idempotent_error(msg)
     return any(pattern.match(msg) for pattern in _IDEMPOTENT_ERROR_PATTERNS)
 
 
-def _split_statements(sql: str) -> list[str]:
+def _split_statements(sql: str, dialect: str = "sqlite") -> list[str]:
     """Split a migration script into individual statements.
 
-    Respects SQLite trigger syntax where a semicolon may appear inside
-    a ``BEGIN ... END`` block. Comments (lines starting with ``--``)
-    are preserved attached to the following statement so the SQL
-    remains readable in logs.
+    SQLite respects trigger ``BEGIN ... END;`` blocks. PostgreSQL
+    respects dollar-quoted function bodies (``$tag$ ... $tag$``).
+    Comments are preserved attached to the following statement so the
+    SQL remains readable in logs.
     """
+    if dialect == "postgresql":
+        return _split_pg_statements(sql)
     # Strip block comments /* ... */ first.
     sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
     statements: list[str] = []
@@ -131,11 +146,76 @@ def _split_statements(sql: str) -> list[str]:
     return statements
 
 
+def _split_pg_statements(sql: str) -> list[str]:
+    """Split PostgreSQL SQL respecting single quotes and $tag$ bodies."""
+    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
+    statements: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        buf.append(ch)
+        if ch == "'":
+            i += 1
+            while i < n:
+                buf.append(sql[i])
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        buf.append("'")
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "$":
+            match = re.match(r"\$(\w*)\$", sql[i:])
+            if match is not None:
+                tag = match.group(0)
+                end = sql.find(tag, i + len(tag))
+                if end != -1:
+                    body_end = end + len(tag)
+                    buf.append(sql[i + 1 : body_end])
+                    i = body_end
+                    continue
+        if ch == ";":
+            text = "".join(buf).strip()
+            meaningful = [
+                line
+                for line in text.splitlines()
+                if line.strip() and not line.strip().startswith("--")
+            ]
+            if meaningful:
+                statements.append("\n".join(buf).strip())
+            buf = []
+        i += 1
+    tail = "".join(buf).strip()
+    if tail and not all(
+        line.strip().startswith("--") or not line.strip() for line in tail.splitlines()
+    ):
+        statements.append(tail)
+    return statements
+    if buf:
+        # Trailing content without a semicolon — append if non-trivial.
+        text = "\n".join(buf).strip()
+        if text and not text.startswith("--"):
+            statements.append(text)
+    return statements
+
+
 def apply_migrations(database: Database) -> int:
-    """Apply all pending migrations atomically and verify checksums."""
-    files = _migration_files()
+    """Apply all pending migrations atomically and verify checksums.
+
+    Dual-dialect (GAP 2): the backend is selected by ``database.dialect``
+    — SQLite reads the canonical files, PostgreSQL reads the generated
+    translations in ``migrations_pg/`` with its own ledger semantics.
+    """
+    dialect = getattr(database, "dialect", "sqlite")
+    files = _migration_files("postgresql") if dialect == "postgresql" else _migration_files()
     if not files:
         return 0
+    is_pg = dialect == "postgresql"
 
     with _MIGRATION_LOCK:
         conn = database.connect()
@@ -170,25 +250,31 @@ def apply_migrations(database: Database) -> int:
                 continue
             sql = path.read_text(encoding="utf-8")
             checksum = _migration_checksum(sql)
-            statements = _split_statements(sql)
+            statements = _split_statements(sql, dialect)
             try:
-                # ``BEGIN IMMEDIATE`` in Database.transaction serializes
-                # writers in-process and across SQLite processes.  All DDL,
-                # bookkeeping, and rollback happen in the same transaction.
-                # A marked SQLite table-rebuild migration may temporarily
-                # disable foreign keys; ordinary migrations never may.
+                # SQLite: ``BEGIN IMMEDIATE`` serializes writers in-process
+                # and across processes. PostgreSQL relies on its own MVCC;
+                # the ledger re-read below plus unique PK keeps it safe.
                 rebuild_migration = "ZERO_MIGRATION_FOREIGN_KEYS_OFF" in sql
-                with database.transaction(enforce_foreign_keys=not rebuild_migration) as tx:
-                    # Re-read after BEGIN IMMEDIATE. Another process may have
-                    # applied this migration while this worker waited for the
-                    # SQLite writer lock; executing its DDL again would cause
-                    # duplicate bookkeeping or destructive races.
+                with database.transaction(
+                    enforce_foreign_keys=not rebuild_migration and not is_pg
+                ) as tx:
+                    if is_pg:
+                        # Cross-process serialization for PG via advisory lock.
+                        lock_key = _pg_lock_key(migration_id)
+                        tx.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+                    # Re-read after acquiring the writer fence. Another process
+                    # may have applied this migration while this worker waited.
                     already_applied = tx.execute(
                         "SELECT checksum FROM schema_migrations WHERE id = ?",
                         (migration_id,),
                     ).fetchone()
                     if already_applied is not None:
-                        recorded_checksum = already_applied[0]
+                        recorded_checksum = (
+                            already_applied["checksum"]
+                            if not isinstance(already_applied, sqlite3.Row)
+                            else already_applied[0]
+                        )
                         if recorded_checksum is not None and str(recorded_checksum) != checksum:
                             raise MigrationError(
                                 f"Migration {migration_id} checksum mismatch after lock acquisition"
@@ -202,7 +288,7 @@ def apply_migrations(database: Database) -> int:
                         try:
                             tx.execute(stmt_text)
                         except sqlite3.Error as exc:
-                            if _is_idempotent_error(exc):
+                            if _is_idempotent_error(exc, dialect):
                                 continue
                             raise
                     tx.execute(
@@ -214,6 +300,14 @@ def apply_migrations(database: Database) -> int:
             newly_applied += 1
             applied_checksums[migration_id] = checksum
         return newly_applied
+
+
+def _pg_lock_key(migration_id: str) -> int:
+    """Stable 63-bit advisory-lock key for a migration id."""
+    import hashlib
+
+    digest = hashlib.sha256(migration_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
 
 
 def count_applied_migrations(database: Database) -> int:

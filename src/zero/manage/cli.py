@@ -30,11 +30,11 @@ SERVICE_NAME = "zero"
 def _engine_services(env_file: str | None = None):
     from zero.app.services import build_services
     from zero.config import Settings
-    from zero.persistence.connection import Database
+    from zero.persistence.connection import open_database
     from zero.persistence.migrations import apply_migrations
 
     settings = Settings.load(env_file=env_file)
-    database = Database(settings)
+    database = open_database(settings)
     apply_migrations(database)
     services = build_services(settings, database)
     return settings, services

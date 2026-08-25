@@ -295,3 +295,19 @@ class Database:
             return True
         except sqlite3.Error:
             return False
+
+
+def open_database(settings: Settings):
+    """Open the backend matching the configured URL scheme (GAP 2).
+
+    SQLite URLs return the classic :class:`Database`; PostgreSQL URLs
+    return :class:`~zero.persistence.pg_connection.PostgresDatabase`.
+    Scheme validation happened at configuration load; unknown schemes
+    fail closed there.
+    """
+    scheme = settings.database_url.split(":", 1)[0].strip().lower()
+    if scheme in ("postgresql", "postgres"):
+        from zero.persistence.pg_connection import PostgresDatabase
+
+        return PostgresDatabase(settings)
+    return Database(settings)

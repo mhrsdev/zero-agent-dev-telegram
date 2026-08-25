@@ -27,12 +27,12 @@ LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 WorktreeIsolationMode = Literal["disabled", "host_bounded"]
 SandboxExecutor = Literal["none", "docker", "firejail"]
 
-#: The only database backend this release implements and tests.
-#: PostgreSQL/MySQL/etc. URLs are refused at configuration load time so
-#: that accepted configuration always matches runtime capability (the
-#: application factory must never fail with a late ``Unsupported
-#: database URL`` error after settings validation passed).
+#: The default database backend. PostgreSQL URLs are accepted when the
+#: ``[pg]`` extra is installed (GAP 2); anything else is refused at
+#: configuration load time so that accepted configuration always
+#: matches runtime capability.
 SUPPORTED_DATABASE_SCHEME = "sqlite"
+POSTGRESQL_DATABASE_SCHEMES: Final[tuple[str, ...]] = ("postgresql", "postgres")
 
 # A path that contains any of these substrings is refused when
 # ZERO_ENV=test, to prevent a test config from pointing at a production
@@ -76,6 +76,9 @@ class Settings(BaseModel):
 
     zero_env: Environment
     database_url: str
+    #: GAP 2: PostgreSQL connection pool bounds (``ZERO_PG_POOL_MIN/MAX``).
+    pg_pool_min: int = 2
+    pg_pool_max: int = 20
     log_level: LogLevel = "INFO"
     secret_key: SecretStr | None = None
     auth_required: bool = False
@@ -335,6 +338,11 @@ class Settings(BaseModel):
             _read_positive_float(raw, "ZERO_COMBINED_TEST_TIMEOUT_SECONDS", 300.0)
         )
 
+        pg_pool_min = _read_pool_size(raw, "ZERO_PG_POOL_MIN", 2)
+        pg_pool_max = _read_pool_size(raw, "ZERO_PG_POOL_MAX", 20)
+        if pg_pool_min > pg_pool_max:
+            raise ConfigError("ZERO_PG_POOL_MIN must not exceed ZERO_PG_POOL_MAX.")
+
         settings = cls(
             zero_env=zero_env,  # type: ignore[arg-type]
             database_url=database_url,
@@ -365,6 +373,8 @@ class Settings(BaseModel):
             polling_interval_seconds=polling_interval_seconds,
             combined_test_command=combined_test_command,
             combined_test_timeout_seconds=combined_test_timeout_seconds,
+            pg_pool_min=pg_pool_min,
+            pg_pool_max=pg_pool_max,
         )
         settings._enforce_fail_closed_rules()
         return settings
@@ -502,20 +512,61 @@ def _read_positive_float(raw: dict[str, str], key: str, default: float) -> float
     return value
 
 
+def _read_pool_size(raw: dict[str, str], key: str, default: int) -> int:
+    """Read a bounded pool-size integer (GAP 2)."""
+    value_raw = raw.get(key)
+    if value_raw is None or not value_raw.strip():
+        return default
+    try:
+        value = int(value_raw)
+    except ValueError as exc:
+        raise ConfigError(f"{key} must be an integer.") from exc
+    if not 1 <= value <= 100:
+        raise ConfigError(f"{key} must be between 1 and 100.")
+    return value
+
+
 def _require_supported_database_scheme(database_url: str) -> None:
     """Refuse database URLs whose backend this release does not ship.
 
-    Configuration acceptance and runtime capability must agree: a URL
-    that would fail later inside :func:`create_app` is rejected here,
-    at the trust boundary, with an actionable message.
+    Configuration acceptance and runtime capability must agree. SQLite
+    is always available; PostgreSQL URLs are accepted only when the
+    ``[pg]`` extra (psycopg) is importable — otherwise the load fails
+    closed with an actionable error instead of a late runtime failure.
     """
     scheme = database_url.split(":", 1)[0].strip().lower()
-    if scheme != SUPPORTED_DATABASE_SCHEME:
+    if scheme == SUPPORTED_DATABASE_SCHEME:
+        return
+    if scheme in POSTGRESQL_DATABASE_SCHEMES:
+        if _postgres_driver_available():
+            return
         raise ConfigError(
-            f"Unsupported database URL scheme {scheme!r}: this release implements "
-            f"{SUPPORTED_DATABASE_SCHEME!r} only. Configure a SQLite database URL; "
-            f"production backends require an explicit persistence-layer port."
+            "ZERO_DATABASE_URL uses PostgreSQL but the [pg] extra is not "
+            "installed; install it with: pip install 'zero-develop[pg]'"
         )
+    supported = f"{SUPPORTED_DATABASE_SCHEME!r}"
+    if _postgres_driver_available():
+        supported += " and 'postgresql'"
+    raise ConfigError(
+        f"Unsupported database URL scheme {scheme!r}: this release implements "
+        f"{supported}. Configure a supported database URL."
+    )
+
+
+def _postgres_driver_available() -> bool:
+    """Probe psycopg importability once per process."""
+    global _PG_DRIVER_AVAILABLE
+    if _PG_DRIVER_AVAILABLE is None:
+        try:
+            import psycopg  # noqa: F401
+
+            _PG_DRIVER_AVAILABLE = True
+        except ImportError:
+            _PG_DRIVER_AVAILABLE = False
+    return _PG_DRIVER_AVAILABLE
+
+
+_PG_DRIVER_AVAILABLE: bool | None = None
 
 
 def _read_env(env_file: Path | str | None) -> dict[str, str]:

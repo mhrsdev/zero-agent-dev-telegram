@@ -92,11 +92,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_migrate(args: argparse.Namespace) -> int:
-    from zero.persistence.connection import Database
+    from zero.persistence.connection import open_database
     from zero.persistence.migrations import apply_migrations
 
     settings = _load(args.env_file)
-    database = Database(settings)
+    database = open_database(settings)
     applied = apply_migrations(database)
     print(json.dumps({"status": "ok", "applied": applied}))
     return 0
@@ -125,11 +125,11 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
 
 def _cmd_reconcile(args: argparse.Namespace) -> int:
     from zero.app.api import build_application_services
-    from zero.persistence.connection import Database
+    from zero.persistence.connection import open_database
     from zero.persistence.migrations import count_applied_migrations
 
     settings = _load(args.env_file)
-    database = Database(settings)
+    database = open_database(settings)
     # build_application_services returns (database, services) and runs
     # startup recovery as part of composition.
     _database, services = build_application_services(settings, database)

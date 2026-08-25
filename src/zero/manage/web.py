@@ -187,11 +187,11 @@ def _usage_summary(days: int = 30) -> list:
     try:
         from zero.app.services import build_services
         from zero.config import Settings
-        from zero.persistence.connection import Database
+        from zero.persistence.connection import open_database
         from zero.persistence.migrations import apply_migrations
 
         settings = Settings.load()
-        database = Database(settings)
+        database = open_database(settings)
         apply_migrations(database)
         svc = build_services(settings, database)
 

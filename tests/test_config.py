@@ -205,12 +205,17 @@ def test_production_manual_provisioning_opt_in_is_accepted(
 def test_unsupported_database_scheme_fails_at_config_load(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A PostgreSQL-style URL must be rejected by configuration loading,
-    not later inside the application factory."""
+    """An unknown URL scheme must be rejected by configuration loading,
+    not later inside the application factory.
+
+    GAP 2 note: ``postgresql://`` is now *accepted* when the [pg] extra
+    is installed and fails closed with an actionable error otherwise;
+    only truly unimplemented schemes (e.g. MySQL) hit this refusal.
+    """
     monkeypatch.setenv("ZERO_ENV", "production")
     monkeypatch.setenv("ZERO_SECRET_KEY", "x" * 64)
     monkeypatch.setenv("ZERO_BOOTSTRAP_TOKEN", "b" * 64)
-    monkeypatch.setenv("ZERO_DATABASE_URL", "postgresql://user:pw@db.example.invalid/zero")
+    monkeypatch.setenv("ZERO_DATABASE_URL", "mysql://user:pw@db.example.invalid/zero")
     with pytest.raises(ConfigError, match="Unsupported database URL scheme"):
         Settings.load()
 

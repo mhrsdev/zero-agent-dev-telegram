@@ -211,7 +211,9 @@ def build_application_services(
     exactly one composition path.
     """
     if database is None:
-        database = Database(settings)
+        from zero.persistence.connection import open_database
+
+        database = open_database(settings)
     apply_migrations(database)
     services = build_services(settings, database)
     if not settings.is_test:

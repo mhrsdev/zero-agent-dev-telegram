@@ -18,5 +18,28 @@
               zero-develop migrate &&
               uvicorn zero.main:app --host 0.0.0.0 --port 8000"
     restart: unless-stopped
+
+  # Optional PostgreSQL backend (GAP 2). Start with:
+  #   docker compose --profile pg up -d postgres
+  # then set ZERO_DATABASE_URL=postgresql://zero:zero@postgres:5432/zero
+  # and install the [pg] extra inside the zero service.
+  postgres:
+    image: postgres:16
+    profiles: ["pg"]
+    environment:
+      POSTGRES_USER: zero
+      POSTGRES_PASSWORD: zero
+      POSTGRES_DB: zero
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zero -d zero"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
 volumes:
   zero-data:
+  pg-data:
