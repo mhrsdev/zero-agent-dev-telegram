@@ -7,7 +7,7 @@
 Coordinate multiple people and AI agents on one codebase without mixing project state,
 identity, context, memory, or working trees.
 
-[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-control_plane-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Status: Phase 9 checkpoint](https://img.shields.io/badge/status-Phase_9_checkpoint-6f42c1)](docs/CURRENT_STATE_LEDGER.md)
 [![Scope: development only](https://img.shields.io/badge/scope-development_only-f0ad4e)](#current-status)
@@ -111,15 +111,15 @@ Interactive API documentation is available from the running application at `/doc
 ### Run locally
 
 ```bash
-git clone https://github.com/mhrsdev/zero-agent-dev.git
-cd zero-agent-dev
+git clone https://github.com/mhrsdev/zero-agent-dev-telegram.git
+cd zero-agent-dev-telegram
 
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e ".[dev]"
 
 export ZERO_ENV=development
-zero-develop
+zero-develop serve
 ```
 
 Open:
@@ -233,7 +233,7 @@ The current `BackupService` produces an authenticated encrypted backup only when
 ## Repository layout
 
 ```text
-zero-agent-dev/
+zero-agent-dev-telegram/
 ├── docs/
 │   ├── decisions/             # architecture decision records
 │   ├── CURRENT_STATE_LEDGER.md
@@ -281,5 +281,4 @@ when the evidence boundary changes.
 
 ## License
 
-The package metadata in `pyproject.toml` declares the project as MIT-licensed. A standalone root
-`LICENSE` file is not currently included in this repository.
+This project is MIT-licensed; see the root [`LICENSE`](LICENSE) file.

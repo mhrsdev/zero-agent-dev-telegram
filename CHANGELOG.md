@@ -4,6 +4,53 @@ All notable changes to Zero Develop are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions
 are milestone-based rather than semver until 1.0.
 
+## [Unreleased] — engineering pass (analysis, fixes, consolidation)
+
+### Fixed
+
+- **Wizard group discovery crashed with `NameError`**:
+  `probes.telegram_recent_chats` referenced an undefined module
+  global; it now uses the shared `_telegram_base()` helper. Covered
+  by a regression test driving a local HTTP stub through
+  `ZERO_TELEGRAM_API_BASE`.
+- **Pool misconfiguration masked by an install hint**: pool bounds
+  are validated before the `[pg]` capability gate, so
+  `ZERO_PG_POOL_MIN > ZERO_PG_POOL_MAX` reports the real error even
+  on hosts without psycopg.
+- **Release gate rejected every build**: the hand-maintained expected
+  migration list stopped at 0028 while the tree ships 32 migrations;
+  the set is now derived from the migrations directory, and a
+  regression test guards against both list drift and a silently
+  empty gate.
+- **CI release smoke asserted the wrong CLI contract**: bare
+  `zero-develop` exits in argparse now that subcommands are required;
+  the fail-closed probe and server start both invoke
+  `zero-develop serve` explicitly.
+- **Load-flaky provider retry test**: the wall-clock budget
+  (`elapsed < 2.0s`) measured loopback latency under load; the test
+  now records `time.sleep` inputs and asserts Retry-After: 0
+  produces exactly two zero-second sleeps.
+
+### Changed
+
+- Dev dependencies now include `httpx2>=2.0.0`: starlette >=1.0
+  prefers it for `TestClient`, and its fallback warning tripped the
+  repo's fail-closed warnings policy on fresh installs.
+- `$ZERO_HOME` resolution consolidated into
+  `zero.manage.core.config.zero_home`; seven duplicated readers were
+  removed with unchanged behavior.
+
+### Removed
+
+- Accidentally committed SQLite sidecar files (`zero_develop.db-shm`,
+  `zero_develop.db-wal`); ignore patterns extended to `*.db-shm` /
+  `*.db-wal`. A byte-level scan found no secrets in the blobs.
+
+### Documentation
+
+- README corrected (Python floor is 3.11+, clone URL, `serve`
+  subcommand, LICENSE reference); current-state ledger repopulated.
+
 ## [Unreleased] — independent audit fixes (Phase 3–17 findings)
 
 Every fix has a reproduction + regression test under `tests/test_audit_*`
