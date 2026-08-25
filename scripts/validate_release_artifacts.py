@@ -18,39 +18,16 @@ import zipfile
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 
+# Expected migrations come from the release source tree rather than a
+# hand-maintained copy: a frozen list went stale the moment migrations
+# 0029/0030 shipped and failed every release build. Deriving the set
+# keeps the gate's real contract — artifacts must match the source
+# tree they were built from — without a second list to forget.
 EXPECTED_MIGRATIONS = frozenset(
-    {
-        "0001_initial",
-        "0002_identity_authorization_tools_audit",
-        "0003_plan_lifecycle",
-        "0004_execution_graph",
-        "0005_worktrees_and_repositories",
-        "0006_agent_types",
-        "0007_artifacts_rag_context",
-        "0008_provider_adapters",
-        "0009_integration_merge",
-        "0010_interface_adapters",
-        "0011_security_hardening",
-        "0012_f03_f04_f05_f06_f18_f19_security_state_integrity",
-        "0012_interface_delivery",
-        "0012_remediation_integration_evidence",
-        "0013_provider_usage_nullable_dedup",
-        "0014_interface_binding_scoped_claims",
-        "0015_task_artifact_immutability",
-        "0016_artifact_provenance",
-        "0017_cross_project_lineage",
-        "0018_provider_request_identity",
-        "0019_provider_lineage",
-        "0020_interface_claim_fencing",
-        "0021_combined_test_evidence",
-        "0022_result_deliveries",
-        "0023_result_delivery_outcome_fencing",
-        "0024_provider_request_lease_fencing",
-        "0025_project_lineage_hardening",
-        "0026_project_ownership_and_legacy_provider_recovery",
-        "0027_remaining_project_lineage",
-        "0028_secret_key_versioning",
-    }
+    path.stem
+    for path in sorted(
+        (Path(__file__).resolve().parents[1] / "src/zero/persistence/migrations").glob("*.sql")
+    )
 )
 
 REQUIRED_MODULES = frozenset(

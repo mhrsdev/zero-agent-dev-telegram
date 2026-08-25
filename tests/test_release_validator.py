@@ -69,3 +69,17 @@ def test_raw_credential_scan_reports_category_without_value() -> None:
         findings,
     )
     assert findings == {"probe:bearer_token": 1}
+
+
+def test_expected_migrations_match_source_tree() -> None:
+    """The gate must track the real migrations directory.
+
+    Guards against both regressions that broke releases before: a
+    hand-maintained frozen list drifting out of sync, and silent
+    path-resolution breakage that would make the expected set empty
+    (an empty gate passes anything).
+    """
+    migrations_dir = Path(__file__).parents[1] / "src" / "zero" / "persistence" / "migrations"
+    from_disk = {path.stem for path in migrations_dir.glob("*.sql")}
+    assert _VALIDATOR.EXPECTED_MIGRATIONS == from_disk
+    assert len(_VALIDATOR.EXPECTED_MIGRATIONS) >= 30
