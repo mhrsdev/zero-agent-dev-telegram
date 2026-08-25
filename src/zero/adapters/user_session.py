@@ -117,8 +117,8 @@ def run_session_login(
     finally:
         try:
             client.disconnect()
-        except Exception:  # noqa: BLE001 - best-effort teardown
-            pass
+        except Exception as exc:  # noqa: BLE001 - best-effort teardown
+            logger.debug("login disconnect failed: %s", type(exc).__name__)
     # Local secrets go out of scope here; nothing was logged or stored.
     return str(session_string)
 
@@ -211,8 +211,8 @@ class UserSessionTelegramAdapter(BaseMessagingAdapter):
         if client is not None and self._loop is not None:
             try:
                 self._submit(client.disconnect())
-            except Exception:  # noqa: BLE001 - teardown best-effort
-                pass
+            except Exception as exc:  # noqa: BLE001 - teardown best-effort
+                logger.debug("disconnect during close failed: %s", type(exc).__name__)
         if self._owns_loop and self._loop is not None:
             self._loop.stop()
             self._loop = None
@@ -270,7 +270,7 @@ class UserSessionTelegramAdapter(BaseMessagingAdapter):
 
 def build_adapter_from_secrets(event_handler, *, resolve_secret) -> UserSessionTelegramAdapter:
     """Compose the adapter from encrypted refs resolved at runtime."""
-    api_id_raw = resolve_secret("telegram_session_api_id")
+    api_id = resolve_secret("telegram_session_api_id")
     api_hash = resolve_secret("telegram_session_api_hash")
     session_string = resolve_secret("telegram_session_string")
     return UserSessionTelegramAdapter(

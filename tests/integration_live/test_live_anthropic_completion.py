@@ -6,7 +6,7 @@ import pytest
 
 pytestmark = [pytest.mark.live_provider]
 
-from conftest import ANTHROPIC_KEY, skip_anthropic  # noqa: E402
+from conftest import ANTHROPIC_KEY, skip_anthropic
 
 
 @skip_anthropic
@@ -19,9 +19,7 @@ def test_live_anthropic_completion():
 
     adapter = AnthropicMessagesProviderAdapter(
         api_key=ANTHROPIC_KEY,
-        base_url=os.environ.get(
-            "LIVE_ANTHROPIC_BASE_URL", "https://api.anthropic.com"
-        ),
+        base_url=os.environ.get("LIVE_ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
         timeout_seconds=60.0,
     )
     request = CanonicalRequest(

@@ -6,7 +6,7 @@ import pytest
 
 pytestmark = [pytest.mark.live_provider]
 
-from conftest import OPENAI_KEY, skip_openai  # noqa: E402
+from conftest import OPENAI_KEY, skip_openai
 
 
 @skip_openai

@@ -1,6 +1,20 @@
 # GAP 8 Design — Subagent Delegation
 
-Status: design accepted · Phase 6 (after Phase 2 streaming/chat)
+Status: implemented (see implementation note below) · Phase 6
+
+## Implementation note (deviation from this design)
+
+The shipped implementation runs delegated children as **isolated
+in-process sub-runs** rather than durable synthetic task rows:
+`WorkerService` has no mid-execution task-creation primitive, and
+adding one (graph surgery, readiness re-evaluation, lease plumbing)
+outweighed the benefit for v1. Every acceptance guarantee is preserved
+and tested: inline results, `sub_agent_type` usage tagging with
+`is_whole_tree=False`, depth cap 3 via a ContextVar,
+intersection-only tool narrowing with workspace tools excluded by
+default, and error-payload isolation. Concurrency is bounded by the
+parent's single agent-type instance lease; children execute
+sequentially within it.
 
 ## Problem
 

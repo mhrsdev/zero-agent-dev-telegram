@@ -8,7 +8,7 @@ import pytest
 
 pytestmark = [pytest.mark.live_provider]
 
-from conftest import OPENAI_KEY, skip_openai  # noqa: E402
+from conftest import OPENAI_KEY, skip_openai
 
 
 @skip_openai
@@ -55,7 +55,9 @@ def test_live_provider_streaming_arrives_incrementally():
     assert saw_end is True
     # Incremental delivery: deltas do not all land in one instant.
     assert len(arrival_times) >= 2
-    span = arrival_times[-1] - min(arrival_times[:-1]) if len(arrival_times) > 2 else (
-        arrival_times[-1] - arrival_times[0]
+    span = (
+        arrival_times[-1] - min(arrival_times[:-1])
+        if len(arrival_times) > 2
+        else (arrival_times[-1] - arrival_times[0])
     )
     assert span >= 0.01 or len(arrival_times) >= 3

@@ -6,7 +6,7 @@ import pytest
 
 pytestmark = [pytest.mark.live_telegram]
 
-from conftest import skip_telegram  # noqa: E402
+from conftest import skip_telegram
 
 
 @skip_telegram

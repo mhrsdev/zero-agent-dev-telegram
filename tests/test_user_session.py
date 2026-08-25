@@ -202,7 +202,7 @@ class TestSessionLogin:
                     return
                 # This account always demands the 2FA step.
                 captured["otp_seen"] = code
-                raise Exception("need password")
+                raise RuntimeError("need password")
 
             def disconnect(self):
                 pass

@@ -192,7 +192,7 @@ class TelegramAdapter(BaseMessagingAdapter):
         response = self._call_api("getMe", {})
         data = self._response_json(response)
         if not isinstance(data, Mapping) or not isinstance(data.get("result"), Mapping):
-            raise RuntimeError("Telegram getMe returned an unexpected payload")
+            raise TypeError("Telegram getMe returned an unexpected payload")
         return dict(data["result"])
 
     def send_message(
