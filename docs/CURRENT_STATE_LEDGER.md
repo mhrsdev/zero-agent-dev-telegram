@@ -7,11 +7,15 @@ August 2026 engineering pass.
 
 ## Verified locally (deterministic, Windows host)
 
-- Full deterministic suite green: **791 passed, 0 failed, 31 skipped**
-  under `ZERO_ENV=test`. Skips are platform-gated POSIX cases,
-  optional extras (tokenizer, psycopg), and credential-gated live
-  tests that skip by design.
+- Full deterministic suite green: **794 passed, 0 failed, 31 skipped**
+  (825 collected) under `ZERO_ENV=test`. Skips are platform-gated
+  POSIX cases, optional extras (tokenizer, psycopg), and
+  credential-gated live tests that skip by design.
 - Ruff lint and format clean across `src/`, `tests/`, and `scripts/`.
+- HTTP API decomposed into `zero.app.routers`: sixteen per-domain
+  router modules plus shared `deps.py`/`models.py`; `app/api.py`
+  keeps application assembly only (304 lines). Golden route/OpenAPI
+  tables prove the public surface identical across the move.
 - Release artifact gate green: wheel and sdist build from a clean
   committed tree; `scripts/validate_release_artifacts.py` exits 0
   (all 32 migrations matched, required modules present, no unsafe

@@ -4,6 +4,31 @@ All notable changes to Zero Develop are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions
 are milestone-based rather than semver until 1.0.
 
+## [Unreleased] — HTTP API decomposition
+
+### Changed
+
+- `src/zero/app/api.py` (2,801 lines) split into the
+  `zero.app.routers` package: sixteen per-domain router modules
+  (`auth`, `identity`, `authorization`, `secret`, `tool`, `audit`,
+  `plan`, `execution`, `artifact`, `topology`, `provider`,
+  `worktree`, `integration`, `interface`, `webhook`, `health`) plus
+  shared `deps.py` (`authorized_actor`/`request_project_actor`;
+  45 renamed call sites) and `models.py` (the `_StrictRequest`
+  request-model family). `api.py` retains application assembly only
+  (304 lines), with the sixteen `register_*` call sites kept in
+  their original registration order.
+- Public HTTP behavior was pinned before any motion by
+  `tests/test_api_route_surface.py`: all 89 JSON routes, a
+  duplicate-registration guard, and an OpenAPI contract that also
+  covers the 19 management-web operations which reach the schema
+  through the include wrapper. Green before, during, and after the
+  split.
+- Test-surface follow-up: the anti-spoofing test resolves
+  `StoreArtifactRequest` from its canonical module
+  (`zero.app.routers.models`) instead of the old `app.api`
+  attribute surface; the assertions themselves are unchanged.
+
 ## [Unreleased] — engineering pass (analysis, fixes, consolidation)
 
 ### Fixed
