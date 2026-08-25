@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import importlib
-
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
 from zero.app.api import create_app
+from zero.app.routers.models import StoreArtifactRequest
 from zero.config import Settings
 
 EXPECTED_ROUTE_PREFIXES = (
@@ -33,12 +32,11 @@ def test_gate_d_api_registers_all_project_scoped_surface_routes(test_settings: S
 
 
 def test_new_mutation_models_reject_caller_supplied_actor_context():
-    api = importlib.import_module("zero.app.api")
-    model = getattr(api, "StoreArtifactRequest", None)
-    assert model is not None, "artifact API request model is missing"
-    assert "actor_id" not in model.model_fields
+    # The strict-model family lives in zero.app.routers.models since
+    # the api split; the anti-spoofing contract below is unchanged.
+    assert "actor_id" not in StoreArtifactRequest.model_fields
     with pytest.raises(ValidationError):
-        model(kind="other", content="evidence", actor_id="spoofed")
+        StoreArtifactRequest(kind="other", content="evidence", actor_id="spoofed")
 
 
 @pytest.mark.asyncio
