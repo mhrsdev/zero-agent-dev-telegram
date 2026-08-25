@@ -219,6 +219,17 @@ class Settings(BaseModel):
 
         # Normalize sqlite:// prefixes to a canonical form.
         database_url = _normalize_sqlite_url(database_url)
+
+        # Structural validation that needs no optional dependency runs
+        # before capability gates: a pool-bound mistake must surface as
+        # a POOL_MIN/MAX error rather than an instruction to install
+        # the [pg] extra, which would mask the real misconfiguration on
+        # hosts where psycopg is absent.
+        pg_pool_min = _read_pool_size(raw, "ZERO_PG_POOL_MIN", 2)
+        pg_pool_max = _read_pool_size(raw, "ZERO_PG_POOL_MAX", 20)
+        if pg_pool_min > pg_pool_max:
+            raise ConfigError("ZERO_PG_POOL_MIN must not exceed ZERO_PG_POOL_MAX.")
+
         _require_supported_database_scheme(database_url)
 
         log_level = (raw.get("ZERO_LOG_LEVEL") or "INFO").upper()
@@ -342,11 +353,6 @@ class Settings(BaseModel):
         combined_test_timeout_seconds = int(
             _read_positive_float(raw, "ZERO_COMBINED_TEST_TIMEOUT_SECONDS", 300.0)
         )
-
-        pg_pool_min = _read_pool_size(raw, "ZERO_PG_POOL_MIN", 2)
-        pg_pool_max = _read_pool_size(raw, "ZERO_PG_POOL_MAX", 20)
-        if pg_pool_min > pg_pool_max:
-            raise ConfigError("ZERO_PG_POOL_MIN must not exceed ZERO_PG_POOL_MAX.")
 
         telegram_mode = raw.get("ZERO_TELEGRAM_MODE", "bot_api").strip().lower()
         if telegram_mode not in {"bot_api", "user_session"}:
