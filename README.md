@@ -171,11 +171,25 @@ automatically. Never commit a real `.env`.
 | Variable | Required | Purpose |
 |---|---|---|
 | `ZERO_ENV` | Always | Selects `development`, `test`, or `production`. |
-| `ZERO_DATABASE_URL` | Production | Explicit database location; development and tests receive isolated defaults. |
-| `ZERO_SECRET_KEY` | Production | Secret material of at least 32 bytes; redacted from representations and logs. |
+| `ZERO_DATABASE_URL` | Production | Explicit database location; development and tests receive isolated defaults. `postgresql://` requires the `[pg]` extra. |
+| `ZERO_SECRET_KEY` | Production | Secret material of at least 32 bytes; redacted from representations and logs. `zero setup` bootstraps `$ZERO_HOME/secret.key` + `.env` when absent. |
 | `ZERO_LOG_LEVEL` | No | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 | `ZERO_AUTH_REQUIRED` | No | Defaults to enabled in production and disabled elsewhere. |
 | `ZERO_BOOTSTRAP_TOKEN` | When protected bootstrap is used | Authorizes first-user bootstrap without storing the raw token in application state. |
+| `ZERO_PANEL_PORT` | No | Port for the engine/admin GUI (default `8000`); the TUI reads the same value. |
+| `ZERO_SANDBOX_EXECUTOR` | No | `none` (default), `docker`, or `firejail`. Required for worktree commands in production. |
+| `ZERO_SANDBOX_IMAGE` | No | Pinned container image for the docker sandbox (default `python:3.12-slim`). |
+| `ZERO_TELEGRAM_MODE` | No | `bot_api` (default) or explicit `user_session` opt-in (needs `[session]` extra). |
+| `ZERO_TELEGRAM_API_BASE` | No | Override for Bot API base (self-hosted gateways / tests). |
+| `ZERO_MCP_SERVERS` | No | JSON array of MCP stdio servers to expose as tools. |
+| `ZERO_CHAT_RATE_LIMIT_PER_MIN` | No | Admin chat endpoint budget per minute (default `10`). |
+| `ZERO_DECOMPOSITION_ENABLED` | No | Opt-in LLM plan decomposition (`1`/`true`). |
+| `ZERO_PG_POOL_MIN` / `ZERO_PG_POOL_MAX` | No | PostgreSQL pool bounds (defaults `2`/`20`). |
+| `ZERO_ENABLE_LIVE_TESTS` | No | Must be `1` plus credentials to run `tests/integration_live`. See [docs/LIVE_TESTING.md](docs/LIVE_TESTING.md). |
+
+Optional extras: `[tokenizer]` tiktoken counting, `[pg]` PostgreSQL,
+`[mcp]` Model Context Protocol, `[session]` user-session Telegram,
+`[tui]` terminal UI.
 
 Production mode refuses missing secrets, in-memory persistence, and development database paths.
 See [ADR 0004](docs/decisions/0004-configuration-as-trust-boundary.md) for the full contract.

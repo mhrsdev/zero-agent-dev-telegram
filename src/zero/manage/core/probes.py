@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import os
+
 import httpx
 
-TELEGRAM_API = "https://api.telegram.org"
+
+def _telegram_base() -> str:
+    """Bot API base; ZERO_TELEGRAM_API_BASE supports gateways/tests."""
+    return os.environ.get("ZERO_TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 
 
 def telegram_get_me(bot_token: str, *, timeout: float = 10.0) -> dict[str, object]:
     """Validate a bot token via getMe; returns {ok, username?, id?, error?}."""
-    url = f"{TELEGRAM_API}/bot{bot_token}/getMe"
+    url = f"{_telegram_base()}/bot{bot_token}/getMe"
     try:
         resp = httpx.get(url, timeout=timeout)
     except httpx.RequestError as exc:

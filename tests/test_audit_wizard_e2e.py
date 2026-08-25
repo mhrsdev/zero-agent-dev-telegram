@@ -88,9 +88,7 @@ def cli_home(tmp_path, monkeypatch):
 def test_non_interactive_setup_stores_secrets_and_writes_config(
     cli_home, api_server, monkeypatch, capsys
 ):
-    from zero.manage.core import probes
-
-    monkeypatch.setattr(probes, "TELEGRAM_API", api_server)
+    monkeypatch.setenv("ZERO_TELEGRAM_API_BASE", api_server)
 
     rc = main(
         [
@@ -177,9 +175,7 @@ def test_non_interactive_setup_stores_secrets_and_writes_config(
 def test_non_interactive_setup_fails_cleanly_on_bad_token(
     cli_home, api_server, monkeypatch, capsys
 ):
-    from zero.manage.core import probes
-
-    monkeypatch.setattr(probes, "TELEGRAM_API", api_server)
+    monkeypatch.setenv("ZERO_TELEGRAM_API_BASE", api_server)
     with pytest.raises(SystemExit) as excinfo:
         main(
             [

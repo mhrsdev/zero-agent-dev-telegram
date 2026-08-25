@@ -4,6 +4,67 @@ All notable changes to Zero Develop are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions
 are milestone-based rather than semver until 1.0.
 
+## [Unreleased] — independent audit fixes (Phase 3–17 findings)
+
+Every fix has a reproduction + regression test under `tests/test_audit_*`
+plus targeted suites; full evidence in the audit report.
+
+### Fixed — Critical / High
+
+- **Telegram intake crashed whenever managed config set
+  `access.owner_project_id`** (`_CfgView` walrus/del leftover raised
+  UnboundLocalError on every event). Groups now flow as plain dicts and
+  `policy.build_gate` normalizes both dict- and object-shaped groups.
+- **Owners were never recognized by the access-policy gate**: the owner
+  lookup called a nonexistent repository method and the broad except
+  swallowed it; now calls `list_external_identities_for_user` and logs
+  lookup failures.
+- **`POST /admin/providers/{id}/test` required no session or CSRF**,
+  letting anyone who could reach the loopback port trigger paid provider
+  probes. Now guarded like every other mutating admin route.
+- **Engine bearer middleware made `/admin` unreachable in production**
+  (two auth systems collided). `/admin/*` is exempt from the bearer
+  gate; the GUI keeps its own scrypt-password + CSRF scheme.
+- **`zero setup` could never finish**: no secret store was wired, so
+  commit always refused with "secrets not stored". The CLI now persists
+  secrets through the encrypted engine store, bootstraps
+  `ZERO_SECRET_KEY` into `$ZERO_HOME/secret.key` + `.env` (0600), routes
+  non-interactive steps through validation, and reports commit failures
+  as clean exit-code-2 messages instead of tracebacks.
+
+### Fixed — Medium
+
+- `zero doctor` crashed with a raw YAML parser error on corrupted
+  config.yaml; it now reports a failing `config` check.
+- Three CLI commands (`capabilities`, `backup-daemon`, `backup-status`)
+  had parsers but were unreachable from dispatch.
+- Wizard silently dropped collected values: fallback-models CSV,
+  agents default agent for groups, updates auto-apply, group discovery
+  token field name. The unwired compaction-threshold field was removed
+  rather than pretending to persist it.
+- TUI hardcoded admin port 8787 while every server start used 8000;
+  both now honor `ZERO_PANEL_PORT`.
+- Dashboard linked to nonexistent `/web/projects/new`.
+- Password change did not invalidate existing admin sessions; sessions
+  are now purged on rotation. Login brute-force lockout added
+  (5 failures / 10 min per client IP).
+- `_ensure_setup_code` crashed first-run bootstrap when `$ZERO_HOME`
+  did not exist.
+- CLI engine bridge leaked one real HTTP client per invocation in dev
+  mode; transports are closed after wizard secret operations.
+
+### Changed
+
+- Doctor `--fix` no longer claims automated fixes were applied.
+- GUI usage loader logs query failures instead of rendering empty
+  tables silently.
+- Plugins receive real managed config and a name-scoped secret facade
+  (management project only) at composition time.
+- `probes.telegram_get_me` honors `ZERO_TELEGRAM_API_BASE` (self-hosted
+  Bot API gateways / tests).
+- README configuration table documents all new environment variables
+  and optional extras.
+
 ## [Unreleased] — production-readiness gap closure (GAPs 1–12)
 
 Design documents for every gap: `docs/gap-designs/` (committed before

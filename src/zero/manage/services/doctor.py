@@ -53,6 +53,12 @@ class DoctorService:
             except ConfigError as exc:
                 cfg_err = str(exc)
                 add("config", False, cfg_err)
+            except Exception as exc:  # noqa: BLE001 - audit fix: corrupted
+                # YAML used to raise raw parser errors here, crashing
+                # `zero doctor` on the most common breakage it exists
+                # to report.
+                cfg_err = f"unreadable ({type(exc).__name__})"
+                add("config", False, cfg_err)
         else:
             add("config", False, "not initialized — run: zero setup")
 
