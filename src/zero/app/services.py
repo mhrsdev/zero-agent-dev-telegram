@@ -407,6 +407,7 @@ def build_services(
         context_builder=context_builder,
         agent_type_repo=agent_type_repo,
         compaction=compaction_service,
+        enable_delegation=True,
     )
     scheduler_service = SchedulerService(
         plans=plan_service,

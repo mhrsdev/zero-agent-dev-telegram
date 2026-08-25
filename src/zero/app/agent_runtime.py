@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from zero.app.artifact_service import ArtifactService
 from zero.app.authorization_service import AuthorizationService
+from zero.app.delegation import DELEGATE_TOOL_NAME
 from zero.app.provider_service import ProviderService
 from zero.app.tool_service import ToolService
 from zero.app.worker_service import WorkerService
@@ -177,6 +178,7 @@ class AgentRuntime:
         agent_type_repo: AgentTypeRepository | None = None,
         compaction: CompactionService | None = None,
         test_command: tuple[str, ...] | None = ("pytest", "-q"),
+        enable_delegation: bool = False,
     ) -> None:
         self._worker = worker
         self._providers = providers
@@ -188,6 +190,9 @@ class AgentRuntime:
         self._agent_type_repo = agent_type_repo
         self._compaction = compaction
         self._test_command = test_command
+        # GAP 8: when enabled, the model may call the `delegate` tool to
+        # run bounded subtasks in isolated child contexts.
+        self._enable_delegation = enable_delegation
 
     def resolve_agent_policy(
         self,
@@ -913,9 +918,9 @@ class AgentRuntime:
         model can emit well-typed arguments; unknown names fall back to
         bare-name declarations rather than being dropped.
         """
-        if not tool_names:
+        if not tool_names and not self._enable_delegation:
             return ()
-        if self._tools is None:
+        if self._tools is None and not self._enable_delegation:
             return tool_names
         by_name: dict[str, Any] = {}
         try:
@@ -935,6 +940,15 @@ class AgentRuntime:
                     parameters=dict(getattr(tool, "input_schema", None) or {}) or None,
                 )
             )
+        # GAP 8: expose `delegate` while nesting budget remains.
+        from zero.app.delegation import (
+            MAX_DELEGATION_DEPTH,
+            current_delegation_depth,
+            delegate_declaration,
+        )
+
+        if self._enable_delegation and current_delegation_depth() < MAX_DELEGATION_DEPTH:
+            declarations.append(delegate_declaration())
         return tuple(declarations)
 
     def _find_task(
@@ -969,6 +983,128 @@ class AgentRuntime:
             stream_callback(execution_value, payload)
 
         return observer
+
+    def _execute_delegation(
+        self,
+        *,
+        call_arguments: str,
+        parent_allowed_tools: tuple[str, ...],
+        execution_id: ExecutionId,
+        project_id: ProjectId,
+        actor_id: UserId,
+        provider: str,
+        model_name: str,
+    ) -> dict[str, Any]:
+        """Run one delegated subtask inline and return its result payload.
+
+        The child runs with a fresh conversation, an intersection-narrowed
+        tool set, and provider requests tagged ``sub_agent`` so usage
+        accounting keeps whole-tree aggregation correct. Failures return
+        structured error payloads — delegation never crashes the parent.
+        """
+        from zero.app.delegation import (
+            _WORKSPACE_TOOLS,
+            MAX_DELEGATION_DEPTH,
+            current_delegation_depth,
+            delegation_depth_increased,
+        )
+
+        def _error(message: str) -> dict[str, Any]:
+            return {"status": "error", "error": message}
+
+        try:
+            input_data = json.loads(call_arguments or "{}")
+        except json.JSONDecodeError:
+            return _error("delegate arguments were not valid JSON")
+        if not isinstance(input_data, dict):
+            return _error("delegate arguments must be a JSON object")
+        objective = str(input_data.get("objective") or "").strip()
+        if not objective or len(objective) > 8192:
+            return _error("delegate requires a non-empty objective")
+        depth = current_delegation_depth()
+        if depth >= MAX_DELEGATION_DEPTH:
+            return _error(
+                f"delegation depth limit reached ({MAX_DELEGATION_DEPTH}); "
+                "complete the task yourself"
+            )
+
+        requested_tools = tuple(str(name) for name in (input_data.get("tools") or ())[:32])
+        allowed = [n for n in requested_tools if n in set(parent_allowed_tools)]
+        if not requested_tools:
+            # Default to the parent's non-workspace tools.
+            allowed = [n for n in parent_allowed_tools if n not in _WORKSPACE_TOOLS]
+        child_model = str(input_data.get("model") or "").strip() or None
+
+        with delegation_depth_increased():
+            messages = [CanonicalMessage(role="user", content=objective)]
+            current_request = CanonicalRequest(
+                provider=provider,
+                model_name=child_model or model_name,
+                system_message=(
+                    "You are a focused sub-agent completing one delegated "
+                    "subtask. Return only the final answer."
+                ),
+                messages=tuple(messages),
+                tools=tuple(self._tool_declarations(tuple(allowed))),
+                max_tokens=1024,
+            )
+            final_content = ""
+            completed = False
+            for _round in range(4):
+                _provider_request, response = self._providers.send_request_with_fallback(
+                    project_id=project_id,
+                    actor_id=actor_id,
+                    execution_id=execution_id,
+                    request=current_request,
+                    agent_scope="sub_agent_type",
+                    source="system",
+                )
+                if not response.tool_calls:
+                    final_content = response.content
+                    completed = True
+                    break
+                messages.append(
+                    CanonicalMessage(
+                        role="assistant",
+                        content=response.content,
+                        tool_calls=tuple(
+                            (c.tool_name, c.tool_call_id, c.arguments) for c in response.tool_calls
+                        ),
+                    )
+                )
+                for call in response.tool_calls:
+                    payload_text = f"tool {call.tool_name} unavailable to sub-agents"
+                    if self._tools is not None and call.tool_name in allowed:
+                        try:
+                            tool_input = json.loads(call.arguments or "{}")
+                            result = self._tools.invoke(
+                                project_id=project_id,
+                                actor_id=actor_id,
+                                agent_scope="main_worker",
+                                tool_name=call.tool_name,
+                                input_data=tool_input if isinstance(tool_input, dict) else {},
+                                execution_id=execution_id.value,
+                                source="system",
+                            )
+                            payload_text = result.model_facing
+                        except Exception as exc:  # noqa: BLE001 - tool failure is data
+                            payload_text = f"error: {type(exc).__name__}"
+                    messages.append(
+                        CanonicalMessage(
+                            role="tool",
+                            content=payload_text[:2000],
+                            tool_call_id=call.tool_call_id,
+                        )
+                    )
+                current_request = replace(current_request, messages=tuple(messages))
+            if not completed:
+                final_content = "(sub-agent exhausted its round budget)"
+        return {
+            "status": "completed",
+            "depth": depth + 1,
+            "tools_used": allowed,
+            "result": final_content[:4000],
+        }
 
     def _run_tool_rounds(
         self,
@@ -1040,6 +1176,26 @@ class AgentRuntime:
                 )
             )
             for call in current_response.tool_calls:
+                if call.tool_name == DELEGATE_TOOL_NAME and self._enable_delegation:
+                    # GAP 8: delegation is runtime-owned; it never flows
+                    # through the static tool registry.
+                    payload = self._execute_delegation(
+                        call_arguments=call.arguments,
+                        parent_allowed_tools=tool_names,
+                        execution_id=execution_id,
+                        project_id=project_id,
+                        actor_id=actor_id,
+                        provider=request.provider,
+                        model_name=request.model_name,
+                    )
+                    messages.append(
+                        CanonicalMessage(
+                            role="tool",
+                            content=json.dumps(payload, ensure_ascii=False),
+                            tool_call_id=call.tool_call_id,
+                        )
+                    )
+                    continue
                 if call.tool_name not in requested_names:
                     raise RuntimeToolError(
                         f"provider requested an undeclared tool {call.tool_name!r}"
