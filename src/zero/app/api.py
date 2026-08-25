@@ -47,6 +47,7 @@ from zero.app.interface_transport_service import (
     InterfaceScopeError,
     InterfaceTransportNotConfigured,
 )
+from zero.app.routers.deps import authorized_actor, request_project_actor
 from zero.app.services import Services, build_services
 from zero.config import Settings
 from zero.domain.authorization import AuthorizationError
@@ -373,31 +374,6 @@ _PUBLIC_PATHS = {
     "/web/login",
 }
 _PROJECT_PATH = re.compile(r"^/(?:web/)?projects/([^/]+)")
-
-
-def _request_project_actor(request: Request, services: Services, project_id: str) -> UserId:
-    try:
-        project = services.identity.get_project(ProjectId(project_id))
-    except (ProjectNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND) from exc
-    return getattr(request.state, "user_id", project.owner_user_id)
-
-
-def _authorized_actor(
-    request: Request,
-    services: Services,
-    project_id: str,
-    permission: str,
-) -> UserId:
-    """Resolve the request principal and authorize the target project."""
-    actor = _request_project_actor(request, services, project_id)
-    services.authorization.require_permission(
-        actor_id=actor,
-        project_id=ProjectId(project_id),
-        permission=permission,  # type: ignore[arg-type]
-        source="web",
-    )
-    return actor
 
 
 def _register_auth_middleware(app: FastAPI, services: Services, settings: Settings) -> None:
@@ -855,7 +831,7 @@ def _register_secret_routes(app: FastAPI, services: Services) -> None:
                 name=req.name,
                 secret_type=req.secret_type,  # type: ignore[arg-type]
                 value=req.value.get_secret_value(),
-                actor_id=_request_project_actor(request, services, project_id),
+                actor_id=request_project_actor(request, services, project_id),
                 source="web",
             )
         except ValueError:
@@ -881,7 +857,7 @@ def _register_secret_routes(app: FastAPI, services: Services) -> None:
 
         refs = services.secrets.list_for_project(
             project_id=ProjectId(project_id),
-            actor_id=_request_project_actor(request, services, project_id),
+            actor_id=request_project_actor(request, services, project_id),
             source="web",
         )
         return [
@@ -909,7 +885,7 @@ def _register_secret_routes(app: FastAPI, services: Services) -> None:
             services.secrets.revoke(
                 project_id=ProjectId(project_id),
                 secret_id=SecretReferenceId(secret_id),
-                actor_id=_request_project_actor(request, services, project_id),
+                actor_id=request_project_actor(request, services, project_id),
                 source="web",
             )
         except (SecretError, ValueError):
@@ -948,7 +924,7 @@ def _register_tool_routes(app: FastAPI, services: Services) -> None:
         try:
             grant = services.tools.grant_tool(
                 project_id=ProjectId(project_id),
-                actor_id=_request_project_actor(request, services, project_id),
+                actor_id=request_project_actor(request, services, project_id),
                 tool_id=ToolId(req.tool_id),
                 agent_scope=req.agent_scope,  # type: ignore[arg-type]
                 max_invocations=req.max_invocations,
@@ -983,7 +959,7 @@ def _register_tool_routes(app: FastAPI, services: Services) -> None:
 
         services.tools.revoke_tool_grant(
             project_id=ProjectId(project_id),
-            actor_id=_request_project_actor(request, services, project_id),
+            actor_id=request_project_actor(request, services, project_id),
             tool_id=ToolId(tool_id),
             agent_scope=agent_scope,  # type: ignore[arg-type]
             source="web",
@@ -999,7 +975,7 @@ def _register_tool_routes(app: FastAPI, services: Services) -> None:
         try:
             result = services.tools.invoke(
                 project_id=ProjectId(project_id),
-                actor_id=_request_project_actor(request, services, project_id),
+                actor_id=request_project_actor(request, services, project_id),
                 agent_scope=req.agent_scope,  # type: ignore[arg-type]
                 tool_name=req.tool_name,
                 input_data=req.input_data,
@@ -1053,7 +1029,7 @@ def _register_audit_routes(app: FastAPI, services: Services) -> None:
 
         events = services.audit.list_for_project(
             project_id=ProjectId(project_id),
-            actor_id=_request_project_actor(request, services, project_id),
+            actor_id=request_project_actor(request, services, project_id),
             limit=limit,
             offset=offset,
             source="web",
@@ -1807,7 +1783,7 @@ def _register_artifact_routes(app: FastAPI, services: Services) -> None:
     ) -> list[dict[str, Any]]:
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "project.view")
+        actor = authorized_actor(request, services, project_id, "project.view")
         artifacts = services.artifacts.list_artifacts(
             project_id=ProjectId(project_id),
             actor_id=actor,
@@ -1825,7 +1801,7 @@ def _register_artifact_routes(app: FastAPI, services: Services) -> None:
     ) -> dict[str, Any]:
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "agent.manage")
+        actor = authorized_actor(request, services, project_id, "agent.manage")
         try:
             artifact = services.artifacts.store_artifact(
                 project_id=ProjectId(project_id),
@@ -1846,7 +1822,7 @@ def _register_artifact_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.artifacts import ArtifactId
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "agent.manage")
+        actor = authorized_actor(request, services, project_id, "agent.manage")
         try:
             artifact = services.artifacts.get_artifact(
                 project_id=ProjectId(project_id),
@@ -1864,7 +1840,7 @@ def _register_artifact_routes(app: FastAPI, services: Services) -> None:
     ) -> list[dict[str, Any]]:
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         documents = services.artifacts.list_rag_documents(
             ProjectId(project_id),
             state=state,  # type: ignore[arg-type]
@@ -1881,7 +1857,7 @@ def _register_artifact_routes(app: FastAPI, services: Services) -> None:
     ) -> dict[str, Any]:
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "agent.manage")
+        actor = authorized_actor(request, services, project_id, "agent.manage")
         try:
             document = services.artifacts.ingest_rag_document(
                 project_id=ProjectId(project_id),
@@ -1902,7 +1878,7 @@ def _register_artifact_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.artifacts import RagDocumentId
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         try:
             document = services.artifacts.get_rag_document(
                 ProjectId(project_id), RagDocumentId(doc_id)
@@ -1917,7 +1893,7 @@ def _register_artifact_routes(app: FastAPI, services: Services) -> None:
     ) -> list[dict[str, Any]]:
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         if not 1 <= limit <= 100:
             raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
         results = services.artifacts.search_rag(
@@ -1929,7 +1905,7 @@ def _register_artifact_routes(app: FastAPI, services: Services) -> None:
     def rebuild_rag(request: Request, project_id: str) -> dict[str, Any]:
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "agent.manage")
+        actor = authorized_actor(request, services, project_id, "agent.manage")
         count = services.artifacts.rebuild_rag_index(
             project_id=ProjectId(project_id), actor_id=actor, source="web"
         )
@@ -1982,7 +1958,7 @@ def _register_topology_routes(app: FastAPI, services: Services) -> None:
     def list_agent_types(request: Request, project_id: str) -> list[dict[str, Any]]:
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         return [
             _agent_type_payload(item)
             for item in services.agent_types.list_types(ProjectId(project_id))
@@ -1998,7 +1974,7 @@ def _register_topology_routes(app: FastAPI, services: Services) -> None:
     ) -> dict[str, Any]:
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "agent.manage")
+        actor = authorized_actor(request, services, project_id, "agent.manage")
         try:
             item = services.agent_types.create_type(
                 project_id=ProjectId(project_id),
@@ -2021,7 +1997,7 @@ def _register_topology_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.agent_types import AgentTypeId
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         try:
             item = services.agent_types.get_type(ProjectId(project_id), AgentTypeId(type_id))
         except Exception as exc:
@@ -2033,7 +2009,7 @@ def _register_topology_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.agent_types import AgentTypeId
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         try:
             records = services.agent_types.list_knowledge_for_type(
                 ProjectId(project_id), AgentTypeId(type_id)
@@ -2053,7 +2029,7 @@ def _register_topology_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.agent_types import AgentTypeId
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "agent.manage")
+        actor = authorized_actor(request, services, project_id, "agent.manage")
         try:
             record = services.agent_types.add_knowledge(
                 project_id=ProjectId(project_id),
@@ -2073,7 +2049,7 @@ def _register_topology_routes(app: FastAPI, services: Services) -> None:
     def list_topology_snapshots(request: Request, project_id: str) -> list[dict[str, Any]]:
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         snapshots = services.agent_types.list_snapshots(ProjectId(project_id))
         return [
             {
@@ -2157,14 +2133,14 @@ def _register_provider_routes(app: FastAPI, services: Services) -> None:
 
     @app.get("/projects/{project_id}/providers", tags=["providers"])
     def list_project_provider_models(request: Request, project_id: str) -> list[dict[str, Any]]:
-        _authorized_actor(request, services, project_id, "model.change")
+        authorized_actor(request, services, project_id, "model.change")
         return [_provider_model_payload(item) for item in services.providers.list_models()]
 
     @app.get("/projects/{project_id}/providers/requests", tags=["providers"])
     def list_provider_requests(request: Request, project_id: str) -> list[dict[str, Any]]:
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "cost.view")
+        actor = authorized_actor(request, services, project_id, "cost.view")
         return [
             _provider_request_payload(item)
             for item in services.providers.list_provider_requests_for_project(
@@ -2179,7 +2155,7 @@ def _register_provider_routes(app: FastAPI, services: Services) -> None:
         """Operator queue: provider requests awaiting reconciliation."""
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "cost.view")
+        authorized_actor(request, services, project_id, "cost.view")
         return [
             _provider_request_payload(item)
             for item in services.providers.list_unknown_requests(ProjectId(project_id))
@@ -2198,7 +2174,7 @@ def _register_provider_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.identity import ProjectId
         from zero.domain.providers import ProviderRequestId
 
-        actor = _authorized_actor(request, services, project_id, "execution.start")
+        actor = authorized_actor(request, services, project_id, "execution.start")
         try:
             services.providers.reconcile_provider_request(
                 project_id=ProjectId(project_id),
@@ -2216,7 +2192,7 @@ def _register_provider_routes(app: FastAPI, services: Services) -> None:
     def list_provider_usage(request: Request, project_id: str) -> list[dict[str, Any]]:
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "cost.view")
+        actor = authorized_actor(request, services, project_id, "cost.view")
         return [
             _usage_payload(item)
             for item in services.providers.list_usage_records_for_project(
@@ -2265,7 +2241,7 @@ def _register_worktree_routes(app: FastAPI, services: Services) -> None:
     def list_repositories(request: Request, project_id: str) -> list[dict[str, Any]]:
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "project.view")
+        actor = authorized_actor(request, services, project_id, "project.view")
         return [
             _repository_payload(item)
             for item in services.worktree.list_repositories(
@@ -2285,7 +2261,7 @@ def _register_worktree_routes(app: FastAPI, services: Services) -> None:
     ) -> dict[str, Any]:
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "execution.start")
+        actor = authorized_actor(request, services, project_id, "execution.start")
         try:
             item = services.worktree.register_repository(
                 project_id=ProjectId(project_id),
@@ -2306,7 +2282,7 @@ def _register_worktree_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.execution import ExecutionId
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "project.view")
+        actor = authorized_actor(request, services, project_id, "project.view")
         if execution_id:
             items = services.worktree.list_worktrees_for_execution(
                 ProjectId(project_id),
@@ -2329,7 +2305,7 @@ def _register_worktree_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.identity import ProjectId
         from zero.domain.worktrees import WorktreeId
 
-        actor = _authorized_actor(request, services, project_id, "project.view")
+        actor = authorized_actor(request, services, project_id, "project.view")
         try:
             item = services.worktree.get_worktree(
                 ProjectId(project_id),
@@ -2402,7 +2378,7 @@ def _proposal_payload(item: Any) -> dict[str, Any]:
 def _register_integration_routes(app: FastAPI, services: Services) -> None:
     @app.get("/projects/{project_id}/integration", tags=["integration"])
     def integration_status(request: Request, project_id: str) -> dict[str, Any]:
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         return {
             "project_id": project_id,
             "reviews": "/integration/reviews",
@@ -2416,7 +2392,7 @@ def _register_integration_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.execution import ExecutionId
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         if not execution_id:
             return []
         items = services.integration.list_reviews(
@@ -2435,7 +2411,7 @@ def _register_integration_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.execution import ExecutionId, TaskId
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "integration.authorize_merge")
+        actor = authorized_actor(request, services, project_id, "integration.authorize_merge")
         try:
             item = services.integration.create_review(
                 project_id=ProjectId(project_id),
@@ -2455,7 +2431,7 @@ def _register_integration_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.identity import ProjectId
         from zero.domain.integration import IntegrationReviewId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         try:
             item = services.integration.get_review(
                 ProjectId(project_id), IntegrationReviewId(review_id)
@@ -2473,7 +2449,7 @@ def _register_integration_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.identity import ProjectId
         from zero.domain.integration import IntegrationReviewId
 
-        actor = _authorized_actor(request, services, project_id, "integration.authorize_merge")
+        actor = authorized_actor(request, services, project_id, "integration.authorize_merge")
         if result not in {"pass", "fail", "not_run"}:
             raise HTTPException(status_code=400, detail="invalid combined test result")
         try:
@@ -2495,7 +2471,7 @@ def _register_integration_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.execution import ExecutionId
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         if not execution_id:
             return []
         items = services.integration.list_proposals(
@@ -2515,7 +2491,7 @@ def _register_integration_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.identity import ProjectId
         from zero.domain.integration import IntegrationReviewId
 
-        actor = _authorized_actor(request, services, project_id, "integration.authorize_merge")
+        actor = authorized_actor(request, services, project_id, "integration.authorize_merge")
         try:
             item = services.integration.create_merge_proposal(
                 project_id=ProjectId(project_id),
@@ -2536,7 +2512,7 @@ def _register_integration_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.identity import ProjectId
         from zero.domain.integration import MergeProposalId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         try:
             item = services.integration.get_proposal(
                 ProjectId(project_id), MergeProposalId(proposal_id)
@@ -2551,7 +2527,7 @@ def _register_integration_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.identity import ProjectId
         from zero.domain.integration import MergeProposalId
 
-        actor = _authorized_actor(request, services, project_id, "integration.authorize_merge")
+        actor = authorized_actor(request, services, project_id, "integration.authorize_merge")
         try:
             typed_project = ProjectId(project_id)
             typed_proposal = MergeProposalId(proposal_id)
@@ -2661,7 +2637,7 @@ def _register_interface_routes(app: FastAPI, services: Services) -> None:
     def list_result_deliveries(request: Request, project_id: str) -> list[dict[str, Any]]:
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "execution.view_diffs")
+        authorized_actor(request, services, project_id, "execution.view_diffs")
         return [
             _result_delivery_payload(item)
             for item in services.result_delivery.list_for_project(ProjectId(project_id))
@@ -2671,7 +2647,7 @@ def _register_interface_routes(app: FastAPI, services: Services) -> None:
     def drain_result_delivery(request: Request, project_id: str) -> dict[str, Any]:
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "execution.view_diffs")
+        authorized_actor(request, services, project_id, "execution.view_diffs")
         if not services.result_delivery.is_outbound_configured:
             raise HTTPException(status_code=503, detail="outbound result delivery unavailable")
         item = services.result_delivery.drain_once(project_id=ProjectId(project_id))
@@ -2681,7 +2657,7 @@ def _register_interface_routes(app: FastAPI, services: Services) -> None:
     def list_bindings(request: Request, project_id: str) -> list[dict[str, Any]]:
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         return [
             _binding_payload(item)
             for item in services.interfaces.list_bindings(ProjectId(project_id))
@@ -2697,7 +2673,7 @@ def _register_interface_routes(app: FastAPI, services: Services) -> None:
     ) -> dict[str, Any]:
         from zero.domain.identity import ProjectId
 
-        actor = _authorized_actor(request, services, project_id, "agent.manage")
+        actor = authorized_actor(request, services, project_id, "agent.manage")
         try:
             item = services.interfaces.create_binding(
                 project_id=ProjectId(project_id),
@@ -2719,7 +2695,7 @@ def _register_interface_routes(app: FastAPI, services: Services) -> None:
     ) -> list[dict[str, Any]]:
         from zero.domain.identity import ProjectId
 
-        _authorized_actor(request, services, project_id, "project.view")
+        authorized_actor(request, services, project_id, "project.view")
         if not 1 <= limit <= 500:
             raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
         return [
@@ -2733,7 +2709,7 @@ def _register_interface_routes(app: FastAPI, services: Services) -> None:
         from zero.domain.identity import ProjectId
         from zero.domain.interfaces import InterfaceBindingId
 
-        actor = _authorized_actor(request, services, project_id, "agent.manage")
+        actor = authorized_actor(request, services, project_id, "agent.manage")
         try:
             method = (
                 services.interfaces.enable_binding
