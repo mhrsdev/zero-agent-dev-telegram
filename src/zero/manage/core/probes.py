@@ -94,7 +94,7 @@ def openai_completion_probe(
 
 def telegram_recent_chats(bot_token: str, *, timeout: float = 12.0) -> dict[str, object]:
     """Best-effort group discovery from one getUpdates poll (offset skip)."""
-    url = f"{TELEGRAM_API}/bot{bot_token}/getUpdates?timeout=0"
+    url = f"{_telegram_base()}/bot{bot_token}/getUpdates?timeout=0"
     try:
         resp = httpx.get(url, timeout=timeout)
     except httpx.RequestError as exc:
