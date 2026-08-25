@@ -81,7 +81,7 @@ class TestPolicyGateGroupMode:
     def test_denied_sender_never_reaches_event_processing(self, wired_gate, monkeypatch):
         """Enforcement happens BEFORE any expensive work: a denied sender
         must produce no conversation event and no provider request."""
-        services, gate, project = wired_gate
+        services, gate, _project = wired_gate
         conn = services.database.connect()
         before_events = conn.execute("SELECT COUNT(*) c FROM conversation_events").fetchone()["c"]
         before_requests = conn.execute("SELECT COUNT(*) c FROM provider_requests").fetchone()["c"]

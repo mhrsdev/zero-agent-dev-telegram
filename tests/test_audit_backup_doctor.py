@@ -28,18 +28,18 @@ def _services(tmp_path):
 
 class TestBackupRestoreRoundTrip:
     def test_backup_encrypts_and_restore_preserves_state(self, tmp_path):
-        settings, database, services = _services(tmp_path)
+        _settings, _database, services = _services(tmp_path)
         owner = services.identity.create_user(display_name="br owner")
         project = services.identity.create_project(owner_id=owner.id, name="BR")
         # Seed durable state across surfaces the checklist names.
-        ref = services.secrets.store(
+        services.secrets.store(
             project_id=project.id,
             name="p-key",
             secret_type="api_key",
             value="sk-backup-secret-xyz",
             actor_id=owner.id,
         )
-        event = services.plans.ingest_conversation_event(
+        services.plans.ingest_conversation_event(
             project_id=project.id,
             actor_id=owner.id,
             source="web",
@@ -71,7 +71,6 @@ class TestBackupRestoreRoundTrip:
 
         # Secrets survive and still decrypt with the same key.
 
-        svc2 = services.secrets  # same key material class
         row = (
             target.connect()
             .execute("SELECT id FROM secret_references WHERE name='p-key'")
@@ -80,7 +79,7 @@ class TestBackupRestoreRoundTrip:
         assert row is not None
 
     def test_corrupted_backup_fails_without_touching_target(self, tmp_path):
-        settings, database, services = _services(tmp_path)
+        _settings, _database, services = _services(tmp_path)
         archive = tmp_path / "b" / "bad.enc"
         archive.parent.mkdir(parents=True, exist_ok=True)
         # Correct magic prefix but garbage ciphertext.
@@ -108,7 +107,7 @@ class TestBackupRestoreRoundTrip:
 
     def test_wrong_key_backup_refuses(self, tmp_path):
         """A backup encrypted under key A must not restore under key B."""
-        settings_a, db_a, services_a = _services(tmp_path)
+        _settings_a, _db_a, services_a = _services(tmp_path)
         archive = tmp_path / "b" / "a.enc"
         services_a.backup.backup_to_file(str(archive))
         # A SECOND deployment running under a different key.

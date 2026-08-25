@@ -228,7 +228,7 @@ class TestAdminEndpointSecurity:
     def test_login_bruteforce_lockout(self, services, test_settings, tmp_path, monkeypatch):
         from zero.manage import web
 
-        app, client = self._harness(services, test_settings, tmp_path, monkeypatch)
+        app, _client = self._harness(services, test_settings, tmp_path, monkeypatch)
         web._login_failures.clear()
         anonymous = self._anonymous(app)
         locked = False

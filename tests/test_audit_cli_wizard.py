@@ -20,7 +20,7 @@ class TestD4DeadCommands:
     def test_capabilities_show_runs(self, cli_home, capsys):
         assert main(["capabilities", "show"]) == 0
         out = capsys.readouterr().out.strip()
-        assert out.startswith("{") or out.startswith("["), "JSON cache dump expected"
+        assert out.startswith(("{", "[")), "JSON cache dump expected"
 
     def test_backup_daemon_respects_off_schedule(self, cli_home, capsys):
         from zero.manage.core.config import ConfigService, ZeroConfig

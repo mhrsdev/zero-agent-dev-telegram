@@ -13,6 +13,7 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import ClassVar
 
 import pytest
 
@@ -22,7 +23,7 @@ from zero.config import Settings
 class FakeUpstream(BaseHTTPRequestHandler):
     """Programmable upstream: test sets class-level `plan` callables."""
 
-    plan: dict = {}  # path-key -> callable(method, body, headers) -> (status, obj|bytes, ctype)
+    plan: ClassVar[dict] = {}  # path-key -> callable(...) -> (status, obj|bytes, ctype)
 
     def log_message(self, *args):
         pass
@@ -180,18 +181,14 @@ class TestTelegramRealHttp:
         FakeUpstream.plan["/getUpdates"] = lambda m, b, h: getUpdates(m, b, h)
         adapter = make_telegram_adapter(upstream)
         seen_texts: list[str] = []
-        original = adapter._dispatch
 
         def counting(event):
             seen_texts.append(event.content)
 
         adapter._event_handler = counting
-        results = adapter.poll_once(scope_key="audit")
+        adapter.poll_once(scope_key="audit")
         assert len(seen_texts) >= 2  # both distinct messages dispatched
         assert seen_texts.count("a") >= 1
-        cursor = (
-            adapter._cursor_store_get("audit") if hasattr(adapter, "_cursor_store_get") else None
-        )
         # Cursor persisted via store; emulate check through next-call offset:
         state["offset"] = 12
         FakeUpstream.plan["/getUpdates"] = lambda m, b, h: (
@@ -222,7 +219,7 @@ class TestTelegramRealHttp:
         adapter = make_telegram_adapter(upstream)
         got: list[str] = []
         adapter._event_handler = lambda e: got.append(e.content)
-        results = adapter.poll_once(scope_key="audit2")
+        adapter.poll_once(scope_key="audit2")
         assert got == ["ok"]
 
     def test_invalid_token_surfaces_typed_error(self, upstream):
@@ -345,7 +342,7 @@ class TestRouterFailoverAndAccounting:
         svc.register_adapter(openai_adapter("secondary", upstream))
         svc.set_fallback_chain(("primary", "secondary"))
 
-        preq, resp = svc.send_request_with_fallback(
+        _preq, resp = svc.send_request_with_fallback(
             project_id=project.id,
             actor_id=owner.id,
             request=chat_request("primary"),
@@ -380,7 +377,7 @@ class TestRouterFailoverAndAccounting:
         FakeUpstream.plan["/only/models"] = lambda m, b, h: (200, {"data": [{"id": "m"}]}, None)
         svc.register_adapter(openai_adapter("only", upstream))
 
-        preq, resp = svc.send_request_with_fallback(
+        _preq, resp = svc.send_request_with_fallback(
             project_id=project.id,
             actor_id=owner.id,
             request=chat_request("only"),

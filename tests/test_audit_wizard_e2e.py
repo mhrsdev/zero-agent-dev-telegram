@@ -117,7 +117,6 @@ def test_non_interactive_setup_stores_secrets_and_writes_config(
     assert FAKE_KEY not in cfg_text
 
     # 2. Draft masks raw secrets too.
-    draft_files = list(cli_home.glob("*.draft*")) + list((cli_home).glob("draft*"))
     for path in cli_home.rglob("*draft*"):
         content = path.read_text(encoding="utf-8", errors="ignore")
         assert FAKE_TOKEN not in content, f"raw token leaked into {path.name}"
