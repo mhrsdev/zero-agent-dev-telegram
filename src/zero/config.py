@@ -26,6 +26,7 @@ Environment = Literal["development", "test", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 WorktreeIsolationMode = Literal["disabled", "host_bounded"]
 SandboxExecutor = Literal["none", "docker", "firejail"]
+TelegramMode = Literal["bot_api", "user_session"]
 
 #: The default database backend. PostgreSQL URLs are accepted when the
 #: ``[pg]`` extra is installed (GAP 2); anything else is refused at
@@ -79,6 +80,10 @@ class Settings(BaseModel):
     #: GAP 2: PostgreSQL connection pool bounds (``ZERO_PG_POOL_MIN/MAX``).
     pg_pool_min: int = 2
     pg_pool_max: int = 20
+    #: GAP 4: Bot API (default) or explicit user-session opt-in. The
+    #: user-session path additionally requires the [session] extra;
+    #: composition refuses the combination otherwise.
+    telegram_mode: TelegramMode = "bot_api"
     log_level: LogLevel = "INFO"
     secret_key: SecretStr | None = None
     auth_required: bool = False
@@ -343,6 +348,10 @@ class Settings(BaseModel):
         if pg_pool_min > pg_pool_max:
             raise ConfigError("ZERO_PG_POOL_MIN must not exceed ZERO_PG_POOL_MAX.")
 
+        telegram_mode = raw.get("ZERO_TELEGRAM_MODE", "bot_api").strip().lower()
+        if telegram_mode not in {"bot_api", "user_session"}:
+            raise ConfigError("ZERO_TELEGRAM_MODE must be 'bot_api' or 'user_session'.")
+
         settings = cls(
             zero_env=zero_env,  # type: ignore[arg-type]
             database_url=database_url,
@@ -375,6 +384,7 @@ class Settings(BaseModel):
             combined_test_timeout_seconds=combined_test_timeout_seconds,
             pg_pool_min=pg_pool_min,
             pg_pool_max=pg_pool_max,
+            telegram_mode=telegram_mode,  # type: ignore[arg-type]
         )
         settings._enforce_fail_closed_rules()
         return settings

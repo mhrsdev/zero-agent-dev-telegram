@@ -52,6 +52,10 @@ class TokenBucketRateLimiter:
         self._buckets: dict[str, tuple[float, float]] = {}  # key -> (tokens, ts)
         self._lock = threading.Lock()
 
+    @property
+    def per_minute(self) -> int:
+        return int(self._rate)
+
     def allow(self, key: str, *, now: float | None = None) -> bool:
         current = time.monotonic() if now is None else now
         with self._lock:
