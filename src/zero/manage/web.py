@@ -12,7 +12,7 @@ import secrets
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Form, Header, Request
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -72,6 +72,36 @@ STEP_ORDER_IDX: dict = {s: i for i, s in enumerate(ORDER_LIST)}
 
 _SALT = b"zero-admin-v1"
 _sessions: dict[str, float] = {}  # sid -> expiry (single-process)
+# Brute-force mitigation: per-client-IP failure timestamps.
+_login_failures: dict[str, list[float]] = {}
+_LOCKOUT_THRESHOLD = 5
+_LOCKOUT_WINDOW_SECONDS = 600.0
+
+
+def _client_ip(request: Request) -> str:
+    return getattr(request.client, "host", "") or "unknown"
+
+
+def _login_locked(ip: str, *, now: float | None = None) -> bool:
+    import time as _time
+
+    current = _time.time() if now is None else now
+    hits = [t for t in _login_failures.get(ip, []) if current - t < _LOCKOUT_WINDOW_SECONDS]
+    _login_failures[ip] = hits
+    return len(hits) >= _LOCKOUT_THRESHOLD
+
+
+def _record_login_failure(ip: str, *, now: float | None = None) -> None:
+    import time as _time
+
+    current = _time.time() if now is None else now
+    hits = [t for t in _login_failures.get(ip, []) if current - t < _LOCKOUT_WINDOW_SECONDS]
+    hits.append(current)
+    _login_failures[ip] = hits
+
+
+def _clear_login_failures(ip: str) -> None:
+    _login_failures.pop(ip, None)
 
 
 def _home() -> Path:
@@ -89,6 +119,9 @@ def _admin_file() -> Path:
 def _ensure_setup_code() -> str:
     f = _home() / "setup-code.txt"
     if not f.exists():
+        # Fresh hosts may not have $ZERO_HOME yet; create it securely
+        # instead of crashing first-run bootstrap.
+        f.parent.mkdir(parents=True, exist_ok=True)
         code = secrets.token_hex(4).upper()
         f.write_text(code, encoding="utf-8")
         os.chmod(f, 0o600)
@@ -268,26 +301,36 @@ def register_admin(app, services=None) -> None:
         return _page(pw_page, None)
 
     @router.post("/login/setpw")
-    def set_password(pw: str = Form(""), pw2: str = Form("")):
+    def set_password(request: Request, pw: str = Form(""), pw2: str = Form("")):
         if pw != pw2 or len(pw) < 10:
             return _login_page("passwords must match and be >= 10 chars", need_setup=True)
         af = _admin_file()
+        af.parent.mkdir(parents=True, exist_ok=True)
         af.write_text(json.dumps({"password": _hash_pw(pw)}), encoding="utf-8")
         os.chmod(af, 0o600)
         (_home() / "setup-code.txt").unlink(missing_ok=True)
+        # Audit hardening: a password change must invalidate every
+        # existing session (fixation/theft mitigation). The current
+        # caller receives the single fresh session below.
+        _sessions.clear()
         sid, _ = _new_session()
         resp = RedirectResponse("/admin", status_code=303)
         resp.set_cookie("zero_admin", sid, httponly=True, samesite="strict")
         return resp
 
     @router.post("/login")
-    def login(secret: str = Form("")):
+    def login(request: Request, secret: str = Form("")):
+        ip = _client_ip(request)
+        if _login_locked(ip):
+            return HTMLResponse("too many failed attempts; try again later", status_code=429)
         af = _admin_file()
         stored = ""
         if af.exists():
             stored = json.loads(af.read_text(encoding="utf-8")).get("password", "")
         if not stored or not _verify_pw(secret, stored):
+            _record_login_failure(ip)
             return _login_page("invalid password")
+        _clear_login_failures(ip)
         sid, _ = _new_session()
         resp = RedirectResponse("/admin", status_code=303)
         resp.set_cookie("zero_admin", sid, httponly=True, samesite="strict")
@@ -619,7 +662,17 @@ displays them.</p>"""
         return RedirectResponse("/admin/wizard", status_code=303)
 
     @router.post("/providers/{provider_id}/test")
-    def provider_test(provider_id: str):
+    def provider_test(
+        provider_id: str,
+        request: Request,
+        x_admin_csrf: str = Header(default=""),
+    ):
+        # Audit D3: this endpoint triggers PAID provider probes, so it
+        # requires an admin session AND a CSRF token like every other
+        # mutating admin route.
+        sid = guard(request)
+        if not _check_csrf(sid, x_admin_csrf):
+            return HTMLResponse("bad csrf", status_code=400)
         cfgsvc = _cfgsvc()
         cfg = cfg_load() if cfgsvc.exists() else None
         target = next((p for p in (cfg.providers if cfg else []) if p.id == provider_id), None)

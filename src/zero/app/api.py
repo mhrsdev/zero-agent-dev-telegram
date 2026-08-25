@@ -408,7 +408,13 @@ def _register_auth_middleware(app: FastAPI, services: Services, settings: Settin
         if not settings.auth_required:
             return await call_next(request)
         path = request.url.path
-        if path in _PUBLIC_PATHS or path.startswith(("/static/", "/webhooks/")):
+        # /admin/* runs its own scrypt-password + CSRF scheme
+        # (zero.manage.web); routing it through the bearer-token
+        # middleware would make the admin GUI unreachable in production
+        # while adding no protection. Audit finding S6.
+        if path in _PUBLIC_PATHS or path.startswith(
+            ("/static/", "/webhooks/", "/admin", "/admin/")
+        ):
             return await call_next(request)
 
         authorization = request.headers.get("authorization", "")

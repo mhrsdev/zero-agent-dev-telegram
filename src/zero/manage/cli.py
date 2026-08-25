@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import logging
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -20,8 +22,15 @@ from pathlib import Path
 from zero import __version__
 from zero.manage.core.config import ConfigError, ConfigService, ZeroConfig
 
-DEFAULT_HOME = Path(os.environ.get("ZERO_HOME", Path.home() / ".zero"))
+
+def _home() -> Path:
+    """$ZERO_HOME resolved per call so runtime env changes apply."""
+    return Path(os.environ.get("ZERO_HOME", str(Path.home() / ".zero")))
+
+
 SERVICE_NAME = "zero"
+
+logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
@@ -40,6 +49,83 @@ def _engine_services(env_file: str | None = None):
     return settings, services
 
 
+def _ensure_secret_key() -> str:
+    """Return the engine encryption key, generating+persisting one first.
+
+    Audit finding: nothing bootstrapped ZERO_SECRET_KEY, so the wizard's
+    secret store could never work on a fresh host. The key lives at
+    ``$ZERO_HOME/secret.key`` (0600) — deliberately NOT beside the
+    encrypted rows — and is exported to the process plus written to
+    $ZERO_HOME/.env so later engine starts (which load that .env) keep
+    resolving old ciphertexts.
+    """
+    env_value = os.environ.get("ZERO_SECRET_KEY", "").strip()
+    if env_value:
+        return env_value
+    key_file = _home() / "secret.key"
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    if key_file.exists():
+        key = key_file.read_text(encoding="utf-8").strip()
+    else:
+        key = secrets.token_urlsafe(48)
+        key_file.write_text(key, encoding="utf-8")
+        try:
+            os.chmod(key_file, 0o600)
+        except OSError:
+            pass
+    os.environ["ZERO_SECRET_KEY"] = key
+    # Persist for future engine processes via the supported .env path.
+    env_file = _home() / ".env"
+    lines: list[str] = []
+    if env_file.exists():
+        lines = [
+            line
+            for line in env_file.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("ZERO_SECRET_KEY=")
+        ]
+    lines.append(f"ZERO_SECRET_KEY={key}")
+    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(env_file, 0o600)
+    except OSError:
+        pass
+    return key
+
+
+def _wizard_secret_store():
+    """Audit D1: persist wizard secrets via the engine's encrypted store.
+
+    Mirrors the GUI's wiring (manage.web._setup): without this, commit
+    always refuses with "secrets not stored", making `zero setup`
+    unable to finish on any deployment.
+    """
+
+    def store(name: str, stype: str, value: str) -> str:
+        _ensure_secret_key()
+        _settings, services = _engine_services(env_file=str(_home() / ".env"))
+        try:
+            project = _ensure_management_scope(services)
+            ref = services.secrets.store(
+                project_id=project.id,
+                name=name,
+                secret_type=stype,
+                value=value,
+                actor_id=project.owner_user_id,
+            )
+            return ref.id.value
+        finally:
+            # Audit perf finding: each CLI engine bridge opened a real
+            # HTTP transport (dev mode) that was never closed.
+            transports = getattr(services, "interface_transports", None)
+            if transports is not None:
+                try:
+                    transports.close()
+                except Exception as exc:  # noqa: BLE001 - cleanup best-effort
+                    logger.debug("transport close failed: %s", type(exc).__name__)
+
+    return store
+
+
 def _ensure_management_scope(services):
     """Create/return the operator user + management project used for secrets."""
     projects = services.identity.list_projects()
@@ -51,7 +137,7 @@ def _ensure_management_scope(services):
 
 
 def _cfgsvc() -> ConfigService:
-    return ConfigService(DEFAULT_HOME)
+    return ConfigService(_home())
 
 
 # ----------------------------------------------------------------------
@@ -85,7 +171,7 @@ def cmd_setup(ns) -> int:
     from zero.manage.services.setup import SetupService
 
     cfgsvc = _cfgsvc()
-    setup = SetupService(cfgsvc, lambda: None)
+    setup = SetupService(cfgsvc, lambda: None, secret_store=_wizard_secret_store())
 
     if ns.reset:
         setup.reset()
@@ -114,29 +200,55 @@ def cmd_setup(ns) -> int:
     if not ns.non_interactive:
         return _interactive_setup(setup)
 
-    # non-interactive: apply --step key=value then commit
+    # Non-interactive: group --step key=value pairs by section, then run
+    # each provided section through setup.answer() so validation runs and
+    # raw secrets are persisted to the encrypted store as durable refs
+    # (audit D1 follow-up: writing the draft directly bypassed storage,
+    # making commit impossible).
     draft = setup.resume()
     data = draft.setdefault("data", {})
+    section_values: dict[str, dict[str, object]] = {}
     for pair in ns.step or []:
         if "=" not in pair:
             _fail(f"--step expects key=value, got {pair!r}", 2)
         dotted_key, value = pair.split("=", 1)
         section, _, key = dotted_key.partition(".")
-        sec = data.setdefault(section, {})
+        if not key:
+            _fail(f"--step expects section.key=value, got {pair!r}", 2)
         if value.lower() in {"true", "false"}:
             value = value.lower() == "true"
-        sec[key] = value
-        # route known raw-secret keys into their expected slots
-        if dotted_key == "telegram_credentials.token":
-            sec["_raw"] = {"token": value}
-        if dotted_key == "provider_add.api_key":
-            sec.setdefault("_raw", {})["api_key"] = value
-    cfgsvc.save_draft(draft)
+        else:
+            try:
+                if value.startswith("[") and value.endswith("]"):
+                    import json as _json
+
+                    parsed = _json.loads(value)
+                    if isinstance(parsed, list):
+                        value = parsed
+            except ValueError:
+                pass
+        section_values.setdefault(section, {})[key] = value
+
+    from zero.manage.services.setup import STEP_ORDER
+
+    for section in [s for s in STEP_ORDER if s in section_values]:
+        result = setup.answer(section, section_values[section])
+        if not result.ok:
+            details = "; ".join(result.errors)
+            _fail(f"step {section} failed: {details}", 2)
+    # NOTE: do not re-save a captured draft here — answer() persists each
+    # step (including stored secret refs); writing a stale snapshot would
+    # erase them (audit regression).
 
     try:
         setup.commit()
     except ConfigError as exc:
         _fail(str(exc), 2)
+    except Exception as exc:
+        # e.g. pydantic ValidationError for malformed provider/model ids:
+        # operators get an actionable message, never a traceback.
+        print(f"error: configuration invalid: {type(exc).__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
     print("configuration written:", cfgsvc.path)
     return 0
 
@@ -251,7 +363,7 @@ def _service_status() -> dict[str, str]:
             check=False,
         )
         return {"kind": "systemd", "state": rc.stdout.strip() or "unknown"}
-    pid_file = DEFAULT_HOME / "zero.pid"
+    pid_file = _home() / "zero.pid"
     if pid_file.exists():
         pid = pid_file.read_text().strip()
         try:
@@ -266,15 +378,15 @@ def cmd_start(ns) -> int:
     if shutil.which("systemctl"):
         subprocess.run(["systemctl", "start", SERVICE_NAME], check=False)
         return cmd_status(ns)
-    log = open(DEFAULT_HOME / "zero.log", "ab")  # noqa: SIM115
+    log = open(_home() / "zero.log", "ab")  # noqa: SIM115
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "zero.main:app", "--host", "127.0.0.1", "--port", "8000"],
         stdout=log,
         stderr=log,
         start_new_session=True,
     )
-    DEFAULT_HOME.mkdir(parents=True, exist_ok=True)
-    (DEFAULT_HOME / "zero.pid").write_text(str(proc.pid))
+    _home().mkdir(parents=True, exist_ok=True)
+    (_home() / "zero.pid").write_text(str(proc.pid))
     print(f"started pid={proc.pid} (foreground alternative: zero-develop serve)")
     return 0
 
@@ -283,7 +395,7 @@ def cmd_stop(ns) -> int:
     if shutil.which("systemctl"):
         subprocess.run(["systemctl", "stop", SERVICE_NAME], check=False)
         return 0
-    pid_file = DEFAULT_HOME / "zero.pid"
+    pid_file = _home() / "zero.pid"
     if pid_file.exists():
         try:
             os.kill(int(pid_file.read_text().strip()), 15)
@@ -304,7 +416,7 @@ def cmd_logs(ns) -> int:
         os.execvp(
             "journalctl", ["journalctl", "-u", SERVICE_NAME, "-n", str(ns.lines), "--no-pager"]
         )
-    log = DEFAULT_HOME / "zero.log"
+    log = _home() / "zero.log"
     if not log.exists():
         print("no log file yet")
         return 0
@@ -571,14 +683,14 @@ def cmd_backup(ns) -> int:
     _settings, services = _engine_services(ns.env_file)
     backup = services.backup
     if ns.op == "create":
-        dest = Path(ns.dest or (DEFAULT_HOME / "backups"))
+        dest = Path(ns.dest or (_home() / "backups"))
         dest.mkdir(parents=True, exist_ok=True)
         path = dest / f"zero-backup-{int(time_time())}.enc"
         backup.backup_to_file(str(path))
         print(f"created {path}")
         return 0
     if ns.op == "list":
-        d = Path(ns.dest or (DEFAULT_HOME / "backups"))
+        d = Path(ns.dest or (_home() / "backups"))
         for f in sorted(d.glob("zero-backup-*")):
             print(f.name, f.stat().st_size)
         return 0
@@ -654,10 +766,10 @@ def cmd_uninstall(ns) -> int:
         if unit.exists():
             unit.unlink()
     if ns.purge_data:
-        shutil.rmtree(DEFAULT_HOME, ignore_errors=True)
+        shutil.rmtree(_home(), ignore_errors=True)
         print("data purged")
     else:
-        print(f"data kept at {DEFAULT_HOME}")
+        print(f"data kept at {_home()}")
     print("uninstalled")
     return 0
 
@@ -724,7 +836,7 @@ def cmd_capabilities(ns) -> int:
     from zero.manage.core.capabilities import CapabilityCache, probe_capabilities
 
     cfgsvc = _cfgsvc()
-    cache = CapabilityCache(Path(DEFAULT_HOME))
+    cache = CapabilityCache(Path(_home()))
     if ns.op == "show":
         _print(cache._read_all())
         return 0
@@ -786,14 +898,14 @@ def cmd_backup_daemon(ns) -> int:
 
     def runner() -> str:
         _settings, services = _engine_services(ns.env_file)
-        dest = Path(DEFAULT_HOME) / "backups"
+        dest = Path(_home()) / "backups"
         dest.mkdir(parents=True, exist_ok=True)
         archive = dest / f"zero-backup-{time.strftime('%Y%m%d-%H%M%S')}.enc"
         services.backup.backup_to_file(str(archive))
         return str(archive)
 
     daemon = BackupDaemon(
-        home=Path(DEFAULT_HOME),
+        home=Path(_home()),
         schedule=cfg.backups.schedule,
         retention=cfg.backups.retention,
         backup_runner=runner,
@@ -811,7 +923,7 @@ def cmd_backup_daemon(ns) -> int:
 
 
 def cmd_backup_status(ns) -> int:
-    sp = Path(DEFAULT_HOME) / "backups" / "last-backup.json"
+    sp = Path(_home()) / "backups" / "last-backup.json"
     data: dict | None = None
     if sp.exists():
         data = json.loads(sp.read_text(encoding="utf-8"))
@@ -994,6 +1106,10 @@ _HANDLERS = {
     "config": cmd_config,
     "websearch": cmd_websearch,
     "tui": cmd_tui,
+    # Audit D4: these parsers existed but were never dispatched.
+    "capabilities": cmd_capabilities,
+    "backup-daemon": cmd_backup_daemon,
+    "backup-status": cmd_backup_status,
 }
 
 

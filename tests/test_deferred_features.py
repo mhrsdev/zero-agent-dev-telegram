@@ -379,8 +379,14 @@ def test_retry_after_toast_payload(services, gui, monkeypatch) -> None:
     monkeypatch.setattr(
         "zero.manage.core.capabilities._openai_stream_probe", lambda *a, **kw: ("supported", "")
     )
+    # Audit D3 hardening: the probe endpoint now requires the admin
+    # CSRF token alongside the session cookie.
+    import zero.manage.web as web
 
-    resp = client.post("/admin/providers/p1/test")
+    sid = client.cookies.get("zero_admin") or ""
+    headers = {"x-admin-csrf": web._csrf(sid)}
+
+    resp = client.post("/admin/providers/p1/test", headers=headers)
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["retry_after"] == 45

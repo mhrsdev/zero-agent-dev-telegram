@@ -81,6 +81,26 @@ def rate_limit_ok(bucket: dict[str, list[float]], key: str, per_min: int) -> boo
     return True
 
 
+def _group_as_dict(group: Any) -> dict[str, Any]:
+    """Normalize a group entry to a plain dict.
+
+    Accepts dicts (managed config path) and objects exposing either
+    ``model_dump()`` or matching attributes (GroupPolicy dataclass path).
+    """
+    if isinstance(group, dict):
+        return group
+    dump = getattr(group, "model_dump", None)
+    if callable(dump):
+        dumped = dump()
+        if isinstance(dumped, dict):
+            return dumped
+    return {
+        key: getattr(group, key)
+        for key in ("chat_id", "title", "enabled", "allowed_features")
+        if hasattr(group, key)
+    }
+
+
 def build_gate(
     cfg_getter: Callable[[], Any],
     owner_lookup: Callable[[str], str | None],
@@ -106,19 +126,20 @@ def build_gate(
             owner_ext = owner_lookup(cfg.owner_project_id)
         except (OSError, RuntimeError, LookupError):
             owner_ext = None
+        groups = [_group_as_dict(g) for g in getattr(cfg, "groups", [])]
         base = decide(
             mode=cfg.mode,
             sender_external_id=sender_id,
             chat_id=chat_id,
             owner_external_id=owner_ext,
             allow_users=list(cfg.allow_users),
-            groups=[g.model_dump() for g in getattr(cfg, "groups", [])],
+            groups=groups,
             feature=feature,
         )
         if not base.allowed:
             return base
         group = next(
-            (g.model_dump() for g in getattr(cfg, "groups", []) if str(g.chat_id) == str(chat_id)),
+            (g for g in groups if str(g.get("chat_id")) == str(chat_id)),
             None,
         )
         return feature_gate(group, feature)

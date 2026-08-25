@@ -149,33 +149,39 @@ def _build_policy_gate(identity_repo, settings):
 
             project = identity_repo.get_project(ProjectId(str(project_id_value)))
             owner_id = project.owner_user_id
-            links = identity_repo.list_external_identities(owner_id)
+            links = identity_repo.list_external_identities_for_user(owner_id)
             for link in links:
                 if link.platform == "telegram" and link.verified_at:
                     return link.external_id
-        except Exception:  # noqa: BLE001 - gate must never crash intake
+        except Exception as exc:  # noqa: BLE001 - gate must never crash intake
+            # Log, never swallow silently: a broken owner lookup must be
+            # diagnosable while still failing closed.
+            logger.warning(
+                "policy-gate owner lookup failed for project %s: %s",
+                project_id_value,
+                type(exc).__name__,
+            )
             return None
         return None
 
     class _CfgView:  # tiny adapter matching build_gate's expectations
         def __init__(self, access: dict):
             self.mode = access.get("mode", "owner_only")
-            self.owner_project_id = access.get("owner_project_id") or (raw_root := None)
-            self.allow_users = access.get("allow_users", [])
+            # Root-level owner_project_id resolution happens lazily in
+            # _cfg_getter when the access section omits it.
+            self.owner_project_id = access.get("owner_project_id")
+            self.allow_users = list(access.get("allow_users") or [])
+            # Plain dicts: build_gate/decide consume dict-shaped groups
+            # exclusively (no ad-hoc attribute wrappers).
             self.groups = [
-                type(
-                    "G",
-                    (),
-                    {
-                        "chat_id": g.get("chat_id"),
-                        "enabled": g.get("enabled", True),
-                        "allowed_features": g.get("allowed_features", ["chat"]),
-                        "model_dump": lambda g=g: g,
-                    },
-                )()
+                {
+                    "chat_id": g.get("chat_id"),
+                    "title": g.get("title"),
+                    "enabled": g.get("enabled", True),
+                    "allowed_features": g.get("allowed_features", ["chat"]),
+                }
                 for g in access.get("groups", [])
             ]
-            del raw_root
 
     def _cfg_getter():
         data = _load_access()

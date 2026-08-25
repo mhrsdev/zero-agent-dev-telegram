@@ -15,6 +15,19 @@ from zero.manage.core.mcp_client import (
     parse_server_config,
     sanitize_name_component,
 )
+
+
+@pytest.fixture
+def services(test_settings):
+    from zero.app.services import build_services
+    from zero.persistence.connection import Database
+    from zero.persistence.migrations import apply_migrations
+
+    database = Database(test_settings)
+    apply_migrations(database)
+    return build_services(test_settings, database)
+
+
 from zero.manage.plugins.registry import (
     load_plugins,
     plugin_dirs,
@@ -122,6 +135,141 @@ class TestManagerRegistrationIntoToolService:
                 source="system",
             )
         manager.shutdown()
+
+
+class TestAdminEndpointSecurity:
+    """Audit D3: provider probe endpoint must require session + CSRF."""
+
+    @staticmethod
+    def _harness(services, settings, tmp_path, monkeypatch):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from zero.manage import web
+
+        zero_home = tmp_path / "zero-home"
+        zero_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("ZERO_HOME", str(zero_home))
+        web._sessions.clear()
+        app = FastAPI()
+        app.state.services = services
+        app.state.settings = settings
+        from zero.app.stream_hub import ExecutionStreamHub
+
+        app.state.stream_hub = ExecutionStreamHub()
+        web.register_admin(app, services)
+        client = TestClient(app)
+        # Bootstrap-login to obtain an authenticated session.
+        client.get("/admin/login")
+        setup_code = (zero_home / "setup-code.txt").read_text(encoding="utf-8").strip()
+        client.post("/admin/login/bootstrap", data={"secret": setup_code})
+        client.post(
+            "/admin/login/setpw",
+            data={"pw": "correct horse battery", "pw2": "correct horse battery"},
+        )
+        return app, client
+
+    def _anonymous(self, app):
+        from fastapi.testclient import TestClient
+
+        return TestClient(app)  # no cookies → no session
+
+    def test_admin_login_reachable_with_engine_auth_required(
+        self, services, test_settings, tmp_path, monkeypatch
+    ):
+        """Audit S6: the engine bearer middleware must not gate /admin —
+        the GUI has its own password+CSRF scheme and would otherwise be
+        unreachable in production (auth_required forces True there)."""
+
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from zero.app.api import _register_auth_middleware
+        from zero.manage import web
+
+        monkeypatch.setenv("ZERO_HOME", str(tmp_path / "zh"))
+        web._sessions.clear()
+        strict = test_settings.model_copy(update={"auth_required": True})
+        app = FastAPI()
+        app.state.settings = strict
+        app.state.services = services
+        _register_auth_middleware(app, services, strict)
+        web.register_admin(app, services)
+        client = TestClient(app)
+        page = client.get("/admin/login")
+        assert page.status_code == 200, (
+            f"/admin/login must be reachable with engine auth on; got {page.status_code}"
+        )
+
+    def test_password_change_invalidates_old_sessions(
+        self, services, test_settings, tmp_path, monkeypatch
+    ):
+        from zero.manage import web
+
+        app, client = self._harness(services, test_settings, tmp_path, monkeypatch)
+        old_sid = client.cookies.get("zero_admin")
+        assert old_sid and web._valid_session.__globals__["_sessions"].get(old_sid)
+
+        # Rotate the password through the real flow.
+        client.post(
+            "/admin/login/setpw",
+            data={"pw": "another-long-password", "pw2": "another-long-password"},
+        )
+        # The OLD session id must no longer authenticate.
+        import fastapi.testclient as ftc
+
+        old_client = ftc.TestClient(app)
+        old_client.cookies.set("zero_admin", old_sid)
+        probe = old_client.get("/admin/config", follow_redirects=False)
+        assert probe.status_code in (303, 401), (
+            "old session must be invalidated by a password change"
+        )
+
+    def test_login_bruteforce_lockout(self, services, test_settings, tmp_path, monkeypatch):
+        from zero.manage import web
+
+        app, client = self._harness(services, test_settings, tmp_path, monkeypatch)
+        web._login_failures.clear()
+        anonymous = self._anonymous(app)
+        locked = False
+        for _ in range(web._LOCKOUT_THRESHOLD + 2):
+            resp = anonymous.post("/admin/login", data={"secret": "wrong"}, follow_redirects=False)
+            if resp.status_code == 429:
+                locked = True
+                break
+        assert locked, "repeated failures must trigger lockout"
+        # A correct password during lockout must STILL be refused.
+        ok = anonymous.post(
+            "/admin/login",
+            data={"secret": "correct horse battery"},
+            follow_redirects=False,
+        )
+        assert ok.status_code == 429
+
+    def test_provider_probe_requires_session(self, services, test_settings, tmp_path, monkeypatch):
+        app, _client = self._harness(services, test_settings, tmp_path, monkeypatch)
+        resp = self._anonymous(app).post("/admin/providers/p1/test", follow_redirects=False)
+        assert resp.status_code in (303, 401), "unauthenticated provider probe must not succeed"
+
+    def test_provider_probe_requires_csrf(self, services, test_settings, tmp_path, monkeypatch):
+        _app, client = self._harness(services, test_settings, tmp_path, monkeypatch)
+        resp = client.post("/admin/providers/p1/test")
+        assert resp.status_code == 400, "missing CSRF token must be rejected"
+
+    def test_provider_probe_allows_authenticated_csrf(
+        self, services, test_settings, tmp_path, monkeypatch
+    ):
+        from zero.manage import web
+
+        _app, client = self._harness(services, test_settings, tmp_path, monkeypatch)
+        sid = client.cookies.get("zero_admin") or ""
+        csrf = web._csrf(sid)
+        resp = client.post(
+            "/admin/providers/unknown-id/test",
+            headers={"x-admin-csrf": csrf},
+        )
+        # Unknown provider id reaches the handler and 404s cleanly.
+        assert resp.status_code == 404
 
 
 class TestPluginRegistry:
