@@ -99,12 +99,12 @@ jobs:
         run: |
           "$VENV/bin/python" -c 'import zero.main; print("installed_import=ok")'
           set +e
-          env -u ZERO_ENV -u ZERO_DATABASE_URL "$VENV/bin/zero-develop" >/tmp/zero-config-error.log 2>&1
+          env -u ZERO_ENV -u ZERO_DATABASE_URL "$VENV/bin/zero-develop" serve >/tmp/zero-config-error.log 2>&1
           config_status=$?
           set -e
           test "$config_status" -ne 0
           grep -F "ZERO_ENV is required" /tmp/zero-config-error.log
-          "$VENV/bin/zero-develop" >/tmp/zero-release-server.log 2>&1 &
+          "$VENV/bin/zero-develop" serve >/tmp/zero-release-server.log 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
           for attempt in $(seq 1 30); do
