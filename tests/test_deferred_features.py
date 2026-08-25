@@ -381,7 +381,7 @@ def test_retry_after_toast_payload(services, gui, monkeypatch) -> None:
     )
     # Audit D3 hardening: the probe endpoint now requires the admin
     # CSRF token alongside the session cookie.
-    import zero.manage.web as web
+    from zero.manage import web
 
     sid = client.cookies.get("zero_admin") or ""
     headers = {"x-admin-csrf": web._csrf(sid)}

@@ -311,6 +311,9 @@ class SetupService:
             access.mode = am.get("mode", access.mode)
             if access.mode == "public" and not access.public_confirmed_at:
                 access.public_confirmed_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        # Audit D5: agents.default_agent applies to groups that do not
+        # declare their own agent.
+        default_agent = (data.get("agents", {}) or {}).get("default_agent", "main_worker")
         from zero.manage.core.config import GroupPolicy
 
         gpol = [
@@ -319,7 +322,7 @@ class SetupService:
                 title=g.get("title", ""),
                 kind=g.get("kind", "supergroup"),
                 enabled=True,
-                default_agent=(data.get("agents", {}).get(g.get("chat_id")) or "main_worker"),
+                default_agent=(data.get("agents", {}).get(g.get("chat_id")) or default_agent),
                 added_by="setup",
             )
             for g in groups
@@ -331,10 +334,18 @@ class SetupService:
         new.telegram.bot_token_ref = tc.get("token_ref") or new.telegram.bot_token_ref
         new.telegram.bot_username = tc.get("bot_username") or new.telegram.bot_username
         new.providers = providers
-        if ma.get("primary_model"):
-            new.routing.primary_model = ma["primary_model"]
-        if ma.get("fallback_models") is not None:
-            new.routing.fallback_models = ma["fallback_models"]
+        new.routing.primary_model = (
+            ma["primary_model"] if ma.get("primary_model") else new.routing.primary_model
+        )
+        # Audit D5: accept both the structured key and the wizard's CSV
+        # field; a comma string is parsed instead of silently dropped.
+        raw_fallback = ma.get("fallback_models")
+        if raw_fallback is None and ma.get("fallback_models_csv"):
+            raw_fallback = [
+                item.strip() for item in str(ma["fallback_models_csv"]).split(",") if item.strip()
+            ]
+        if raw_fallback:
+            new.routing.fallback_models = list(raw_fallback)
         new.access = access
         new.websearch.enabled = bool(ws.get("enabled", False))
         new.websearch.provider_id = ws.get("provider_id")
@@ -342,6 +353,9 @@ class SetupService:
             new.websearch.api_key_ref = ws["api_key_ref"]
         new.backups.schedule = bk.get("schedule", new.backups.schedule)
         new.updates.channel = up.get("channel", new.updates.channel)
+        # Audit D5: persist the collected auto_apply flag.
+        if "auto_apply" in up:
+            new.updates.auto_apply = bool(up["auto_apply"])
         new.privacy.telemetry_enabled = bool(pv.get("telemetry_enabled", False))
         return new
 

@@ -141,7 +141,7 @@ WIZARD_STEPS: dict[str, WizardStep] = {
             fields=(
                 _f("chat_id", "Group chat id"),
                 _f("title", "Group title"),
-                _f("discover_token", "Bot token (for discovery)", kind="password"),
+                _f("token", "Bot token (for discovery)", kind="password"),
             ),
         ),
         WizardStep(
@@ -152,11 +152,11 @@ WIZARD_STEPS: dict[str, WizardStep] = {
         WizardStep(
             "memory_storage",
             "Memory & storage",
-            fields=(
-                _f(
-                    "compaction_threshold_percent", "Compaction threshold %", kind="int", default=85
-                ),
-            ),
+            # Audit D5: compaction threshold tuning is NOT wired into the
+            # engine yet; collecting it here silently dropped the value.
+            # The step stays so operators see the state explicitly.
+            fields=(),
+            optional=True,
         ),
         WizardStep(
             "websearch",

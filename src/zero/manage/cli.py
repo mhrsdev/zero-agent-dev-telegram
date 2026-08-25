@@ -439,7 +439,12 @@ def cmd_doctor(ns) -> int:
             print(f"{sym[c['status']]} {c['name']}: {c['detail']}")
         print(f"\n{len(report['checks'])} checks · {len(failed)} fail · {len(warn)} warn")
     if ns.fix:
-        print("safe fixes applied where possible (permissions, migrations)")
+        # Audit S7: the previous message claimed fixes were applied when
+        # DoctorService implements none. Be honest until real automated
+        # remediation exists.
+        print(
+            "no automated fixes are available in this release; apply the suggested actions manually"
+        )
     return 4 if failed else 0
 
 

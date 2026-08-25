@@ -11,6 +11,13 @@ from __future__ import annotations
 from typing import ClassVar
 
 
+def panel_base() -> str:
+    """Admin GUI base URL; ZERO_PANEL_PORT matches zero.main.resolve_bind."""
+    import os
+
+    return "http://127.0.0.1:" + os.environ.get("ZERO_PANEL_PORT", "8000")
+
+
 def run() -> int:
     try:
         from textual.app import App, ComposeResult
@@ -218,7 +225,7 @@ def run() -> int:
                         httpx.Client(timeout=None) as client,
                         client.stream(
                             "GET",
-                            f"http://127.0.0.1:8787/admin/executions/{exec_id}/stream",
+                            f"{panel_base()}/admin/executions/{exec_id}/stream",
                             cookies={"zero_admin": cookie},
                         ) as response,
                     ):
@@ -267,7 +274,7 @@ def run() -> int:
 
         try:
             response = httpx.post(
-                "http://127.0.0.1:8787/admin/login",
+                panel_base() + "/admin/login",
                 data={"secret": password},
                 follow_redirects=False,
                 timeout=10.0,

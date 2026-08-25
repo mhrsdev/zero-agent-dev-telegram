@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import time
@@ -239,7 +240,8 @@ def _usage_summary(days: int = 30) -> list:
             (since,),
         ).fetchall()
         return [dict(r) for r in rows]
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - degrade UI, but log loudly
+        logging.getLogger(__name__).warning("usage summary query failed: %s", type(exc).__name__)
         return []
 
 
@@ -630,10 +632,9 @@ displays them.</p>"""
             return HTMLResponse("bad csrf", status_code=400)
         svc = _setup()
         if action == "back":
-            idx = STEP_ORDER_IDX.get(step_id, 0)
-            draft = cfg_draft_data()
-            draft["current_step"] = ORDER_LIST[max(0, idx - 1)]
-            save_draft(draft)
+            # Audit S4: delegate to the shared state machine instead of
+            # hand-rolling step arithmetic here.
+            svc.back(step_id)
             return RedirectResponse("/admin/wizard", status_code=303)
         if action == "commit":
             try:

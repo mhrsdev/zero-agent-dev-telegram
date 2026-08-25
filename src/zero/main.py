@@ -68,17 +68,30 @@ except ConfigError as exc:
     raise
 
 
+def resolve_bind() -> tuple[str, int]:
+    """Loopback-first bind address; ZERO_PANEL_PORT overrides the port.
+
+    Audit D6: the TUI reads the same variable so its admin links point
+    at the panel actually running.
+    """
+    import os
+
+    port = int(os.environ.get("ZERO_PANEL_PORT", "8000"))
+    return "127.0.0.1", port
+
+
 def run() -> None:
     """Console-script entry point: run uvicorn with sensible defaults."""
     import uvicorn
 
+    host, port = resolve_bind()
     uvicorn.run(
         "zero.main:app",
-        host="127.0.0.1",
-        port=8000,
+        host=host,
+        port=port,
         reload=_settings.is_development,
         log_level=_settings.log_level.lower(),
     )
 
 
-__all__ = ["app", "create_app", "run"]
+__all__ = ["app", "create_app", "resolve_bind", "run"]

@@ -215,7 +215,33 @@ def _build_sandbox_executor(settings):
         raise ConfigError(str(exc)) from exc
 
 
-def _load_extensions(tool_service) -> None:
+class _PluginSecretFacade:
+    """Name-based read-only secret access for plugins (audit S12).
+
+    Resolves only within the management project so a plugin cannot walk
+    arbitrary project scopes.
+    """
+
+    def __init__(self, secret_service, project) -> None:
+        self._svc = secret_service
+        self._project = project
+
+    def resolve_by_name(self, name: str) -> str | None:
+        ref = self._svc.get_reference_by_name(
+            project_id=self._project.id,
+            name=name,
+            actor_id=self._project.owner_user_id,
+        )
+        if ref is None or ref.is_revoked:
+            return None
+        return self._svc.resolve_value(
+            project_id=self._project.id,
+            secret_id=ref.id,
+            actor_id=self._project.owner_user_id,
+        )
+
+
+def _load_extensions(tool_service, *, secret_service=None, identity=None) -> None:
     """Wire MCP servers and plugins (GAP 7); failures are logged only."""
     try:
         from zero.manage.core.mcp_client import get_mcp_manager
@@ -229,7 +255,30 @@ def _load_extensions(tool_service) -> None:
     try:
         from zero.manage.plugins.registry import load_plugins
 
-        loaded = load_plugins(tool_service)
+        config = None
+        facade = None
+        try:
+            import os as _os
+            from pathlib import Path as _Path
+
+            from zero.manage.core.config import ConfigService
+
+            home = _Path(_os.environ.get("ZERO_HOME", _Path.home() / ".zero"))
+            cfgsvc = ConfigService(home)
+            if cfgsvc.exists():
+                config = cfgsvc.load()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("plugin config unavailable: %s", type(exc).__name__)
+        if secret_service is not None and identity is not None:
+            for p in identity.list_projects():
+                if p.name == "Zero Management":
+                    facade = _PluginSecretFacade(secret_service, p)
+                    break
+        loaded = load_plugins(
+            tool_service,
+            config=config,
+            secret_store=facade,
+        )
         if loaded:
             logger.info("plugins loaded: %s", loaded)
     except Exception as exc:  # noqa: BLE001
@@ -291,7 +340,11 @@ def build_services(
         # GAP 7: extension loading is opt-in and never fatal. MCP servers
         # require explicit ZERO_MCP_SERVERS entries; plugins load from
         # $ZERO_HOME/plugins and /opt/zero/plugins when present.
-        _load_extensions(tool_service)
+        _load_extensions(
+            tool_service,
+            secret_service=secret_service,
+            identity=identity_service,
+        )
     agent_type_service = AgentTypeService(agent_type_repo, audit_repo, authorization_service)
     artifact_service = ArtifactService(
         artifact_repo, agent_type_repo, audit_repo, authorization_service
