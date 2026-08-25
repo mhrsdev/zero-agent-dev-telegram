@@ -1,0 +1,35 @@
+name: Live integration tests
+
+# GAP 1: real Telegram/provider qualification. Manual dispatch ONLY —
+# this workflow never runs on push or pull_request.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    name: Live Telegram + provider adapters
+    runs-on: ubuntu-latest
+    env:
+      ZERO_ENABLE_LIVE_TESTS: "1"
+      LIVE_TELEGRAM_BOT_TOKEN: ${{ secrets.LIVE_TELEGRAM_BOT_TOKEN }}
+      LIVE_TELEGRAM_CHAT_ID: ${{ secrets.LIVE_TELEGRAM_CHAT_ID }}
+      LIVE_OPENAI_API_KEY: ${{ secrets.LIVE_OPENAI_API_KEY }}
+      LIVE_ANTHROPIC_API_KEY: ${{ secrets.LIVE_ANTHROPIC_API_KEY }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project and development tools
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+      - name: Run live integration tests
+        run: >
+          python -m pytest tests/integration_live
+          -m "live_telegram or live_provider"
+          -rA -p no:cacheprovider

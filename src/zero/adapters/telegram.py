@@ -187,6 +187,14 @@ class TelegramAdapter(BaseMessagingAdapter):
             raise RuntimeError("Telegram API returned an unsuccessful response")
         return response
 
+    def get_me(self) -> dict[str, Any]:
+        """Fetch the bot's own identity via ``getMe``."""
+        response = self._call_api("getMe", {})
+        data = self._response_json(response)
+        if not isinstance(data, Mapping) or not isinstance(data.get("result"), Mapping):
+            raise RuntimeError("Telegram getMe returned an unexpected payload")
+        return dict(data["result"])
+
     def send_message(
         self,
         *,
