@@ -28,7 +28,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field
 
 from zero import __version__
 from zero.adapters.messaging import UnsupportedUpdateError, WebhookAuthError
@@ -46,9 +46,13 @@ from zero.app.interface_transport_service import (
     InterfaceScopeError,
     InterfaceTransportNotConfigured,
 )
+from zero.app.routers.audit import register_audit_routes
 from zero.app.routers.auth import register_auth_routes
-from zero.app.routers.deps import authorized_actor, request_project_actor
+from zero.app.routers.authorization import register_authorization_routes
+from zero.app.routers.deps import authorized_actor
 from zero.app.routers.identity import register_identity_routes
+from zero.app.routers.secret import register_secret_routes
+from zero.app.routers.tool import register_tool_routes
 from zero.app.services import Services, build_services
 from zero.config import Settings
 from zero.domain.authorization import AuthorizationError
@@ -59,8 +63,6 @@ from zero.domain.identity import (
 )
 from zero.domain.interfaces import InterfaceBindingId
 from zero.domain.plans import PlanError
-from zero.domain.secrets import SecretError
-from zero.domain.tools import ToolError
 from zero.persistence.connection import Database
 from zero.persistence.migrations import (
     apply_migrations,
@@ -70,28 +72,6 @@ from zero.persistence.migrations import (
 # ----------------------------------------------------------------------
 # Request/response models (Pydantic v2)
 # ----------------------------------------------------------------------
-
-
-class StoreSecretRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=200)
-    secret_type: str = Field(..., pattern="^(api_key|token|password|other)$")
-    # SecretStr keeps the plaintext out of reprs/logs by construction
-    # (the same convention as Settings) without version-fragile
-    # Field(repr=...) metadata.
-    value: SecretStr = Field(..., min_length=1)
-
-
-class GrantToolRequest(BaseModel):
-    tool_id: str
-    agent_scope: str = Field(..., pattern="^(main_planner|main_worker|sub_agent_type|integration)$")
-    max_invocations: int | None = None
-    timeout_seconds: int | None = None
-
-
-class InvokeToolRequest(BaseModel):
-    tool_name: str
-    input_data: dict[str, Any]
-    agent_scope: str = Field(..., pattern="^(main_planner|main_worker|sub_agent_type|integration)$")
 
 
 class _StrictRequest(BaseModel):
@@ -256,10 +236,10 @@ def create_app(settings: Settings) -> FastAPI:
     _register_health_routes(app, health_service, services=services, settings=settings)
     register_auth_routes(app, services)
     register_identity_routes(app, services)
-    _register_authorization_routes(app, services)
-    _register_secret_routes(app, services)
-    _register_tool_routes(app, services)
-    _register_audit_routes(app, services)
+    register_authorization_routes(app, services)
+    register_secret_routes(app, services)
+    register_tool_routes(app, services)
+    register_audit_routes(app, services)
     _register_plan_routes(app, services)
     _register_execution_routes(app, services)
     _register_artifact_routes(app, services)
@@ -487,289 +467,6 @@ def _register_health_routes(
 
 # ----------------------------------------------------------------------
 # Authorization routes
-# ----------------------------------------------------------------------
-
-
-def _register_authorization_routes(app: FastAPI, services: Services) -> None:
-    @app.post(
-        "/projects/{project_id}/authorize",
-        tags=["authorization"],
-    )
-    def authorize(
-        project_id: str,
-        actor_id: str = "",
-        permission: str = "project.view",
-    ) -> dict[str, Any]:
-        """Check whether an actor may perform a permission on a project.
-
-        This endpoint is for diagnostics and tests. Real mutations
-        call :meth:`AuthorizationService.require_permission` internally
-        rather than going through this endpoint.
-        """
-        from zero.domain.identity import ProjectId
-
-        try:
-            decision = services.authorization.authorize(
-                actor_id=authenticated_actor(actor_id),
-                project_id=ProjectId(project_id),
-                permission=permission,  # type: ignore[arg-type]
-                source="web",
-            )
-        except ValueError:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="request failed")
-        return {
-            "allowed": decision.allowed,
-            "actor_id": decision.actor_id.value if decision.actor_id else None,
-            "project_id": decision.project_id.value,
-            "permission": decision.permission,
-            "role": decision.role,
-            "reason": decision.reason,
-        }
-
-
-# ----------------------------------------------------------------------
-# Secret routes
-# ----------------------------------------------------------------------
-
-
-def _register_secret_routes(app: FastAPI, services: Services) -> None:
-    @app.post(
-        "/projects/{project_id}/secrets",
-        tags=["secrets"],
-        status_code=status.HTTP_201_CREATED,
-    )
-    def store_secret(request: Request, project_id: str, req: StoreSecretRequest) -> dict[str, Any]:
-        from zero.domain.identity import ProjectId
-
-        try:
-            secret_ref = services.secrets.store(
-                project_id=ProjectId(project_id),
-                name=req.name,
-                secret_type=req.secret_type,  # type: ignore[arg-type]
-                value=req.value.get_secret_value(),
-                actor_id=request_project_actor(request, services, project_id),
-                source="web",
-            )
-        except ValueError:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="request failed")
-        except SecretError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to store secret",
-            ) from exc
-        # IMPORTANT: we never return the value. We return only metadata.
-        return {
-            "id": secret_ref.id.value,
-            "project_id": secret_ref.project_id.value,
-            "name": secret_ref.name,
-            "secret_type": secret_ref.secret_type,
-            "created_at": secret_ref.created_at,
-            "revoked_at": secret_ref.revoked_at,
-        }
-
-    @app.get("/projects/{project_id}/secrets", tags=["secrets"])
-    def list_secrets(request: Request, project_id: str) -> list[dict[str, Any]]:
-        from zero.domain.identity import ProjectId
-
-        refs = services.secrets.list_for_project(
-            project_id=ProjectId(project_id),
-            actor_id=request_project_actor(request, services, project_id),
-            source="web",
-        )
-        return [
-            {
-                "id": r.id.value,
-                "project_id": r.project_id.value,
-                "name": r.name,
-                "secret_type": r.secret_type,
-                "created_at": r.created_at,
-                "revoked_at": r.revoked_at,
-            }
-            for r in refs
-        ]
-
-    @app.post(
-        "/projects/{project_id}/secrets/{secret_id}/revoke",
-        tags=["secrets"],
-        status_code=status.HTTP_204_NO_CONTENT,
-    )
-    def revoke_secret(request: Request, project_id: str, secret_id: str):
-        from zero.domain.identity import ProjectId
-        from zero.domain.secrets import SecretReferenceId
-
-        try:
-            services.secrets.revoke(
-                project_id=ProjectId(project_id),
-                secret_id=SecretReferenceId(secret_id),
-                actor_id=request_project_actor(request, services, project_id),
-                source="web",
-            )
-        except (SecretError, ValueError):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request failed")
-
-
-# ----------------------------------------------------------------------
-# Tool routes
-# ----------------------------------------------------------------------
-
-
-def _register_tool_routes(app: FastAPI, services: Services) -> None:
-    @app.get("/tools", tags=["tools"])
-    def list_tools() -> list[dict[str, Any]]:
-        tools = services.tools.list_tools()
-        return [
-            {
-                "id": t.id.value,
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.input_schema,
-                "output_schema": t.output_schema,
-            }
-            for t in tools
-        ]
-
-    @app.post(
-        "/projects/{project_id}/tool-grants",
-        tags=["tools"],
-        status_code=status.HTTP_201_CREATED,
-    )
-    def grant_tool(request: Request, project_id: str, req: GrantToolRequest) -> dict[str, Any]:
-        from zero.domain.identity import ProjectId
-        from zero.domain.tools import ToolId
-
-        try:
-            grant = services.tools.grant_tool(
-                project_id=ProjectId(project_id),
-                actor_id=request_project_actor(request, services, project_id),
-                tool_id=ToolId(req.tool_id),
-                agent_scope=req.agent_scope,  # type: ignore[arg-type]
-                max_invocations=req.max_invocations,
-                timeout_seconds=req.timeout_seconds,
-                source="web",
-            )
-        except (ToolError, ValueError):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="request failed")
-        return {
-            "id": grant.id.value,
-            "project_id": grant.project_id.value,
-            "tool_id": grant.tool_id.value,
-            "agent_scope": grant.agent_scope,
-            "max_invocations": grant.max_invocations,
-            "timeout_seconds": grant.timeout_seconds,
-        }
-
-    @app.delete(
-        "/projects/{project_id}/tool-grants/{tool_id}",
-        tags=["tools"],
-        status_code=status.HTTP_204_NO_CONTENT,
-    )
-    def revoke_tool_grant(
-        request: Request,
-        project_id: str,
-        tool_id: str,
-        agent_scope: str,
-    ):
-        """Revoke a project tool grant; takes effect immediately."""
-        from zero.domain.identity import ProjectId
-        from zero.domain.tools import ToolId
-
-        services.tools.revoke_tool_grant(
-            project_id=ProjectId(project_id),
-            actor_id=request_project_actor(request, services, project_id),
-            tool_id=ToolId(tool_id),
-            agent_scope=agent_scope,  # type: ignore[arg-type]
-            source="web",
-        )
-
-    @app.post(
-        "/projects/{project_id}/tool-invocations",
-        tags=["tools"],
-    )
-    def invoke_tool(request: Request, project_id: str, req: InvokeToolRequest) -> dict[str, Any]:
-        from zero.domain.identity import ProjectId
-
-        try:
-            result = services.tools.invoke(
-                project_id=ProjectId(project_id),
-                actor_id=request_project_actor(request, services, project_id),
-                agent_scope=req.agent_scope,  # type: ignore[arg-type]
-                tool_name=req.tool_name,
-                input_data=req.input_data,
-                source="web",
-                secret_service=services.secrets,
-            )
-        except ToolError as exc:
-            # Map typed tool errors to HTTP statuses.
-            from zero.domain.tools import (
-                ToolInputValidationError,
-                ToolInvocationDeniedError,
-                ToolNotFoundError,
-            )
-
-            if isinstance(exc, ToolInputValidationError):
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail={"error": "request validation failed", "errors": []},
-                )
-            if isinstance(exc, ToolInvocationDeniedError):
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="request failed")
-            if isinstance(exc, ToolNotFoundError):
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request failed")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Tool invocation failed",
-            ) from exc
-        return {
-            "tool_id": result.tool_id.value,
-            "status": result.status,
-            "output": result.output,
-            "model_facing": result.model_facing,
-            "duration_ms": result.duration_ms,
-        }
-
-
-# ----------------------------------------------------------------------
-# Audit routes
-# ----------------------------------------------------------------------
-
-
-def _register_audit_routes(app: FastAPI, services: Services) -> None:
-    @app.get("/projects/{project_id}/audit", tags=["audit"])
-    def list_audit_events(
-        request: Request,
-        project_id: str,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        from zero.domain.identity import ProjectId
-
-        events = services.audit.list_for_project(
-            project_id=ProjectId(project_id),
-            actor_id=request_project_actor(request, services, project_id),
-            limit=limit,
-            offset=offset,
-            source="web",
-        )
-        return [
-            {
-                "id": e.id.value,
-                "project_id": e.project_id.value if e.project_id else None,
-                "actor_id": e.actor_id.value if e.actor_id else None,
-                "source": e.source,
-                "operation": e.operation,
-                "target_type": e.target_type,
-                "target_id": e.target_id,
-                "result": e.result,
-                "correlation_id": e.correlation_id,
-                "redacted_summary": e.redacted_summary,
-                "created_at": e.created_at,
-            }
-            for e in events
-        ]
-
-
-# ----------------------------------------------------------------------
-# Plan routes (Phase 3, M4)
 # ----------------------------------------------------------------------
 
 
