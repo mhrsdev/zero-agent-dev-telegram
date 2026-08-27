@@ -60,6 +60,17 @@ if TYPE_CHECKING:
 _MAX_EVIDENCE_BYTES = 64 * 1024
 _DEFAULT_MAX_TOOL_ROUNDS = 8
 _LOGGER = logging.getLogger(__name__)
+#: Hermes-parity resilience knobs for the execution tool loop.
+#:
+#: A single malformed tool-call argument or one repeated tool failure
+#: must never kill a whole attempt: structured error payloads go back to
+#: the model so it can self-correct, truncated calls get a bounded
+#: max_tokens boost instead of being executed half-parsed, and identical
+#: failure loops trip a breaker that falls through to the summary nudge.
+_MAX_TRUNCATION_BOOSTS_PER_LOOP = 2
+_MAX_BOOSTED_TOKENS = 32768
+_FAILURE_WARN_THRESHOLD = 3
+_FAILURE_ABORT_THRESHOLD = 5
 #: Final toolless request when the round budget is exhausted (Hermes
 #: parity: request a summary instead of hard-failing the turn).
 MAX_TOOL_ROUNDS_NUDGE_REQUEST = (
@@ -179,6 +190,8 @@ class AgentRuntime:
         compaction: CompactionService | None = None,
         test_command: tuple[str, ...] | None = ("pytest", "-q"),
         enable_delegation: bool = False,
+        approval_gate: Any | None = None,
+        metrics: Any | None = None,
     ) -> None:
         self._worker = worker
         self._providers = providers
@@ -187,6 +200,13 @@ class AgentRuntime:
         self._tools = tools
         self._worktrees = worktrees
         self._context_builder = context_builder
+        # GAP 8b/G2 Hermes parity: optional per-call tool approval gate
+        # (ToolApprovalGate). ``None`` keeps historical plan-only posture.
+        self._approval_gate = approval_gate
+        # Optional MetricsService for execution-loop defect counters
+        # (closed label vocabulary; per-model detail lives in the S7
+        # JSONL ledger instead).
+        self._metrics = metrics
         self._agent_type_repo = agent_type_repo
         self._compaction = compaction
         self._test_command = test_command
@@ -294,11 +314,15 @@ class AgentRuntime:
                 if isinstance(exc, KeyboardInterrupt):
                     raise
                 errors.append(exc)
+                # Include the message, not just the class name: a bare
+                # "RuntimeEvidenceError" hid WHY evidence was refused
+                # (the exact silent-skip trap installation audit R6
+                # documents).
                 _LOGGER.warning(
                     "ready task %s in execution %s failed without blocking siblings: %s",
                     task.id.value,
                     execution_id.value,
-                    type(exc).__name__,
+                    exc,
                 )
         if not results and errors:
             raise errors[0]
@@ -1163,8 +1187,69 @@ class AgentRuntime:
                     f"attempt lease expired during tool round: {lease_exc}"
                 ) from lease_exc
 
+        def _synthetic_tool_error(call_id: str, payload: dict[str, object]) -> CanonicalMessage:
+            """Hermes parity: never raise on recoverable call defects.
+
+            The model receives a structured error as the paired tool
+            message so it can correct course in the next round instead of
+            losing the whole attempt to one malformed argument.
+            """
+            return CanonicalMessage(
+                role="tool",
+                content=json.dumps(payload, ensure_ascii=False),
+                tool_call_id=call_id,
+            )
+
+        failure_signatures: dict[str, int] = {}
+        boost_budget = _MAX_TRUNCATION_BOOSTS_PER_LOOP
+        breaker_tripped = False
+
         for _round in range(max_tool_rounds):
             _renew_lease()
+
+            # ---- truncation boost ladder (before history append) ------
+            # finish_reason=length can truncate arguments mid-JSON. If any
+            # call fails to parse AND the cap was hit, discard the broken
+            # assistant turn entirely and re-ask once with doubled output
+            # budget rather than executing guessed/partial arguments.
+            if (
+                current_response.finish_reason == "length"
+                and current_response.tool_calls
+                and boost_budget > 0
+                and any(
+                    self._tool_argument_error(call) is not None
+                    for call in current_response.tool_calls
+                )
+            ):
+                boosted_request = replace(
+                    request,
+                    messages=tuple(messages),
+                    max_tokens=min(request.max_tokens * 2, _MAX_BOOSTED_TOKENS),
+                )
+                boost_budget -= 1
+                if self._metrics is not None:
+                    self._metrics.increment(
+                        "agent_runtime_truncation_boosts",
+                        project_id=task.project_id.value,
+                        result="boosted_reask",
+                    )
+                next_provider_request, boosted_response = (
+                    self._providers.send_request_with_fallback(
+                        project_id=task.project_id,
+                        actor_id=actor_id,
+                        execution_id=execution_id,
+                        request=boosted_request,
+                        cancel_event=cancel_event,
+                        source=source,
+                        agent_scope=agent_scope,
+                        stream_observer=stream_observer,
+                    )
+                )
+                current_request_id = next_provider_request.id
+                current_response = boosted_response
+                if not current_response.tool_calls:
+                    return current_response, current_request_id, messages
+
             messages.append(
                 CanonicalMessage(
                     role="assistant",
@@ -1175,6 +1260,7 @@ class AgentRuntime:
                     ),
                 )
             )
+            abort_after_batch = False
             for call in current_response.tool_calls:
                 if call.tool_name == DELEGATE_TOOL_NAME and self._enable_delegation:
                     # GAP 8: delegation is runtime-owned; it never flows
@@ -1196,24 +1282,89 @@ class AgentRuntime:
                         )
                     )
                     continue
-                if call.tool_name not in requested_names:
-                    raise RuntimeToolError(
-                        f"provider requested an undeclared tool {call.tool_name!r}"
+                arg_error = self._tool_argument_error(call)
+                if arg_error is not None:
+                    if self._metrics is not None:
+                        self._metrics.increment(
+                            "agent_runtime_tool_call_defects",
+                            project_id=task.project_id.value,
+                            result="invalid_arguments",
+                        )
+                    messages.append(
+                        _synthetic_tool_error(
+                            call.tool_call_id,
+                            {
+                                "error": "invalid_tool_arguments",
+                                "detail": arg_error,
+                                "hint": "Re-issue this tool call with a JSON object "
+                                "whose keys match the declared schema.",
+                            },
+                        )
                     )
-                try:
-                    input_data = json.loads(call.arguments)
-                except json.JSONDecodeError as exc:
-                    raise RuntimeToolError(
-                        f"tool {call.tool_name!r} returned invalid JSON arguments"
-                    ) from exc
-                if not isinstance(input_data, dict):
-                    raise RuntimeToolError(f"tool {call.tool_name!r} arguments must be an object")
+                    continue
+                if call.tool_name not in requested_names:
+                    if self._metrics is not None:
+                        self._metrics.increment(
+                            "agent_runtime_tool_call_defects",
+                            project_id=task.project_id.value,
+                            result="undeclared_tool",
+                        )
+                    messages.append(
+                        _synthetic_tool_error(
+                            call.tool_call_id,
+                            {
+                                "error": "undeclared_tool",
+                                "detail": (
+                                    f"tool {call.tool_name!r} is not declared for this task"
+                                ),
+                                "declared_tools": sorted(requested_names),
+                            },
+                        )
+                    )
+                    continue
+                call_arguments = json.loads(call.arguments)
+                if self._approval_gate is not None:
+                    verdict = self._approval_gate.evaluate(
+                        project_id=task.project_id.value,
+                        execution_id=execution_id.value,
+                        tool_name=call.tool_name,
+                        input_data=call_arguments,
+                    )
+                    if verdict.state != "allowed":
+                        if self._metrics is not None:
+                            self._metrics.increment(
+                                "agent_runtime_tool_call_defects",
+                                project_id=task.project_id.value,
+                                result=(
+                                    "approval_pending"
+                                    if verdict.state == "pending"
+                                    else "approval_denied"
+                                ),
+                            )
+                        payload: dict[str, object] = {
+                            "error": (
+                                "approval_pending"
+                                if verdict.state == "pending"
+                                else "approval_denied"
+                            ),
+                            "tool": call.tool_name,
+                        }
+                        if verdict.request is not None and verdict.state == "pending":
+                            payload["approval_request_id"] = verdict.request.id
+                            payload["hint"] = (
+                                "A human must approve this tool call before it runs. "
+                                "Continue with other work or finalize your answer."
+                            )
+                        elif verdict.cause is not None:
+                            payload["cause"] = verdict.cause
+                        messages.append(_synthetic_tool_error(call.tool_call_id, payload))
+                        continue
                 result = self._tools.invoke(
                     project_id=task.project_id,
                     actor_id=actor_id,
                     agent_scope=agent_scope,
                     tool_name=call.tool_name,
-                    input_data=input_data,
+                    input_data=call_arguments,
                     execution_id=execution_id.value,
                     task_id=task.id.value,
                     source=source,
@@ -1225,6 +1376,32 @@ class AgentRuntime:
                         tool_call_id=call.tool_call_id,
                     )
                 )
+                # ---- identical-failure loop breaker --------------------
+                status = getattr(result, "status", "success")
+                if status in ("success", "unknown"):
+                    continue
+                signature = (
+                    call.tool_name,
+                    (getattr(result, "error", None) or result.model_facing or "")[:120],
+                )
+                count = failure_signatures.get(signature, 0) + 1
+                failure_signatures[signature] = count
+                if count == _FAILURE_WARN_THRESHOLD:
+                    messages.append(
+                        CanonicalMessage(
+                            role="user",
+                            content=(
+                                f"Tool {call.tool_name!r} has failed {count} times with an "
+                                "identical error. Change your approach or try a different "
+                                "strategy before calling it again."
+                            ),
+                        )
+                    )
+                elif count >= _FAILURE_ABORT_THRESHOLD:
+                    breaker_tripped = True
+                    abort_after_batch = True
+            if abort_after_batch:
+                break
             # Field-preserving reconstruction: replace() carries any
             # CanonicalRequest field this loop does not manage (notably
             # ``stream``) instead of silently resetting it.
@@ -1244,9 +1421,14 @@ class AgentRuntime:
             if not current_response.tool_calls:
                 return current_response, current_request_id, messages
         unresolved = ", ".join(call.tool_name for call in current_response.tool_calls)
-        # Round budget exhausted: one final toolless request asking the
-        # model for its summary (reference parity). If it STILL returns
-        # tool calls, the original failure stands.
+        reason = (
+            "identical-failure loop breaker tripped"
+            if breaker_tripped
+            else f"model/tool loop exceeded {max_tool_rounds} rounds"
+        )
+        # Round budget exhausted (or breaker fired): one final toolless
+        # request asking the model for its summary (reference parity). If
+        # it STILL returns tool calls, the original failure stands.
         nudge_request = replace(
             request,
             messages=tuple(messages)
@@ -1272,9 +1454,26 @@ class AgentRuntime:
         else:
             if not nudge_response.tool_calls:
                 return nudge_response, nudge_provider_request.id, messages
-        raise RuntimeToolError(
-            f"model/tool loop exceeded {max_tool_rounds} rounds with unresolved calls: {unresolved}"
-        )
+        raise RuntimeToolError(f"{reason} with unresolved calls: {unresolved}")
+
+    @staticmethod
+    def _tool_argument_error(call: Any) -> str | None:
+        """Describe a defective tool-call argument payload, or None.
+
+        Hermes parity check used by BOTH the truncation ladder (a cap-hit
+        plus unparseable arguments means the call may be half-written)
+        and the synthesized-error path. Deliberately refuses coercion:
+        guessed arguments are never executed.
+        """
+        try:
+            data = json.loads(call.arguments)
+        except json.JSONDecodeError as exc:
+            return (
+                f"arguments are not valid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno})"
+            )
+        if not isinstance(data, dict):
+            return "arguments must decode to a JSON object"
+        return None
 
     def _collect_workspace_evidence(
         self,

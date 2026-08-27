@@ -205,3 +205,7 @@ def generate_interface_delivery_id() -> str:
 
 def generate_callback_token_id() -> str:
     return f"ct_{_generate_token()}"
+
+
+def generate_tool_approval_id() -> str:
+    return f"ta_{_generate_token()}"

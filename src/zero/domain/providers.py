@@ -165,6 +165,54 @@ class ToolDeclaration:
         return dict(self.parameters)
 
 
+TOOL_CHOICE_MODES = ("auto", "none", "required")
+
+
+def normalize_tool_choice(
+    value: str | Mapping[str, Any] | None,
+) -> str | dict[str, Any] | None:
+    """Canonicalize a ``tool_choice`` request value.
+
+    Providers express tool-call forcing differently; Zero's canonical
+    vocabulary is:
+
+    - ``None`` — no explicit choice (the provider default applies).
+    - ``"auto" / "none" / "required"`` — mode strings.
+    - ``{"type": "function", "name": <tool>}`` — force one specific
+      function. Shorthands ``{"name": <tool>}`` and OpenAI's nested
+      ``{"function": {"name": <tool>}}`` are accepted and folded into
+      the canonical form so adapters and request hashing see one shape.
+
+    Raises ValueError/TypeError on unusable shapes so misconfiguration
+    fails loudly at request-build time instead of leaking a provider 400.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode not in TOOL_CHOICE_MODES:
+            raise ValueError(
+                f"tool_choice must be one of {TOOL_CHOICE_MODES} or a function mapping; "
+                f"got {value!r}"
+            )
+        return mode
+    if isinstance(value, Mapping):
+        name = ""
+        if "function" in value:
+            function = value.get("function")
+            if isinstance(function, Mapping):
+                name = str(function.get("name") or "")
+        else:
+            kind = str(value.get("type") or "function")
+            if kind != "function":
+                raise ValueError(f"unsupported canonical tool_choice type {kind!r}")
+            name = str(value.get("name") or "")
+        if not name.strip():
+            raise ValueError("forced tool_choice requires a non-empty function 'name'")
+        return {"type": "function", "name": name.strip()}
+    raise TypeError(f"unsupported tool_choice specification: {type(value).__name__}")
+
+
 def coerce_tool_declarations(
     tools: Sequence[ToolDeclaration | str | Mapping[str, Any]],
 ) -> tuple[ToolDeclaration, ...]:
@@ -205,6 +253,9 @@ class CanonicalRequest:
         tools: tool declarations available to the model. Bare name
             strings are accepted for compatibility and coerced to
             declarations without schemas.
+        tool_choice: optional forcing policy — a mode string, a forced
+            function spec, or None for the provider default. See
+            :func:`normalize_tool_choice` for the canonical shapes.
         system_message: optional system message (separate from messages).
     """
 
@@ -214,6 +265,7 @@ class CanonicalRequest:
     max_tokens: int = 4096
     temperature: float = 0.0
     tools: tuple[ToolDeclaration | str, ...] = ()
+    tool_choice: str | Mapping[str, Any] | None = None
     system_message: str | None = None
     stream: bool = False
 

@@ -120,6 +120,11 @@ uv pip install -e ".[dev]"
 
 export ZERO_ENV=development
 zero-develop serve
+
+# Bare start also works: with ZERO_ENV unset, `serve` assumes the
+# development defaults above (local SQLite, loopback bind) and prints
+# a notice. Production still requires explicit configuration.
+# zero-develop serve --host 127.0.0.1 --port 8000
 ```
 
 Open:
@@ -184,6 +189,7 @@ automatically. Never commit a real `.env`.
 | `ZERO_MCP_SERVERS` | No | JSON array of MCP stdio servers to expose as tools. |
 | `ZERO_CHAT_RATE_LIMIT_PER_MIN` | No | Admin chat endpoint budget per minute (default `10`). |
 | `ZERO_DECOMPOSITION_ENABLED` | No | Opt-in LLM plan decomposition (`1`/`true`). |
+| `ZERO_TOOL_APPROVAL_MODE` | No | Per-call tool approval gate (`off` default / `manual`). Manual mode consults a durable gate before every declared tool call in task executions: hardline floor, deny rules outrank allows, pending queue answerable at `GET/POST /projects/{id}/tool-approvals`. |
 | `ZERO_PG_POOL_MIN` / `ZERO_PG_POOL_MAX` | No | PostgreSQL pool bounds (defaults `2`/`20`). |
 | `ZERO_ENABLE_LIVE_TESTS` | No | Must be `1` plus credentials to run `tests/integration_live`. See [docs/LIVE_TESTING.md](docs/LIVE_TESTING.md). |
 

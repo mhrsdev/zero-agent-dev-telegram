@@ -58,6 +58,7 @@ from zero.domain.providers import (
     ToolCallResult,
     ToolDeclaration,
     coerce_tool_declarations,
+    normalize_tool_choice,
 )
 from zero.persistence.repositories.provider_repository import (
     ProviderRepository,
@@ -105,6 +106,61 @@ def _rate_limit_detail(response: httpx.Response) -> str:
     return f" (retry_after={retry_after})" if retry_after else ""
 
 
+def _render_openai_tool_choice(value) -> dict[str, Any] | str:
+    """Render a canonical tool_choice for OpenAI-compatible endpoints.
+
+    Modes pass through; a forced function becomes the nested
+    ``{"type": "function", "function": {"name": ...}}`` wire shape.
+    """
+    normalized = normalize_tool_choice(value)
+    if normalized is None:
+        raise InvalidProviderRequestError("tool_choice is None")
+    if isinstance(normalized, str):
+        return normalized
+    return {"type": "function", "function": {"name": normalized["name"]}}
+
+
+def _apply_tool_choice(
+    payload: dict[str, Any], request: CanonicalRequest, *, protocol: str
+) -> None:
+    """Attach the normalized tool_choice to an outgoing payload when set.
+
+    Silent no-op when no tools were rendered (a choice without tools is
+    meaningless and some gateways 400 on it), loud failure when the
+    value itself is malformed.
+    """
+    if request.tool_choice is None or "tools" not in payload:
+        return
+    if protocol == "openai-compatible":
+        payload["tool_choice"] = _render_openai_tool_choice(request.tool_choice)
+    elif protocol == "anthropic":
+        choice = normalize_tool_choice(request.tool_choice)
+        if choice is None:  # pragma: no cover - guarded above
+            return
+        if choice == "auto":
+            payload["tool_choice"] = {"type": "auto"}
+        elif choice in ("required", "any"):
+            payload["tool_choice"] = {"type": "any"}
+        elif choice == "none":
+            raise InvalidProviderRequestError(
+                "anthropic has no 'none' tool_choice; drop the tool declarations instead"
+            )
+        else:
+            payload["tool_choice"] = {"type": "tool", "name": choice["name"]}
+    else:  # pragma: no cover - internal protocol registry only
+        raise ValueError(f"unknown provider protocol {protocol!r}")
+
+
+def _hashable_tool_choice(req: CanonicalRequest) -> Any:
+    """Deterministic JSON-ready canonical view of ``tool_choice``."""
+    normalized = normalize_tool_choice(req.tool_choice)
+    if normalized is None:
+        return None
+    if isinstance(normalized, str):
+        return normalized
+    return {"name": normalized["name"], "type": "function"}
+
+
 def compute_request_hash(
     req: CanonicalRequest,
     *,
@@ -117,33 +173,38 @@ def compute_request_hash(
     deduplication": if the same request is submitted twice, the second
     is a no-op.
     """
+    request_payload: dict[str, Any] = {
+        "scope": scope,
+        "provider": req.provider,
+        "model_name": req.model_name,
+        "messages": [
+            {
+                "role": m.role,
+                "content": m.content,
+                "tool_call_id": m.tool_call_id,
+                "tool_calls": list(m.tool_calls),
+            }
+            for m in req.messages
+        ],
+        "max_tokens": req.max_tokens,
+        "temperature": req.temperature,
+        "tools": [
+            {
+                "name": declaration.name,
+                "description": declaration.description,
+                "parameters": declaration.normalized_parameters(),
+            }
+            for declaration in coerce_tool_declarations(req.tools)
+        ],
+        "system_message": req.system_message,
+        "stream": req.stream,
+    }
+    # Only present when set, so hashes of choice-free requests stay
+    # byte-identical across the introduction of this field.
+    if req.tool_choice is not None:
+        request_payload["tool_choice"] = _hashable_tool_choice(req)
     payload = json.dumps(
-        {
-            "scope": scope,
-            "provider": req.provider,
-            "model_name": req.model_name,
-            "messages": [
-                {
-                    "role": m.role,
-                    "content": m.content,
-                    "tool_call_id": m.tool_call_id,
-                    "tool_calls": list(m.tool_calls),
-                }
-                for m in req.messages
-            ],
-            "max_tokens": req.max_tokens,
-            "temperature": req.temperature,
-            "tools": [
-                {
-                    "name": declaration.name,
-                    "description": declaration.description,
-                    "parameters": declaration.normalized_parameters(),
-                }
-                for declaration in coerce_tool_declarations(req.tools)
-            ],
-            "system_message": req.system_message,
-            "stream": req.stream,
-        },
+        request_payload,
         sort_keys=True,
         ensure_ascii=False,
     )
@@ -411,6 +472,7 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
         }
         if request.tools:
             payload["tools"] = _render_tools(request.tools)
+            _apply_tool_choice(payload, request, protocol="openai-compatible")
 
         try:
             response = self._client.post(
@@ -501,6 +563,7 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
         }
         if request.tools:
             payload["tools"] = _render_tools(request.tools)
+            _apply_tool_choice(payload, request, protocol="openai-compatible")
         try:
             with self._client.stream(
                 "POST",
@@ -990,6 +1053,7 @@ class AnthropicMessagesProviderAdapter(ProviderAdapter):
             ]
         if request.tools:
             body["tools"] = self._render_tools(request.tools)
+            _apply_tool_choice(body, request, protocol="anthropic")
         return body
 
     # -- response parsing --------------------------------------------------

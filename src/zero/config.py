@@ -98,6 +98,18 @@ class Settings(BaseModel):
     anthropic_timeout_seconds: float = 60.0
     #: Automatic requeue budget for failed tasks (0 disables auto-retry).
     task_max_attempts: int = 0
+    #: Optional JSONL evidence sink for S7 decomposition recovery
+    #: analytics (per-model typo rates). Empty disables the sink.
+    decomposition_analytics_path: str = ""
+    #: GAP 8b/G2 Hermes-parity per-call tool approval gate.
+    #: ``off`` (default) keeps plan-level-only authorization;
+    #: ``manual`` consults ToolApprovalGate before every declared
+    #: tool call inside task executions (hardline floor always on).
+    tool_approval_mode: str = "off"
+    #: GAP 8b/G3 scheduler fan-out: how many independent executions a
+    #: single tick drains concurrently (1 = historical serial ticks).
+    #: Within one execution, dependency order stays strictly serial.
+    tick_parallel_executions: int = 1
     #: Total dispatch attempts per provider request (first call +
     #: in-process retries of transient/rate-limit failures). Reference
     #: parity: Hermes defaults to retrying before failing over.
@@ -189,12 +201,25 @@ class Settings(BaseModel):
     # ------------------------------------------------------------------
 
     @classmethod
-    def load(cls, *, env_file: Path | str | None = None) -> Settings:
+    def load(
+        cls,
+        *,
+        env_file: Path | str | None = None,
+        zero_env_fallback: str | None = None,
+    ) -> Settings:
         """Load settings from environment variables.
 
         Args:
             env_file: Optional path to a ``.env`` file for local
                 development. Ignored if the file does not exist.
+            zero_env_fallback: Optional environment to assume when
+                ``ZERO_ENV`` is not set anywhere (process env or env
+                file). Only ``"development"`` is accepted — production
+                must always be configured explicitly so the fail-closed
+                rules stay in charge. Developer-facing entry points
+                (``zero-develop serve``, ``zero.main``) pass this so a
+                bare start works; validation commands such as
+                ``check-config`` keep loading strictly.
 
         Raises:
             ConfigError: if any fail-closed rule is violated.
@@ -202,7 +227,19 @@ class Settings(BaseModel):
         raw = _read_env(env_file)
         zero_env = raw.get("ZERO_ENV")
         if zero_env is None:
-            raise ConfigError("ZERO_ENV is required (one of: development, test, production).")
+            if zero_env_fallback == "development":
+                raw["ZERO_ENV"] = zero_env = zero_env_fallback
+            elif zero_env_fallback is not None:
+                raise ConfigError(
+                    f"Invalid ZERO_ENV fallback {zero_env_fallback!r}: only 'development' "
+                    "may be assumed automatically. Configure ZERO_ENV explicitly."
+                )
+            else:
+                raise ConfigError(
+                    "ZERO_ENV is required (one of: development, test, "
+                    "production). Next action: run 'export ZERO_ENV=development' "
+                    "for a local server, or run 'zero setup' to write $ZERO_HOME/.env."
+                )
         if zero_env not in ("development", "test", "production"):
             raise ConfigError(
                 f"ZERO_ENV must be one of development, test, production; got {zero_env!r}."
@@ -316,6 +353,23 @@ class Settings(BaseModel):
         if task_max_attempts < 0 or task_max_attempts > 16:
             raise ConfigError("ZERO_TASK_MAX_ATTEMPTS must be between 0 and 16.")
 
+        decomposition_analytics_path = str(
+            raw.get("ZERO_DECOMPOSITION_ANALYTICS_PATH", "") or ""
+        ).strip()
+
+        tool_approval_mode = str(raw.get("ZERO_TOOL_APPROVAL_MODE", "off") or "off")
+        tool_approval_mode = tool_approval_mode.strip().lower()
+        if tool_approval_mode not in ("off", "manual"):
+            raise ConfigError("ZERO_TOOL_APPROVAL_MODE must be 'off' or 'manual'.")
+
+        tick_parallel_raw = str(raw.get("ZERO_TICK_PARALLEL_EXECUTIONS", "1"))
+        try:
+            tick_parallel_executions = int(tick_parallel_raw)
+        except ValueError as exc:
+            raise ConfigError("ZERO_TICK_PARALLEL_EXECUTIONS must be an integer.") from exc
+        if tick_parallel_executions < 1 or tick_parallel_executions > 8:
+            raise ConfigError("ZERO_TICK_PARALLEL_EXECUTIONS must be between 1 and 8.")
+
         provider_attempts_raw = raw.get("ZERO_PROVIDER_MAX_ATTEMPTS", "2")
         try:
             provider_max_attempts = int(provider_attempts_raw)
@@ -375,6 +429,9 @@ class Settings(BaseModel):
             anthropic_timeout_seconds=anthropic_timeout_seconds,
             task_max_attempts=task_max_attempts,
             provider_max_attempts=provider_max_attempts,
+            decomposition_analytics_path=decomposition_analytics_path,
+            tool_approval_mode=tool_approval_mode,
+            tick_parallel_executions=tick_parallel_executions,
             telegram_webhook_secret=telegram_webhook_secret,
             discord_application_public_key=discord_application_public_key,
             worktree_isolation_mode=isolation_mode,  # type: ignore[arg-type]

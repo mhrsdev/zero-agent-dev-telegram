@@ -64,10 +64,17 @@ def register_health_routes(
         host: BackgroundWorkerHost | None = getattr(app.state, "worker_host", None)
         if host is not None:
             worker_host_status = host.status.to_dict()
+        # S7 recovery analytics (GAP-10/8-s7b): low-cardinality per-model
+        # decomposition outcomes incl. the typo_rate_per_graph headline.
+        analytics_service = getattr(services, "decomposition_analytics", None)
+        decomposition_analytics = (
+            analytics_service.snapshot() if analytics_service is not None else None
+        )
         return {
             "counters": counters,
             "histograms": histograms,
             "workers": worker_host_status,
+            "decomposition_analytics": decomposition_analytics,
         }
 
     @app.get("/", tags=["root"])

@@ -17,8 +17,10 @@ LIVE_ENABLED = os.environ.get("ZERO_ENABLE_LIVE_TESTS") == "1"
 TELEGRAM_READY = LIVE_ENABLED and os.environ.get("LIVE_TELEGRAM_BOT_TOKEN")
 ...
 pytestmark = [
-    pytest.mark.live_telegram,                       # new marker
-    pytest.skipif(not TELEGRAM_READY, reason="live Telegram creds + ZERO_ENABLE_LIVE_TESTS=1 required"),
+    pytest.mark.live_telegram,  # new marker
+    pytest.skipif(
+        not TELEGRAM_READY, reason="live Telegram creds + ZERO_ENABLE_LIVE_TESTS=1 required"
+    ),
 ]
 ```
 

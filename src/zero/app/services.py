@@ -11,17 +11,20 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 
 from zero.adapters.messaging import HttpTransport
 from zero.app.agent_runtime import AgentRuntime
 from zero.app.agent_type_service import AgentTypeService
+from zero.app.approval_gate import ToolApprovalGate
 from zero.app.artifact_service import ArtifactService
 from zero.app.audit_service import AuditService
 from zero.app.auth_service import AuthService
 from zero.app.authorization_service import AuthorizationService
 from zero.app.compaction_service import CompactionService
+from zero.app.decomposition_analytics import DecompositionAnalytics
 from zero.app.identity_service import IdentityService
 from zero.app.integration_service import IntegrationService
 from zero.app.interface_service import InterfaceAdapterService
@@ -43,6 +46,7 @@ from zero.app.result_delivery_service import ResultDeliveryService
 from zero.app.retrieval_service import ContextBuilder, RetrievalRouter
 from zero.app.scheduler_service import SchedulerService
 from zero.app.secret_service import SecretService
+from zero.app.task_decomposition import TaskDecomposer
 from zero.app.tool_service import ToolService
 from zero.app.worker_service import WorkerService
 from zero.app.worktree_service import WorktreeService
@@ -116,6 +120,10 @@ class Services:
     scheduler: SchedulerService | None = None
     runtime: AgentRuntime | None = None
     interface_transports: InterfaceTransportService | None = None
+    decomposition_analytics: DecompositionAnalytics | None = None
+    #: Optional per-call tool approval gate; present only when
+    #: ZERO_TOOL_APPROVAL_MODE != off.
+    approval_gate: ToolApprovalGate | None = None
 
 
 def _build_policy_gate(identity_repo, settings):
@@ -481,6 +489,13 @@ def build_services(
         authorization_service,
         interface_transport_service,
     )
+    # GAP 8b/G2 Hermes parity: opt-in per-call tool approval gate.
+    # ``off`` keeps the historical plan-level-only posture byte-for-byte.
+    approval_gate = (
+        ToolApprovalGate(database, mode=settings.tool_approval_mode)
+        if settings.tool_approval_mode == "manual"
+        else None
+    )
     agent_runtime = AgentRuntime(
         worker=worker_service,
         providers=provider_service,
@@ -490,8 +505,23 @@ def build_services(
         worktrees=worktree_service,
         context_builder=context_builder,
         agent_type_repo=agent_type_repo,
+        approval_gate=approval_gate,
+        metrics=metrics_service,
         compaction=compaction_service,
         enable_delegation=True,
+    )
+    # GAP 10 / S7: wire the LLM task decomposer into the production
+    # scheduler. The flag (ZERO_DECOMPOSITION_ENABLED) still gates the
+    # behavior — without it the scheduler takes its historical
+    # single-task path byte-for-byte. Recovery analytics capture every
+    # decompose() outcome (per-model typo rates, degradations,
+    # fallbacks) and optionally append JSONL evidence to the sink path.
+    decomposition_analytics = DecompositionAnalytics.get_or_create(
+        sink_path=(
+            Path(settings.decomposition_analytics_path)
+            if settings.decomposition_analytics_path
+            else None
+        )
     )
     scheduler_service = SchedulerService(
         plans=plan_service,
@@ -502,6 +532,8 @@ def build_services(
         result_delivery=result_delivery_service,
         agent_type_repo=agent_type_repo,
         task_max_attempts=settings.task_max_attempts,
+        decomposer=TaskDecomposer(providers=provider_service, analytics=decomposition_analytics),
+        parallel_executions=settings.tick_parallel_executions,
     )
     backup_service = BackupService(database)
     canary_service = SecretCanaryScan(
@@ -589,4 +621,6 @@ def build_services(
         scheduler=scheduler_service,
         runtime=agent_runtime,
         interface_transports=interface_transport_service,
+        decomposition_analytics=decomposition_analytics,
+        approval_gate=approval_gate,
     )

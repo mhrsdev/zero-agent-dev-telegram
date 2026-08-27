@@ -48,6 +48,7 @@ from zero.app.routers.plan import register_plan_routes
 from zero.app.routers.provider import register_provider_routes
 from zero.app.routers.secret import register_secret_routes
 from zero.app.routers.tool import register_tool_routes
+from zero.app.routers.tool_approvals import register_tool_approval_routes
 from zero.app.routers.topology import register_topology_routes
 from zero.app.routers.webhook import register_webhook_routes
 from zero.app.routers.worktree import register_worktree_routes
@@ -154,6 +155,7 @@ def create_app(settings: Settings) -> FastAPI:
     register_authorization_routes(app, services)
     register_secret_routes(app, services)
     register_tool_routes(app, services)
+    register_tool_approval_routes(app, services)
     register_audit_routes(app, services)
     register_plan_routes(app, services)
     register_execution_routes(app, services)

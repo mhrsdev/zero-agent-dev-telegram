@@ -78,6 +78,7 @@ class SchedulerService:
         task_max_attempts: int = 0,
         decomposer=None,
         decomposition_enabled: bool | None = None,
+        parallel_executions: int = 1,
     ) -> None:
         self._plans = plans
         self._worker = worker
@@ -95,6 +96,12 @@ class SchedulerService:
         if decomposition_enabled is None:
             decomposition_enabled = _env_flag("ZERO_DECOMPOSITION_ENABLED")
         self._decomposition_enabled = bool(decomposition_enabled)
+        # GAP 8b/G3 (Hermes segment-planning lite): bounded cross-execution
+        # parallelism inside one tick. Independent executions (separate
+        # plans) dispatch concurrently; within a single execution the
+        # dependency chain stays strictly serial so lease fencing and
+        # DAG order semantics are untouched. 1 preserves serial ticks.
+        self._parallel_executions = max(1, min(8, int(parallel_executions)))
 
     def _task_specs_for_revision(
         self,
@@ -294,24 +301,45 @@ class SchedulerService:
             for execution in executions
             if execution.state in {"pending", "running", "paused"}
         ]
-        for execution in runnable:
-            if len(results) >= max_tasks:
-                break
-            try:
-                batch = self._runtime.run_ready_tasks(
-                    execution_id=execution.id,
-                    project_id=project_id,
-                    actor_id=actor_id,
-                    lease_owner=lease_owner,
-                    provider=provider,
-                    model_name=model_name,
-                    repository_id=repository_id,
-                    max_tasks=max_tasks - len(results),
-                    source=source,
-                )
-                results.extend(batch)
-            except (OSError, RuntimeError, ValueError) as exc:
-                errors.append(f"execution {execution.id.value}: {type(exc).__name__}")
+
+        def _drain(execution, budget):
+            return self._runtime.run_ready_tasks(
+                execution_id=execution.id,
+                project_id=project_id,
+                actor_id=actor_id,
+                lease_owner=lease_owner,
+                provider=provider,
+                model_name=model_name,
+                repository_id=repository_id,
+                max_tasks=budget,
+                source=source,
+            )
+
+        use_parallel = self._parallel_executions > 1 and len(runnable) > 1
+        if not use_parallel:
+            for execution in runnable:
+                if len(results) >= max_tasks:
+                    break
+                try:
+                    batch = _drain(execution, max_tasks - len(results))
+                    results.extend(batch)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    errors.append(f"execution {execution.id.value}: {type(exc).__name__}")
+        else:
+            # Each concurrent drain gets the full task budget; combined
+            # results are trimmed to max_tasks preserving runnable order.
+            import concurrent.futures
+
+            workers = min(self._parallel_executions, len(runnable))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_drain, execution, max_tasks) for execution in runnable]
+            collected: list[RuntimeTaskResult] = []
+            for execution, future in zip(runnable, futures):
+                try:
+                    collected.extend(future.result())
+                except (OSError, RuntimeError, ValueError) as exc:
+                    errors.append(f"execution {execution.id.value}: {type(exc).__name__}")
+            results.extend(collected[:max_tasks])
         # Bounded auto-retry: requeue failed tasks while the task has
         # not yet consumed its configured attempt budget. Disabled by
         # default (ZERO_TASK_MAX_ATTEMPTS=0). GAP 12: each requeue is

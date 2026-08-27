@@ -4,6 +4,100 @@ All notable changes to Zero Develop are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions
 are milestone-based rather than semver until 1.0.
 
+## [Unreleased] — Hermes-parity hardening (G1 + G2)
+
+### Added
+
+- Per-call tool approval gate (GAP 8b/G2, Hermes parity): opt-in via
+  ``ZERO_TOOL_APPROVAL_MODE=manual``. Durable ``tool_approval_decisions``
+  table (migration 0031) is both pending queue and decision record;
+  service semantics port Hermes' layered approvals — hardline floor
+  denies catastrophic arguments under any allowlist, deny rules outrank
+  allows (``grain=always`` denial escalates to a TOOL-WIDE wildcard),
+  standing always-allows key on canonical argument hash (tool-wide row
+  supported), session grants scope in-process per execution, and the
+  pending window carries a TTL so the runtime never blocks forever
+  (model receives ``approval_pending``/``approval_denied`` as
+  structured tool errors instead of dying). REST surface:
+  ``GET /projects/{id}/tool-approvals`` (project.view) and
+  ``POST .../tool-approvals/{request_id}/resolve`` (tool.manage);
+  disabled deployments answer 409. Golden route tables updated.
+
+### Changed
+
+- AgentRuntime execution loop resilience (GAP 8b/G1, Hermes parity):
+  malformed/unparseable or non-object tool arguments and undeclared
+  tool names no longer raise-and-kill the attempt — the model receives
+  structured error payloads (with declared-tool surface revealed) and
+  can self-correct; guessed arguments are never executed.
+  ``finish_reason=length`` together with unparseable arguments discards
+  the broken assistant turn and re-asks with doubled ``max_tokens``
+  (bounded 2 boosts, cap 32768) before anything executes. An
+  identical-failure breaker counts repeated identical tool failures,
+  injects an explicit change-approach steering note at the third
+  failure and falls through to the summary nudge at five; terminal
+  errors distinguish breaker-trip from round-budget exhaustion.
+
+## [Unreleased] — Forced tool-call path (S7) and production env preset
+
+### Added
+
+- Canonical ``tool_choice`` support end to end:
+  ``normalize_tool_choice`` folds modes (`auto`/`none`/`required`) and
+  forced-function shorthands into one canonical shape;
+  OpenAI-compatible and Anthropic adapters render it per protocol
+  (nested `{type:function,function:{name}}` vs `{type:auto|any|tool}`);
+  payloads stay byte-identical when unset, request hashes change only
+  when set, provider-fallback reconstruction preserves it
+  (task forcing survives a failover), and Anthropic's missing `none`
+  mode fails loudly instead of silently doing nothing.
+- Decomposition is now wired into the production composition root
+  (services builder): the scheduler receives a real `TaskDecomposer`
+  over the shared provider service, so `ZERO_DECOMPOSITION_ENABLED=1`
+  takes effect on live servers (previously the flag existed but no
+  decomposer was ever constructed — flipping it was a silent no-op).
+- S7 recovery analytics (`zero.app.decomposition_analytics`): every
+  decompose() outcome is recorded with attempts used, rescued
+  near-miss dependency repairs (raw typo + Jaccard score), escalation,
+  legacy degradation and single-task fallback facts, aggregated PER
+  MODEL. Headline metric `typo_rate_per_graph` tracks per-model slug
+  discipline over time; JSONL evidence sink via
+  `ZERO_DECOMPOSITION_ANALYTICS_PATH` keeps durable audit lines from
+  live servers without schema changes. Repair planning is factored
+  into pure `plan_dependency_repairs` / `apply_dependency_repairs`
+  while `repair_dangling_dependencies` keeps its exact contract.
+- Decomposition ladder deepening (GAP 10 hardening):
+  strict system prompt plus a single forced `emit_task_graph` tool
+  call replaces reliance on free-text JSON; an escalated re-ask with
+  even stricter phrasing covers one bad reply; deterministic recovery
+  of structured output repairs near-miss dependency keys (unique-best
+  snake_case Jaccard >= 0.5, duplicate edges collapsed) and
+  normalizes dependency order before any re-ask is spent; providers
+  without native tools (capability gate or gateway 4xx on tools)
+  degrade once to the legacy text contract; transient failures stop
+  the ladder immediately; idempotency keys are attempt-scoped.
+- Live GLM evidence (real bridge to GLM-class model): all three probe
+  plans produced validated multi-task DAGs on the first forced ask
+  (10–22 tasks, 11–23 edges, 9.8s–23.8s), ahead of legacy free-text
+  duration; two previously-failing raw responses recover exactly via
+  key repair (`build_vendor_dashboard` -> declared key). Evidence:
+  `scripts/logs/s7/{summary.md,probe_results.jsonl,raw/,bridge.log}`,
+  harness `scripts/s7_decomposition_probe.py`, transport
+  `scripts/ai_bridge/server.mjs`.
+- `.env.example` restructured (core/workers/providers/execution/
+  interfaces) with a go-live **production preset**; every knob name
+  cross-checked against source, retry/backoff semantics documented,
+  previously-undocumented operational knobs surfaced
+  (`ZERO_DECOMPOSITION_ENABLED`, sandbox executor, PG pool bounds).
+
+### Tests
+
+- New `tests/test_s7_tool_call_decomposition.py`: 30+ cases covering
+  canonicalization, both wire formats (incl. stream path omission),
+  hash sensitivity/fallback propagation through a real service stack,
+  extraction preference order, the full ladder matrix, repair rules,
+  and degradation semantics.
+
 ## [Unreleased] — HTTP API decomposition
 
 ### Changed

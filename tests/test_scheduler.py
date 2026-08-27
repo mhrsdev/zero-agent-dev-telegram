@@ -198,3 +198,112 @@ def test_scheduler_run_forever_stops_after_supervised_tick() -> None:
     assert calls[0]["combined_test_command"] == "sh"
     assert calls[0]["combined_test_args"] == ("-c", "true")
     assert len(ticks) == 1
+
+
+# ----------------------------------------------------------------------
+# GAP 8b/G3 — bounded cross-execution parallelism inside one tick
+# ----------------------------------------------------------------------
+
+
+def _parallel_scheduler(parallel_executions: int, runtime) -> SchedulerService:
+    from zero.app.scheduler_service import SchedulerService as Svc
+
+    class Authorization:
+        def require_permission(self, **_kwargs):
+            return None
+
+    class Plans:
+        def list_unclaimed_handoffs(self, _project, *, limit, **_kwargs):
+            return []
+
+    class Worker:
+        def list_project_executions(self, *, project_id, **_kwargs):
+            return [
+                SimpleNamespace(id=ExecutionId("exec_a"), state="running"),
+                SimpleNamespace(id=ExecutionId("exec_b"), state="running"),
+            ]
+
+    scheduler = cast(
+        SchedulerService,
+        Svc(
+            plans=Plans(),
+            worker=Worker(),
+            runtime=runtime,
+            authorization=Authorization(),
+            parallel_executions=parallel_executions,
+        ),
+    )
+    return scheduler
+
+
+def test_tick_parallel_drains_independent_executions_concurrently() -> None:
+    """Both drains must overlap in time (barrier), not run serially."""
+    import threading
+    import time as _time
+
+    entered = []
+    barrier = threading.Barrier(2, timeout=5.0)
+
+    class SlowRuntime:
+        def run_ready_tasks(self, *, execution_id, max_tasks, **_kwargs):
+            entered.append(execution_id.value)
+            barrier.wait()  # only both-at-once can pass
+            _time.sleep(0.05)
+            return [SimpleNamespace(task_id=f"t_{execution_id.value}")]
+
+    scheduler = _parallel_scheduler(4, SlowRuntime())
+    t0 = _time.monotonic()
+    result = scheduler.run_once(
+        project_id=ProjectId("p_par"),
+        actor_id=UserId("zu_par"),
+        lease_owner="par-test",
+        provider="fake",
+        model_name="fake-standard",
+    )
+    elapsed = _time.monotonic() - t0
+    assert result.errors == ()
+    assert sorted(entered) == ["exec_a", "exec_b"]
+    # Serial execution would deadlock on the barrier => any completion
+    # already proves overlap; the timing bound guards regressions.
+    assert elapsed < 4.0
+    assert {r.task_id for r in result.task_results} == {"t_exec_a", "t_exec_b"}
+
+
+def test_tick_parallel_trims_results_to_max_tasks_in_order() -> None:
+
+    class BurstyRuntime:
+        def run_ready_tasks(self, *, execution_id, max_tasks, **_kwargs):
+            return [SimpleNamespace(task_id=f"{execution_id.value}-{i}") for i in range(max_tasks)]
+
+    scheduler = _parallel_scheduler(4, BurstyRuntime())
+    result = scheduler.run_once(
+        project_id=ProjectId("p_par"),
+        actor_id=UserId("zu_par"),
+        lease_owner="par-test",
+        provider="fake",
+        model_name="fake-standard",
+        max_tasks=3,
+    )
+    ids = [r.task_id for r in result.task_results]
+    assert len(ids) == 3
+    assert all(i.startswith("exec_a") for i in ids)  # runnable order preserved
+
+
+def test_tick_serial_default_stays_one_at_a_time() -> None:
+    order: list[str] = []
+
+    class OrderingRuntime:
+        def run_ready_tasks(self, *, execution_id, max_tasks, **_kwargs):
+            order.append(execution_id.value)
+            return []
+
+    scheduler = _parallel_scheduler(1, OrderingRuntime())
+    result = scheduler.run_once(
+        project_id=ProjectId("p_ser"),
+        actor_id=UserId("zu_ser"),
+        lease_owner="ser-test",
+        provider="fake",
+        model_name="fake-standard",
+    )
+    assert result.errors == ()
+    assert order == ["exec_a", "exec_b"]

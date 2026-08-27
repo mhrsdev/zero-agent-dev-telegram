@@ -91,6 +91,7 @@ GOLDEN_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/projects/{project_id}/plans/{plan_id}/reject"),
         ("POST", "/projects/{project_id}/plans/{plan_id}/revisions"),
         ("POST", "/projects/{project_id}/providers/requests/{request_id}/reconcile"),
+        ("GET", "/projects/{project_id}/tool-approvals"),
         ("POST", "/projects/{project_id}/rag"),
         ("POST", "/projects/{project_id}/rag/rebuild"),
         ("POST", "/projects/{project_id}/rag/search"),
@@ -105,6 +106,7 @@ GOLDEN_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/users/{user_id}/external-identities"),
         ("POST", "/users/{user_id}/external-identities/verify"),
         ("POST", "/webhooks/{platform}/{project_id}/{binding_id}"),
+        ("POST", "/projects/{project_id}/tool-approvals/{request_id}/resolve"),
     }
 )
 

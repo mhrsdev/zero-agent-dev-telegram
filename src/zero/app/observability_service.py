@@ -209,6 +209,12 @@ class MetricsService:
             "failure",
             "error",
             "cancelled",
+            # GAP 8b/G1 execution-loop defect outcomes (bounded set):
+            "invalid_arguments",
+            "undeclared_tool",
+            "approval_pending",
+            "approval_denied",
+            "boosted_reask",
         }
     )
     ALLOWED_SOURCES = frozenset(

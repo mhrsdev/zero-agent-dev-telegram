@@ -116,3 +116,51 @@ def test_capabilities_endpoint_declares_worktree_execution() -> None:
     prod_caps = compute_capabilities(production_settings)
     assert prod_caps["worktree_execution"]["status"] == "unavailable"
     assert "isolation backend" in prod_caps["worktree_execution"]["detail"]
+
+
+def test_metrics_endpoint_exposes_decomposition_analytics_snapshot() -> None:
+    """S7 recovery analytics are observable at /metrics, per model."""
+    settings = Settings.load_for_test()
+    database = Database(settings)
+    apply_migrations(database)
+
+    from zero.app.api import create_app
+    from zero.app.decomposition_analytics import (
+        DecompositionAnalytics,
+        DecompositionOutcome,
+    )
+
+    app = create_app(settings)
+    analytics: DecompositionAnalytics = app.state.services.decomposition_analytics  # type: ignore[attr-defined]
+    analytics.record(
+        DecompositionOutcome(
+            ts_utc="2026-08-27T09:00:00+00:00",
+            revision_id="pr_test_metrics",
+            provider="openai-compatible",
+            model_name="glm-4.6",
+            outcome="native_first_ask",
+            path="native",
+            attempts_used=1,
+            task_count=3,
+            edge_count=2,
+            elapsed_ms=21000,
+        )
+    )
+
+    import asyncio
+
+    async def call():
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            response = await ac.get("/metrics")
+            return response.status_code, response.json()
+
+    metrics_status, payload = asyncio.run(call())
+    assert metrics_status == 200
+    snapshot = payload["decomposition_analytics"]
+    assert snapshot is not None
+    assert snapshot["total_outcomes"] >= 1
+    model_stats = snapshot["models"]["openai-compatible:glm-4.6"]
+    assert model_stats["graphs_validated"] >= 1
+    assert "typo_rate_per_graph" in model_stats
+    assert model_stats["typo_rate_per_graph"] == 0.0

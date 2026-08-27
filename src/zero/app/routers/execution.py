@@ -18,6 +18,7 @@ from zero.domain.identity import (
     UserId,
 )
 from zero.domain.plans import PlanError
+from zero.domain.providers import ProviderModelNotFoundError
 
 
 class TaskSpecModel(BaseModel):
@@ -274,6 +275,18 @@ def register_execution_routes(app: FastAPI, services: Services) -> None:
                 source="web",
                 stream_callback=_publish_stream,
             )
+        except ProviderModelNotFoundError as exc:
+            # Unknown provider/model is an operator input error, not a
+            # server fault: surface the registered names so the next
+            # action is obvious. (Previously this escaped as a raw 500.)
+            names = ", ".join(services.providers.registered_provider_names) or "none"
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Unknown provider/model {req.provider!r}:{req.model_name!r}. "
+                    f"Registered providers: {names}."
+                ),
+            ) from exc
         except RuntimeErrorBase as exc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -331,6 +344,15 @@ def register_execution_routes(app: FastAPI, services: Services) -> None:
                 max_tasks=req.max_tasks,
                 source="web",
             )
+        except ProviderModelNotFoundError as exc:
+            names = ", ".join(services.providers.registered_provider_names) or "none"
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Unknown provider/model {req.provider!r}:{req.model_name!r}. "
+                    f"Registered providers: {names}."
+                ),
+            ) from exc
         except (ExecutionError, AuthorizationError, ValueError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail="request failed"

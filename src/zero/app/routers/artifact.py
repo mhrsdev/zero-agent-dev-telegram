@@ -160,11 +160,15 @@ def register_artifact_routes(app: FastAPI, services: Services) -> None:
         request: Request, project_id: str, query: str, limit: int = 20
     ) -> list[dict[str, Any]]:
 
-        authorized_actor(request, services, project_id, "project.view")
+        actor = authorized_actor(request, services, project_id, "project.view")
         if not 1 <= limit <= 100:
             raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
         results = services.artifacts.search_rag(
-            project_id=ProjectId(project_id), query=query, limit=limit
+            project_id=ProjectId(project_id),
+            actor_id=actor,
+            query=query,
+            limit=limit,
+            source="web",
         )
         return [{"document": _rag_payload(document), "score": score} for document, score in results]
 

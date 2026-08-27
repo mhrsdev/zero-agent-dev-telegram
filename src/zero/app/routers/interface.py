@@ -41,6 +41,7 @@ def _interface_event_payload(item: Any) -> dict[str, Any]:
         "chat_id": item.chat_id,
         "topic_id": item.topic_id,
         "event_kind": item.event_kind,
+        "event_content": getattr(item, "event_content", None),
         "processing_result": item.processing_result,
         "processing_detail": item.processing_detail,
         "created_at": item.created_at,

@@ -18,7 +18,14 @@ class StoreArtifactRequest(_StrictRequest):
 
 
 class StoreRagDocumentRequest(_StrictRequest):
-    source_type: str = Field(..., min_length=1, max_length=40)
+    # source_type must match the canonical retrieval-provenance enum that
+    # the persistence layer CHECK-constrains (see migrations 0007_*).
+    # Validating it here turns what used to surface as an opaque 500
+    # (sqlite3.IntegrityError escaping the route) into a proper 422.
+    source_type: str = Field(
+        ...,
+        pattern="^(plan_revision|task_result|knowledge_record|artifact|manual)$",
+    )
     source_id: str = Field(..., min_length=1, max_length=200)
     title: str = Field(..., min_length=1, max_length=500)
     content: str = Field(..., min_length=1)

@@ -44,9 +44,17 @@ def register_secret_routes(app: FastAPI, services: Services) -> None:
         except ValueError:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="request failed")
         except SecretError as exc:
+            # Fail closed without leaking internals, but give the
+            # operator the one fact that matters for recovery (usually
+            # missing/blank ZERO_SECRET_KEY material).
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to store secret",
+                detail=(
+                    "Failed to store secret: the encrypted secret store "
+                    "refused this write. Most common cause is a server "
+                    "without configured ZERO_SECRET_KEY key material; "
+                    "run 'zero setup' or configure the key, then retry."
+                ),
             ) from exc
         # IMPORTANT: we never return the value. We return only metadata.
         return {

@@ -284,6 +284,7 @@ class ProviderService:
                     model_name=request.model_name,
                     messages=request.messages,
                     tools=request.tools,
+                    tool_choice=request.tool_choice,
                     system_message=request.system_message,
                     max_tokens=request.max_tokens,
                     temperature=request.temperature,

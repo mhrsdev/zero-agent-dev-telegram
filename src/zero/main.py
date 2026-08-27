@@ -6,7 +6,7 @@ Run with:
 
 Or via the console script installed by ``pip install -e .[dev]``:
 
-    zero-develop
+    zero-develop serve
 
 The :data:`app` module-level global is constructed eagerly from process
 configuration so that ``uvicorn zero.main:app`` and ``zero-develop`` use
@@ -31,10 +31,19 @@ def _load_settings() -> Settings:
     """Load settings; raise :class:`ConfigError` if invalid.
 
     On a real production deploy this raises and the process exits
-    non-zero, which is the correct fail-closed behavior. On development
-    and test it auto-selects safe defaults.
+    non-zero, which is the correct fail-closed behavior. When ZERO_ENV
+    is not configured anywhere at all (process env or env file), a
+    local development server with safe defaults is assumed — matching
+    ``zero-develop serve`` and ``scripts/run_dev.sh``. Explicit but
+    invalid or incomplete production/test configuration still fails
+    closed exactly as before.
     """
-    return Settings.load()
+    from zero.cli import _ensure_development_secret_key
+
+    settings = Settings.load(zero_env_fallback="development")
+    # The uvicorn entry point shares the CLI's dev-only key bootstrap so
+    # the encrypted secret store works identically on both paths.
+    return _ensure_development_secret_key(settings, None)
 
 
 def _configure_logging(settings: Settings) -> None:
@@ -50,9 +59,11 @@ def _configure_logging(settings: Settings) -> None:
 # zero.main:app` works without extra ceremony. Tests do NOT use this
 # module-level app; they call `create_app` directly with test settings.
 #
-# If configuration is invalid (e.g. ZERO_ENV missing), we let the
-# ConfigError propagate so the process exits non-zero with a clear
-# message. This is the fail-closed behavior required by ADR 0004.
+# If configuration is invalid (for example an explicit production
+# config missing its secrets), we let the ConfigError propagate so the
+# process exits non-zero with a clear message. This is the fail-closed
+# behavior required by ADR 0004. A completely unset environment is not
+# an error: it falls back to development defaults (see _load_settings).
 
 try:
     _settings = _load_settings()
