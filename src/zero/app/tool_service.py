@@ -440,7 +440,15 @@ class ToolService:
 
         def context_ids(context: ToolContext) -> tuple[TaskId, Any]:
             if not context.task_id:
-                raise ToolError("coding tools require a task context")
+                # Real-run fix (2026-08-28, bug 11a): name the actual
+                # policy so a delegation sub-agent (which has no worktree
+                # context by design) produces a self-explanatory denial
+                # instead of a mystery.
+                raise ToolError(
+                    "coding tools require a task worktree context; delegation "
+                    "sub-agents cannot call worktree tools — the parent task "
+                    "must invoke them directly"
+                )
             return TaskId(context.task_id), context
 
         def get_worktree(context: ToolContext):
@@ -575,9 +583,22 @@ class ToolService:
                 command_handler,
             ),
             (
+                # Real-run fix (2026-08-28, bug 11a): the previous schema
+                # declared a zero-property object with
+                # additionalProperties=False, so a frontier model that
+                # naturally passed arguments ("base", "paths", …) failed
+                # input validation FIVE times in a row in a real run
+                # before giving up on the tool. capture_diff is a
+                # read-only, no-argument tool: declare that explicitly in
+                # the description and tolerate (ignore) extra keys instead
+                # of failing the call.
                 "capture_diff",
-                "Capture the current Git diff and status for the current task worktree.",
-                {"type": "object", "properties": {}, "additionalProperties": False},
+                (
+                    "Capture the current Git diff and status for the current "
+                    "task worktree. Takes NO arguments — call it with an "
+                    "empty object {}; any extra keys are ignored."
+                ),
+                {"type": "object", "properties": {}, "additionalProperties": True},
                 diff_output,
                 "zero.workspace.capture_diff",
                 diff_handler,
@@ -798,8 +819,21 @@ class ToolService:
                 correlation_id=correlation_id,
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
+            # Real-run fix (2026-08-28, bug 11a class): a zero-argument
+            # tool must say so plainly, or the model keeps re-sending
+            # arguments it invented (observed: 5 consecutive validation
+            # failures on capture_diff in one real task).
+            _decl = tool.input_schema if isinstance(tool.input_schema, dict) else {}
+            _no_arg_tool = not _decl.get("properties") and not _decl.get(
+                "additionalProperties"
+            )
+            _hint = (
+                " This tool takes NO arguments — call it with an empty object {}."
+                if _no_arg_tool
+                else ""
+            )
             raise ToolInputValidationError(
-                f"Input for tool {tool.name!r} failed validation: {exc.message}",
+                f"Input for tool {tool.name!r} failed validation: {exc.message}{_hint}",
                 errors=[{"path": list(exc.path), "message": exc.message}],
             ) from exc
 

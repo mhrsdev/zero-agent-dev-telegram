@@ -13,6 +13,25 @@ real-run failure.
 
 ### Fixed
 
+- **Tool declarations fought the model instead of steering it** (real run,
+  5-minute window 2026-08-28): ``capture_diff`` declared a zero-property
+  object schema with ``additionalProperties=False``, so a frontier model
+  that naturally passed arguments (``base``, ``paths``, …) failed input
+  validation five consecutive times in one real task and burned its tool
+  rounds; the model then tried to work around via ``delegate``, whose
+  sub-agents correctly cannot call worktree tools, and finally recovered
+  with ``git diff`` over ``run_command``. ``capture_diff`` is read-only and
+  argument-free, so its schema now tolerates (ignores) extra keys and its
+  description says "Takes NO arguments — call it with an empty object
+  {}"; genuine zero-argument tools that still reject extra keys now say so
+  plainly in the model-facing validation error; and the context-less
+  worktree-tool denial names the policy ("delegation sub-agents cannot
+  call worktree tools — the parent task must invoke them directly")
+  instead of a mystery. The decomposer evidence guidance gained the
+  missing aggregation rule: a task whose objective is to capture/produce
+  the final diff requires ``["diff"]`` evidence (its artifact IS the
+  diff), not ``["provider_response"]``.
+
 - **The Telegram gateway could never receive a message**: the polling
   worker built its adapter with the default per-request HTTP timeout
   (10 s) while asking Telegram to hold the long poll open for 25 s —

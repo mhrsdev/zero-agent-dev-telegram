@@ -999,7 +999,7 @@
   },
   "features_sweep": {
     "chat": {
-      "content_head": "6 words (36 characters, longest word 9 characters).",
+      "content_head": "6 words (36 characters, longest word 9 letters).",
       "tools": [
         {
           "tool": "wordcount",
@@ -1007,10 +1007,10 @@
           "result_head": "{\"chars\": 36, \"longest\": 9, \"words\": 6}"
         }
       ],
-      "provider_request_id": "preq_jimzuxh76htvefo76yzojrtj",
+      "provider_request_id": "preq_j9j8j7x4xy462yw5mb91pswm",
       "usage": {
-        "input_tokens": 8033,
-        "output_tokens": 19,
+        "input_tokens": 8062,
+        "output_tokens": 18,
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0
       }
@@ -1020,7 +1020,7 @@
       "content": "FALLBACK-OK"
     },
     "rag": {
-      "doc_id": "rag_p5r9wvutvceo0n8d4fq7nj5p",
+      "doc_id": "rag_t67gfu030u43cvzp7eja9fov",
       "state": "approved",
       "search_hits": [
         [
@@ -1038,7 +1038,7 @@
       ]
     },
     "retrieval": {
-      "execution_id": "exec_iwyduzs9qnqadtz8w42ksvt8",
+      "execution_id": "exec_k29kcnw8kc0dqwq0qflgrt80",
       "candidates": [
         [
           "rag_document",
@@ -1054,46 +1054,51 @@
           "rag_document",
           "rag_p5r9wvutvceo0n8d4fq7nj5p",
           0.0
+        ],
+        [
+          "rag_document",
+          "rag_t67gfu030u43cvzp7eja9fov",
+          0.0
         ]
       ],
-      "ledger_selected": 3,
-      "ledger_tokens": 285
+      "ledger_selected": 4,
+      "ledger_tokens": 380
     },
     "compaction": {
       "should_compact": false,
-      "record_id": "comp_r1hlirnydymy91qdoymiqa8z",
+      "record_id": "comp_qdmpl4jcrzp8v69wmefrez41",
       "state": "activated",
       "fit_rung": "verbatim",
-      "summary_chars": 1991,
-      "summary_head": "## Current goal\n\nDeliver the `textcase` package: three public conversion functions (`to_snake_case`, `to_camel_case`, `to_kebab_case`) backed by one shared tokenizer, using only the Python standard library, with unittest coverage.\n\n## Accep",
+      "summary_chars": 2088,
+      "summary_head": "## Current goal\n\nDeliver the `textcase` package: three public conversion functions (`to_snake_case`, `to_camel_case`, `to_kebab_case`) built on one shared tokenizer, stdlib only, with unittest coverage. Work is happening in a git worktree.\n",
       "deltas": [
         {
           "kind": "decision",
-          "content": "Public API limited to three functions: `to_snake_case`, `to_camel_case`, `to_kebab_case`."
+          "content": "Public API limited to exactly three functions: `to_snake_case`, `to_camel_case`, `to_kebab_case`."
         },
         {
           "kind": "decision",
-          "content": "A single shared tokenizer feeds all three functions (no per-function splitting logic)."
+          "content": "All three share a single tokenizer implementation rather than each parsing independently."
         },
         {
           "kind": "decision",
-          "content": "Dependencies: stdlib only."
+          "content": "Dependencies: Python standard library only."
         },
         {
           "kind": "decision",
-          "content": "Token splitting is Unicode-aware, based on `\\W`."
+          "content": "Tokenization splits on Unicode-aware `\\W` boundaries."
         },
         {
           "kind": "decision",
-          "content": "Uppercase / word-boundary detection is ASCII-only (deliberately narrower than the Unicode-aware splitting)."
+          "content": "Uppercase/word-boundary detection is ASCII-only (deliberately narrower than the Unicode-aware splitting)."
         },
         {
           "kind": "decision",
-          "content": "Test suite consolidated per sub-agent review: duplicate cases merged, 30 → 23 tests, coverage judged still adequate."
+          "content": "Test suite consolidated per sub-agent review: duplicate cases removed, 30 → 23 tests, coverage judged still adequate."
         },
         {
           "kind": "decision",
-          "content": "Process rule adopted: do not require diff evidence when the task is verification-only."
+          "content": "Process rule adopted: on a verification-only task, do not require diff evidence as a precondition."
         }
       ]
     },
@@ -1277,40 +1282,40 @@
   },
   "textcase_r11_deliveries": [
     {
+      "id": "idl_lex9hvs3p2dz41kyxjx3ymo5",
+      "state": "sent",
+      "external_message_id": "254",
+      "head": "Execution exec_ktls7lsmr5e7x7qyzt4hkagf finished with state:"
+    },
+    {
+      "id": "idl_pbnnntjoqjc98fwo03p273xe",
+      "state": "sent",
+      "external_message_id": "231",
+      "head": "Execution exec_5d04qrg6ksgf7r02ud87hbhy finished with state:"
+    },
+    {
+      "id": "idl_hj33ngzsnote0ak2gmruvpy7",
+      "state": "sent",
+      "external_message_id": "230",
+      "head": "Execution exec_gli9x0zhtzstkxsj0qjsx9xx finished with state:"
+    },
+    {
+      "id": "idl_a1dwsfwvszsdalzwhalko5b5",
+      "state": "sent",
+      "external_message_id": "229",
+      "head": "Execution exec_o79pr8c3yi8904hoxs9kcwx6 finished with state:"
+    },
+    {
+      "id": "idl_t58lc4xjrph34bf107bxap8s",
+      "state": "sent",
+      "external_message_id": "228",
+      "head": "Execution exec_h4u6ua5udsz5lqb6sh8gs1vs finished with state:"
+    },
+    {
       "id": "idl_97ansbxghe92rn0w4gx3s22e",
       "state": "sent",
       "external_message_id": "227",
       "head": "Execution exec_923wqz4mdq6vox2hz92whbxd finished with state:"
-    },
-    {
-      "id": "idl_7j3eo51wxii3ajfo380c4y5q",
-      "state": "sent",
-      "external_message_id": "226",
-      "head": "Execution exec_dd5ntx9wrgrk6blkkz6vtcvs finished with state:"
-    },
-    {
-      "id": "idl_ogjfnqgkwv6w3hhg0ffnbckc",
-      "state": "sent",
-      "external_message_id": "225",
-      "head": "Execution exec_iwyduzs9qnqadtz8w42ksvt8 finished with state:"
-    },
-    {
-      "id": "idl_i91qgt0vg4zr4x6gyj06su27",
-      "state": "sent",
-      "external_message_id": "224",
-      "head": "Execution exec_bfrowlopbt9alzrtqlldbv3z finished with state:"
-    },
-    {
-      "id": "idl_jqmz9oa2nw5pybovww4c7jan",
-      "state": "sent",
-      "external_message_id": "223",
-      "head": "Execution exec_tx5isp362jq5vi8nac76hmnc finished with state:"
-    },
-    {
-      "id": "idl_txuemc8rc2sbhu3rbzmzia4h",
-      "state": "sent",
-      "external_message_id": "222",
-      "head": "Execution exec_wysef9c7dylimwnapi737oer finished with state:"
     }
   ],
   "textcase_r11_tool_invocations": {},
@@ -1483,5 +1488,101 @@
       "head": "Execution exec_iwyduzs9qnqadtz8w42ksvt8 finished with state:"
     }
   ],
-  "textcase_final_tool_invocations": {}
+  "textcase_final_tool_invocations": {},
+  "textcase_5min_event_id": "realrun-c97fc5c3aced",
+  "textcase_5min_plan": {
+    "plan_id": "plan_2ruueai6cmjd4hj4llb23i4j",
+    "revision_id": "pr_ifnckhgrn361p6u3r5m6ppy5",
+    "objective": "Create a standard-library-only `wordwrap` package providing a greedy `wrap_text(text, width)` function, expose it via the package's `__init__.py`, and cover it with a unittest suite that passes under `python3 -m unittest discover -s tests -v`."
+  },
+  "textcase_5min_casual_checked": "ingested as conversation event evt_pbxo9c9c9v3odstccp6wnm1t; no actionable plan proposed",
+  "textcase_5min_handoff_id": "ph_2qkzizhlg49umbb0ekprt81l",
+  "textcase_5min_5min_summary": {
+    "run_started": "2026-08-28T20:42:02Z",
+    "run_seconds": 300,
+    "server_pid": "980",
+    "bot_marker_message_id": 239,
+    "chat_tool_loop": {
+      "content_head": "5 words (26 characters, longest word 6 letters).",
+      "tools": [
+        {
+          "tool": "wordcount",
+          "status": "success"
+        }
+      ]
+    },
+    "pipeline": {
+      "intake": "ok",
+      "casual": "ingested as conversation event evt_pbxo9c9c9v3odstccp6wnm1t; no actionable plan proposed",
+      "approval": "approved -> handoff ph_2qkzizhlg49umbb0ekprt81l"
+    },
+    "baseline_counts": {
+      "provider_requests": 861,
+      "deliveries": 20,
+      "deliveries_sent": 20
+    },
+    "final_counts": {
+      "provider_requests": 903,
+      "deliveries": 20,
+      "deliveries_sent": 20
+    },
+    "deltas": {
+      "provider_requests": 42,
+      "deliveries_sent": 0
+    },
+    "poll_cycles_observed": 0,
+    "notable_log_lines": [],
+    "execution_final": {
+      "id": "exec_ktls7lsmr5e7x7qyzt4hkagf",
+      "state": "running",
+      "tasks": [
+        {
+          "id": "task_vzcwiz85dbsfvlcu4",
+          "state": "completed",
+          "objective": "Create wordwrap/wrap.py defining wrap_text(text, width) that collapses"
+        },
+        {
+          "id": "task_x13vgjub867o3y95g",
+          "state": "completed",
+          "objective": "Create wordwrap/__init__.py that re-exports wrap_text from wordwrap.wr"
+        },
+        {
+          "id": "task_l0xnj1gctemdw2qki",
+          "state": "completed",
+          "objective": "Create tests/test_wrap.py with unittest.TestCase coverage for empty te"
+        },
+        {
+          "id": "task_2iz7brntzadgsp2np",
+          "state": "completed",
+          "objective": "Run `python3 -m unittest discover -s tests -v` and record output showi"
+        },
+        {
+          "id": "task_pl2bkz26kh6xmzahs",
+          "state": "running",
+          "objective": "Capture the final diff covering wordwrap/wrap.py, wordwrap/__init__.py"
+        }
+      ]
+    }
+  },
+  "s6_toolcall_proof": {
+    "elapsed_s": 3.5,
+    "reply": "7 words (39 characters, longest word 8 letters — \"verified\").",
+    "tool_calls": [
+      {
+        "tool": "wordcount",
+        "status": "success",
+        "result_head": "{\"chars\": 39, \"longest\": 8, \"words\": 7}"
+      }
+    ],
+    "provider_request_id": "preq_bftgsc2it068w4ylcnwdh4g5"
+  },
+  "textcase_r21_event_id": "realrun-b84fc65bfcfe",
+  "textcase_r21_plan": {
+    "plan_id": "plan_5md9e6nyct4eeiwsa54ppsv3",
+    "revision_id": "pr_3rfaqnx2tmhufrxtyuothtgh",
+    "objective": "Add a standard-library-only `textcase` package to this repository that converts arbitrary separator-delimited text to snake_case, camelCase, and kebab-case, with unittest coverage, README usage docs, a sub-agent review of the word-splitting rules, and a captured final diff."
+  },
+  "textcase_r21_casual_event": "realrun-479eb1b92b48",
+  "textcase_r21_casual_checked": "ingested as conversation event evt_9al40hnpwq2a5d8745dml95o; no actionable plan proposed",
+  "textcase_r21_handoff_id": "ph_1sdxcrnpqirnrkqlbn2ozbn0"
 }

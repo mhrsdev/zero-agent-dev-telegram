@@ -96,6 +96,8 @@ DECOMPOSITION_SYSTEM_PROMPT = (
     '    can actually hold true then:\n'
     '    - read-only analysis/review tasks: ["provider_response"]\n'
     '    - tasks that create files BEFORE the test suite exists: ["diff"]\n'
+    '    - a task whose objective is to capture/produce the final diff\n'
+    '      (aggregation): ["diff"] — its artifact is the diff itself\n'
     '    - the ONE task that runs and verifies the full test suite (after\n'
     '      tests exist): ["test_report","exit_status"] — NO diff: a\n'
     '      verification task may legitimately change nothing, and an\n'
@@ -155,8 +157,10 @@ _EMITTED_TASK_SCHEMA: dict = {
                             "Durable proof this task must produce. Use "
                             "[\"provider_response\"] for read/analysis/review "
                             "tasks that change no files; use "
-                            "[\"diff\", \"test_report\", \"exit_status\"] for "
-                            "tasks that create or modify code. Omit to get "
+                            "[\"diff\"] for tasks that create or modify "
+                            "code, and ALSO for a task whose objective is to "
+                            "capture the final diff (aggregation) — its "
+                            "artifact is the diff itself. Omit to get "
                             "the scheduler default."
                         ),
                     },
@@ -201,7 +205,9 @@ DECOMPOSITION_SYSTEM_PROMPT_STRICT = (
     "what can truly hold at that point: [\"provider_response\"] for "
     "read/analysis/review tasks that change no files; [\"diff\"] for "
     "tasks that create or modify files while the test suite does not yet "
-    "exist; [\"test_report\",\"exit_status\"] (NO diff — a verification "
+    "exist; [\"diff\"] ALSO for a task whose objective is to capture or "
+    "produce the final diff (aggregation) — its artifact is the diff "
+    "itself; [\"test_report\",\"exit_status\"] (NO diff — a verification "
     "task may legitimately change nothing, and an empty diff would fail "
     "it) ONLY for the task that runs and verifies the complete test "
     "suite (it must depend on the tests-existing task). Reserve "

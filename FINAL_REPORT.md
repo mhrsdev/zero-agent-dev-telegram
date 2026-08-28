@@ -101,6 +101,32 @@ intentional tokenizer test data, not documentation.
 | F9 | Completed delivery still said "task failed or blocked" | `blocker_reason` never cleared on completion | `_maybe_complete_execution` clears `blocker_reason` on completion |
 | F10 | Regression safety | — | New test files: `test_execution_result_context.py` (4), `test_provider_streaming.py` (3), `test_stream_outcome_classification.py` (4), `test_reconcile_blocked_task.py` (3), plus `test_hermes_parity_audit.py` (16) and earlier additions |
 
+### Phase G — Tool-calling verification round + 5-minute complete run (2 bugs)
+
+After the 11/11 completion, the complete bot + server was run live for a
+5-minute window (real Telegram in/out, real LLM, real pipeline), then every
+tool invocation was audited. **38 audited tool calls** fired in the window —
+and the audit exposed two final defects:
+
+| # | Symptom | Root cause | Fix |
+|---|---------|-----------|-----|
+| G1 | `capture_diff` failed input validation **5× consecutively** in the final diff task (model passed natural arguments like `base`/`paths` to a tool declared `{"properties": {}, "additionalProperties": false}`); the model then tried `delegate` (sub-agents correctly cannot call worktree tools) and finally self-recovered via `git diff` over `run_command` | Tool declaration fought the model instead of steering it; each failure had a different signature so the loop breaker never fired | `capture_diff` schema now tolerates (ignores) extra keys and its description says "Takes NO arguments — call it with an empty object {}"; genuine zero-argument tools that still reject now append "call it with an empty object {}" to the model-facing error; the context-less worktree-tool denial names the policy ("delegation sub-agents cannot call worktree tools — the parent task must invoke them directly") |
+| G2 | The "capture the final diff" aggregation task carried only `["provider_response"]` evidence (gate NOT bypassed — the task legitimately completed — but the evidence was weak) | Decomposer guidance had no rule for aggregation/diff-capture tasks | All three decomposer guidance surfaces (plain prompt, tool-schema description, strict prompt) now require `["diff"]` for capture-the-final-diff tasks |
+
+The 5-minute window itself proved: server healthy on every 15s sample, 21
+real Telegram long-poll cycles, bot outbound marker delivered (msg 239),
+chat tool loop live (real LLM → `wordcount` → success), fresh planner
+revision, casual chat correctly declined, 4/5 tasks completed inside the
+window, execution **completed 5/5** right after, rich Telegram delivery
+(msg 254) with Goal + all task objectives, and the final worktree verified
+(package files + 13 unittest OK + per-task evidence commits).
+
+Post-fix live proof: a fresh `capture_diff` invocation **with extra
+arguments succeeds end-to-end** against a real worktree
+(`tests/test_tool_schema_steering.py`), and a fresh live LLM tool round
+(`wordcount`) completes in 3.5 s with a correct result. Total defects fixed
+across the session: **45**.
+
 ---
 
 ## 3. End-to-End Verification (all real, no mocks)
@@ -119,14 +145,17 @@ intentional tokenizer test data, not documentation.
 | RAG / memory | ingest → approve → FTS search → RetrievalRouter injection ledger; compaction with real LLM summarizer + 7 memory deltas |
 | Plugins | `user:wordcount` invoked by real LLM in chat and directly |
 | HTTP / CLI | 110 OpenAPI paths; `/capabilities` all-available; `/web/login`, `/admin/login` 200; protected routes 401/403; `zero status` / `zero doctor` 9/9 OK |
-| Final pipeline | 11/11 tasks COMPLETED; final worktree contains the full `textcase` package (convert.py, __init__.py, tests, README); `python3 -m unittest discover` = 12 tests OK |
+| Final pipeline | 11/11 tasks COMPLETED (textcase_final); post-fix rerun textcase_r21 COMPLETED 10/10 with **capture_diff 9/9 first-try successes, zero validation failures**; final worktrees contain full packages with passing unittest suites (13 and 16 tests OK) |
 
 ## 4. Test Suite
 
-- Final: **986 passed / 15 skipped / 0 failed** (start of session: 920).
-- 66+ new regression tests across 10 new test files; `ruff` clean on every changed file.
-- One pre-existing golden-table failure (`test_api_route_surface`) is excluded and was
-  verified to fail on a clean stash too (unrelated to these changes).
+- Final: **994 passed / 15 skipped / 0 failed** (1,009 collected across 95
+  files; start of session: 920).
+- 74+ new regression tests across 11 new test files; `ruff` clean on every
+  changed file.
+- One pre-existing golden-table failure (`test_api_route_surface`) is excluded
+  from the historical count and was verified to fail on a clean stash too
+  (unrelated to these changes).
 
 ## 5. How to Run
 
