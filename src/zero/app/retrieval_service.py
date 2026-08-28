@@ -407,7 +407,17 @@ class ContextBuilder:
                     project_id=ProjectId(project_id.value),
                     execution_id=ExecutionId(execution_id.value),
                     version=actual_version,
-                    active=True,
+                    # Bug fix (real run): this used to be active=True, but
+                    # context_versions carries UNIQUE(execution_id) WHERE
+                    # active = 1 — inserting the second version of an
+                    # execution while the previous one is still active
+                    # violated the index and the WHOLE context version was
+                    # dropped ("persistence skipped … IntegrityError" on
+                    # every task after the first). Insert inactive and let
+                    # activate_context_version below do the atomic
+                    # deactivate-all → activate-new flip inside this same
+                    # transaction.
+                    active=False,
                     system_message=system_message,
                     user_prefix=user_prefix,
                     plan_contract=plan_contract,

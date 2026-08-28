@@ -374,6 +374,37 @@ class AgentTypeRepository:
         """Move a leased instance to a terminal/reusable state."""
         self.update_instance_state(instance_id, new_state)
 
+    def finish_running_instances_for_task(
+        self,
+        task_id: TaskId,
+        new_state: AgentInstanceState = "cancelled",
+        *,
+        commit: bool = True,
+    ) -> int:
+        """Release every ``running`` instance lease held by ``task_id``.
+
+        Restart-recovery companion to :meth:`lease_instance_for_task`
+        (real-run fix): when a worker process dies mid-task,
+        ``recover_after_restart`` puts the task back to ``ready``, but
+        its agent-type instance rows stayed ``running`` forever —
+        silently exhausting the type's ``max_concurrent_instances``
+        budget so every later claim failed with
+        ``ConcurrencyLimitExceededError``. Recovery now calls this to
+        release the leaked leases. Returns the number of instances
+        released.
+        """
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "UPDATE agent_instances SET state = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE task_id = ? AND state = 'running'",
+            (new_state, task_id.value),
+        )
+        released = int(cursor.rowcount)
+        if commit:
+            conn.commit()
+        return released
+
     def update_instance_state(
         self,
         instance_id: AgentInstanceId,

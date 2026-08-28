@@ -78,6 +78,25 @@ def _now_utc_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+#: Hermes parity (audit 2026-08-28): tool handler failures surface the
+#: underlying reason to the model — bounded and secret-redacted, in the
+#: reference shape ``Error executing tool '{name}': {reason}``.
+_HANDLER_ERROR_DETAIL_LIMIT = 512
+
+
+def _handler_failure_message(tool_name: str, exc: BaseException | None) -> str:
+    """Render a handler failure with its bounded, redacted cause."""
+    if exc is None:
+        return f"Tool {tool_name!r} handler failed"
+    from zero.domain.audit import redact_sensitive_text
+
+    detail = redact_sensitive_text(str(exc) or type(exc).__name__)
+    return (
+        f"Error executing tool {tool_name!r}: "
+        f"{type(exc).__name__}: {detail[:_HANDLER_ERROR_DETAIL_LIMIT]}"
+    )
+
+
 # ----------------------------------------------------------------------
 # Tool context and handler protocol
 # ----------------------------------------------------------------------
@@ -161,6 +180,21 @@ Handlers MUST NOT:
 # ----------------------------------------------------------------------
 # Built-in test tool: echo
 # ----------------------------------------------------------------------
+
+#: Upper bound on stdout/stderr text surfaced to the model per
+#: ``run_command`` invocation (real-run fix, 2026-08-28: the model used
+#: to receive only artifact ids and could not observe command output).
+_COMMAND_OUTPUT_CHAR_LIMIT = 8000
+
+#: Upper bound on the model-facing rendering of ANY tool result.
+#: Real-run fix (2026-08-28): the historical hard cap of 500 characters
+#: made a coding agent effectively blind — read_file returned ~450 chars
+#: of a source file and command output was invisible, so the model could
+#: not write correct tests or react to failures (its own honest reports
+#: documented exactly this blocker). 20k chars ≈ 5k tokens is still a
+#: bounded, context-safe render while carrying real file content and
+#: bounded test output.
+_MODEL_FACING_CHAR_LIMIT = 20000
 
 
 ECHO_TOOL_INPUT_SCHEMA: dict[str, Any] = {
@@ -383,8 +417,15 @@ class ToolService:
                 "state": {"type": "string"},
                 "exit_code": {"type": ["integer", "null"]},
                 "artifact_ids": {"type": "array", "items": {"type": "string"}},
+                # Real-run fix (2026-08-28): the model received only artifact
+                # ids and could never see what a command printed — it could
+                # not read test failures or probe output and reported the
+                # objective as unmet (honestly). Bounded stdout/stderr are
+                # now part of the declared result.
+                "stdout": {"type": "string"},
+                "stderr": {"type": "string"},
             },
-            "required": ["run_id", "state", "exit_code", "artifact_ids"],
+            "required": ["run_id", "state", "exit_code", "artifact_ids", "stdout", "stderr"],
             "additionalProperties": False,
         }
         diff_output = {
@@ -455,11 +496,26 @@ class ToolService:
                 args=tuple(input_data.get("args", ())),
                 timeout_seconds=input_data.get("timeout_seconds", 300),
             )
+
+            def _bounded(kind: str) -> str:
+                for artifact in artifacts:
+                    if artifact.kind == kind:
+                        text = artifact.content or ""
+                        if len(text) > _COMMAND_OUTPUT_CHAR_LIMIT:
+                            return (
+                                text[:_COMMAND_OUTPUT_CHAR_LIMIT]
+                                + f"\n…[{kind} truncated at {_COMMAND_OUTPUT_CHAR_LIMIT} chars]"
+                            )
+                        return text
+                return ""
+
             return {
                 "run_id": run.id.value,
                 "state": run.state,
                 "exit_code": run.exit_code,
                 "artifact_ids": [artifact.id.value for artifact in artifacts],
+                "stdout": _bounded("stdout"),
+                "stderr": _bounded("stderr"),
             }
 
         def diff_handler(_input_data: dict[str, Any], context: ToolContext) -> dict[str, Any]:
@@ -471,6 +527,27 @@ class ToolService:
                 actor_id=context.actor_id,
             )
             return {"artifact_id": artifact.id.value, "content": artifact.content}
+
+        # Bug fix (real run, 2026-08-28): the description used to keep the
+        # allowlist secret ("allowlisted, bounded command"), so a frontier
+        # model naturally asked for `bash -c "…"` and got a policy
+        # rejection it could not have predicted. Declare the exact
+        # permitted binaries and the no-shell rule in the description the
+        # model sees, and read them from the enforcing service so the
+        # advertisement can never drift from the policy.
+        allowed = sorted(getattr(worktree_service, "allowed_commands", ()) or ())
+        if allowed:
+            run_command_description = (
+                "Run one bounded command in the current task worktree. "
+                "There is NO shell: only these exact binaries are permitted: "
+                + ", ".join(allowed)
+                + ". Shell composition (bash/sh -c), pipes and redirects are "
+                "refused; pass file lists via args instead."
+            )
+        else:
+            run_command_description = (
+                "Run one allowlisted, bounded command in the current task worktree."
+            )
 
         definitions = (
             (
@@ -491,7 +568,7 @@ class ToolService:
             ),
             (
                 "run_command",
-                "Run one allowlisted, bounded command in the current task worktree.",
+                run_command_description,
                 command_input,
                 command_output,
                 "zero.workspace.run_command",
@@ -521,6 +598,24 @@ class ToolService:
                 # server-owned handler every time the composition root starts.
                 self._handlers[handler_key] = handler
                 self._inline_handler_keys.add(handler_key)
+                # Real-run fix (2026-08-28): the persisted row also carried
+                # the ORIGINAL declared schemas. When a server-owned tool's
+                # declaration evolves (run_command gained stdout/stderr
+                # result fields), invocations kept failing output validation
+                # against the stale contract. The declaration is server-
+                # owned metadata — refresh it in lockstep with the handler.
+                if (
+                    existing_tool.description != description
+                    or existing_tool.input_schema != input_schema
+                    or existing_tool.output_schema != output_schema
+                ):
+                    self._tool_repo.update_tool_declaration(
+                        existing_tool.id,
+                        description=description,
+                        input_schema=input_schema,
+                        output_schema=output_schema,
+                    )
+                    existing_tool = self.get_tool_by_name(name)
                 registered.append(existing_tool)
                 continue
             registered.append(
@@ -814,7 +909,9 @@ class ToolService:
                 correlation_id=correlation_id,
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
-            raise ToolError(f"Tool {tool.name!r} handler failed") from exc
+            # Hermes parity (audit 2026-08-28): the model-facing error must
+            # carry the underlying reason or the loop cannot self-correct.
+            raise ToolError(_handler_failure_message(tool.name, exc.__cause__ or exc)) from exc
         except ToolError:
             self._audit_invocation(
                 project_id=project_id,
@@ -838,7 +935,10 @@ class ToolService:
                 correlation_id=correlation_id,
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
-            raise ToolError(f"Tool {tool.name!r} handler failed") from exc
+            # Hermes parity (audit 2026-08-28): include the bounded,
+            # redacted underlying reason. A bare "handler failed" made the
+            # model blind to e.g. which path was unreadable.
+            raise ToolError(_handler_failure_message(tool.name, exc)) from exc
 
         # 5. Validate output against schema.
         try:
@@ -928,15 +1028,14 @@ class ToolService:
         redacted. Raw output is preserved in the :class:`ToolResult`
         for the caller; the model only sees the summary.
         """
-        # For the echo tool and similar simple tools, we render the
-        # output as compact JSON. For tools with large outputs, the
-        # handler should provide a custom rendering; for now we cap
-        # the length to a safe bound.
         import json
 
         text = redact_sensitive_text(json.dumps(output, ensure_ascii=False, sort_keys=True))
-        if len(text) > 500:
-            text = text[:497] + "..."
+        if len(text) > _MODEL_FACING_CHAR_LIMIT:
+            text = (
+                text[:_MODEL_FACING_CHAR_LIMIT]
+                + f"…[model-facing output truncated at {_MODEL_FACING_CHAR_LIMIT} chars]"
+            )
         return text
 
     def _audit_invocation(

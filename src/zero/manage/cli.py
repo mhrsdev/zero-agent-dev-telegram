@@ -41,7 +41,13 @@ def _engine_services(env_file: str | None = None):
     from zero.persistence.connection import open_database
     from zero.persistence.migrations import apply_migrations
 
-    settings = Settings.load(env_file=env_file)
+    # Bug fix: strict load made `zero setup` impossible on a fresh host —
+    # storing any secret raised "ZERO_ENV is required" because the .env
+    # the wizard is supposed to create does not exist yet. Like
+    # `zero-develop serve`, the management CLI is a developer-facing
+    # entry point, so it may assume development defaults; an explicit
+    # ZERO_ENV (env or .env) still always wins.
+    settings = Settings.load(env_file=env_file, zero_env_fallback="development")
     database = open_database(settings)
     apply_migrations(database)
     services = build_services(settings, database)
@@ -176,6 +182,11 @@ def cmd_setup(ns) -> int:
         setup.reset()
         print("draft cleared")
 
+    if ns.resume:
+        draft = setup.resume()
+        if draft.get("current_step") or draft.get("data"):
+            print(f"resuming draft at step: {draft.get('current_step') or 'welcome'}")
+
     if ns.from_env:
         draft = setup.resume()
         data = draft.setdefault("data", {})
@@ -198,6 +209,13 @@ def cmd_setup(ns) -> int:
 
     if not ns.non_interactive:
         return _interactive_setup(setup)
+
+    if not ns.step:
+        _fail(
+            "--non-interactive requires at least one --step section.key=value "
+            "(or run the interactive wizard without --non-interactive)",
+            2,
+        )
 
     # Non-interactive: group --step key=value pairs by section, then run
     # each provided section through setup.answer() so validation runs and
@@ -253,52 +271,277 @@ def cmd_setup(ns) -> int:
 
 
 def _interactive_setup(setup) -> int:
+    """Form-driven interactive wizard.
+
+    Bug fix history: the previous "minimal" driver passed an empty value
+    dict for every step it had no hard-coded branch for — including
+    ``telegram_mode`` and ``model_assign`` — so typing the exact valid
+    answer still failed validation and the wizard deadlocked. It now
+    derives its prompts from the shared WIZARD_STEPS form specs (same
+    source as the GUI), shows every available option/default, and can
+    skip optional steps, so every step of STEP_ORDER is completable.
+    """
+    from zero.manage.services.setup import STEP_ORDER
+    from zero.manage.services.wizard_forms import WIZARD_STEPS
+
     print("Zero Dev Telegram — setup wizard")
-    print("(answers are saved; Ctrl+C to pause and resume later)\n")
-    while True:
-        step = setup.current()
-        raw = input(f"[{step}] value (Enter=skip/back with 'b'): ").strip()
-        if raw == "b":
-            setup.back(step)
-            continue
-        # Minimal interactive driver: feed simple key=value tokens.
-        value: dict[str, object] = {}
-        if step == "telegram_credentials":
-            token = raw or getpass.getpass("bot token: ")
-            value = {"token": token}
-        elif step == "provider_add":
-            parts = dict(kv.split("=", 1) for kv in raw.split() if "=" in kv)
-            value = {
-                "id": parts.get("id", "openai-primary"),
-                "protocol": parts.get("protocol", "openai_compatible"),
-                "base_url": parts.get("base_url", "https://api.openai.com/v1"),
-                "api_key": parts.get("key") or getpass.getpass("api key: "),
-            }
-        elif step == "access_mode":
-            value = {"mode": raw or "owner_only"}
-        elif step == "groups":
-            value = {"chat_id": raw}
-        elif step in {"version"}:
-            value = {"channel": raw or "stable"}
-        elif step == "privacy":
-            value = {"telemetry_enabled": raw.lower() == "true"}
-        elif step == "updates":
-            value = {"channel": raw or "stable"}
-        result = setup.answer(step, value)
-        if result.errors:
-            for e in result.errors:
-                print(f"  ! {e}")
-            continue
-        print(f"  ok -> {setup.current()}")
-        if step == STEP_LAST:
-            break
-    cfg = setup.commit()
-    print(f"written: {cfgsvc_path()}")
-    del cfg
+    print("(answers are saved · 'b'=back · 's'=skip optional · Ctrl+C to pause/resume)")
+    total = len(STEP_ORDER)
+    try:
+        while True:
+            step = setup.current()
+            spec = WIZARD_STEPS.get(step)
+            idx = STEP_ORDER.index(step) + 1 if step in STEP_ORDER else total
+            print("\n" + "─" * 64)
+            print(f"Step {idx}/{total} · {spec.title if spec else step}")
+            if step == "welcome":
+                print(f"  config home : {_home()}")
+                print(f"  version     : {__version__}")
+            if spec and spec.optional:
+                print("  (optional step)")
+            if step == "groups":
+                print("  (Enter at chat id skips — add later via: zero telegram groups add)")
+
+            value, action = _collect_step_answers(setup, step, spec)
+            if action == "back":
+                setup.back(step)
+                print(f"  <- back to {setup.current()}")
+                continue
+            if action == "skip":
+                if step == STEP_ORDER[-1]:
+                    break
+                nxt = setup.skip(step)
+                print(f"  skipped -> {nxt}")
+                continue
+
+            while True:
+                result = setup.answer(step, value)
+                for e in result.errors or []:
+                    print(f"  ! {e}")
+                for w in result.warnings or []:
+                    print(f"  ~ {w}")
+                if result.ok:
+                    break
+                # Bug fix (UX): any validation failure used to re-ask every
+                # field, so a transient probe error ("unreachable:
+                # ConnectError") forced retyping the whole step. Offer a
+                # retry with the same answers first.
+                can_skip = bool(spec and spec.optional) or step == "groups"
+                opts = "Enter=retry same answers · r=re-enter · b=back"
+                if can_skip:
+                    opts += " · s=skip"
+                choice = input(f"  [{opts}]: ").strip().lower()
+                if choice == "b":
+                    setup.back(step)
+                    print(f"  <- back to {setup.current()}")
+                    action = "back"
+                    break
+                if choice == "s" and can_skip:
+                    action = "skip"
+                    break
+                if choice == "r":
+                    value, action2 = _collect_step_answers(setup, step, spec, prefill=value)
+                    if action2 == "back":
+                        setup.back(step)
+                        print(f"  <- back to {setup.current()}")
+                        action = "back"
+                        break
+                    if action2 == "skip":
+                        action = "skip"
+                        break
+                    continue
+                # Enter (or anything else): retry with the same answers —
+                # the usual fix for a transient network error.
+            if action == "back":
+                continue
+            if action == "skip":
+                if step == STEP_ORDER[-1]:
+                    break
+                nxt = setup.skip(step)
+                print(f"  skipped -> {nxt}")
+                continue
+            print(f"  ok -> {setup.current()}")
+            if step == STEP_ORDER[-1]:
+                break
+    except (KeyboardInterrupt, EOFError):
+        print(f"\npaused at step '{setup.current()}' — resume with: zero setup --resume")
+        return 130
+
+    print("\n" + "─" * 64)
+    try:
+        setup.commit()
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - e.g. pydantic ValidationError:
+        # operators get an actionable message, never a traceback.
+        print(
+            f"error: configuration invalid: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"configuration written: {cfgsvc_path()}")
     return 0
 
 
-STEP_LAST = "backup_policy"  # last answered step before final validation
+_OMIT = object()  # sentinel: field left unset (no default, not required)
+
+
+def _dynamic_wizard_defaults(setup, step: str, draft_data: dict) -> dict[str, object]:
+    """Per-step defaults derived from previously answered draft steps."""
+    out: dict[str, object] = {}
+    provider_models = (draft_data.get("provider_add", {}) or {}).get("models") or []
+    if step == "provider_test" and provider_models:
+        out["model"] = provider_models[0]
+    elif step == "model_assign" and provider_models:
+        out["primary_model"] = provider_models[0]
+    elif step == "groups":
+        raw_token = ((draft_data.get("telegram_credentials", {}) or {}).get("_raw") or {}).get(
+            "token"
+        )
+        if raw_token:
+            out["token"] = raw_token
+    return out
+
+
+def _field_prompt(field, default) -> str:
+    """Render one input line: label, available options, default, required."""
+    hints: list[str] = []
+    if field.kind == "select" and field.options:
+        hints.append("options: " + ", ".join(field.options))
+    if field.kind == "bool":
+        hints.append("y/n")
+    if field.kind == "password":
+        if default:
+            hints.append("Enter=keep previous")
+    elif default is not None and default != "":
+        hints.append(f"default: {default}")
+    if field.required and field.kind != "bool":
+        hints.append("required")
+    suffix = (" (" + "; ".join(hints) + ")") if hints else ""
+    return f"  {field.label}{suffix}: "
+
+
+def _parse_field_value(field, raw: str, default):
+    """Coerce one raw answer per field kind; returns (value|_OMIT, error)."""
+    if raw == "":
+        if field.kind == "bool":
+            return bool(default), None
+        if default is not None:
+            return default, None
+        if field.required:
+            return None, f"{field.label} is required"
+        return _OMIT, None
+    if field.kind == "bool":
+        if raw.lower() in {"true", "yes", "y", "1", "on"}:
+            return True, None
+        if raw.lower() in {"false", "no", "n", "0", "off"}:
+            return False, None
+        return None, "please answer y/n"
+    if field.kind == "password":
+        # Keys/tokens are pasted: strip invisible artifacts (zero-width,
+        # NBSP, BOM) and reject visible non-ASCII up front — the wizard's
+        # own draft mask ('…') or a truncated copy would otherwise crash
+        # the HTTP probe with UnicodeEncodeError.
+        from zero.manage.core.probes import clean_secret
+
+        cleaned = clean_secret(raw)
+        if cleaned is None:
+            return None, (
+                "value contains invalid characters (often '…' from a truncated "
+                "copy or invisible paste artifacts) — paste the full value again"
+            )
+        return cleaned, None
+    if field.kind == "select":
+        opts = list(field.options)
+        if raw in opts:
+            return raw, None
+        if raw.isdigit() and 1 <= int(raw) <= len(opts):
+            return opts[int(raw) - 1], None
+        normalized = raw.lower().replace("-", "_").replace(" ", "_")
+        if normalized in opts:
+            return normalized, None
+        return None, f"choose one of: {', '.join(opts)}"
+    if field.kind == "int":
+        try:
+            return int(raw), None
+        except ValueError:
+            return None, "enter a whole number"
+    return raw, None
+
+
+def _collect_step_answers(setup, step: str, spec, prefill: dict | None = None):
+    """Prompt every field of a wizard step; returns (value, action).
+
+    action: 'answer' | 'back' | 'skip' ('s', or Enter on an empty
+    non-required step such as groups). ``prefill`` (the last failed
+    attempt) supplies field defaults so 'r'-re-entry keeps typed values
+    instead of falling back to stale draft/spec defaults.
+    """
+    fields = spec.fields if spec else ()
+    if not fields:
+        raw = input("  Press Enter to continue ('b'=back, 's'=skip): ").strip().lower()
+        if raw == "b":
+            return {}, "back"
+        if raw == "s":
+            return {}, "skip"
+        return {}, "answer"
+
+    draft_data = setup.resume().get("data", {})
+    saved = draft_data.get(step, {}) or {}
+    dynamic = _dynamic_wizard_defaults(setup, step, draft_data)
+
+    value: dict[str, object] = {}
+    for field in fields:
+        # Conditional fields: only asked when a previous answer needs them.
+        if (
+            step == "access_mode"
+            and field.name == "confirm_public"
+            and value.get("mode") != "public"
+        ):
+            continue
+        if (
+            step == "websearch"
+            and field.name in {"provider_id", "api_key"}
+            and not value.get("enabled")
+        ):
+            continue
+
+        default = saved.get(field.name, field.default)
+        if default is None and field.name in dynamic:
+            default = dynamic[field.name]
+        if default is None and prefill and field.name in prefill:
+            default = prefill[field.name]
+
+        while True:
+            prompt = _field_prompt(field, default)
+            if field.kind == "password":
+                raw = getpass.getpass(prompt).strip()
+            else:
+                raw = input(prompt).strip()
+            low = raw.lower()
+            if low == "b":
+                return {}, "back"
+            if low in {"s", "skip"} and (spec.optional or step == "groups"):
+                return {}, "skip"
+            parsed, err = _parse_field_value(field, raw, default)
+            if err:
+                print(f"  ! {err}")
+                continue
+            if parsed is not _OMIT:
+                value[field.name] = parsed
+            # Groups gate: an empty chat id means "no groups" — skip the
+            # remaining discovery prompts immediately.
+            if step == "groups" and field.name == "chat_id" and not value.get("chat_id"):
+                return {}, "skip"
+            break
+
+    if step == "groups":
+        if not str(value.get("chat_id") or "").strip():
+            return {}, "skip"
+        if value.get("token"):
+            value["discover"] = True
+    return value, "answer"
 
 
 def cfgsvc_path() -> str:
@@ -353,6 +596,38 @@ def _human_status(info: dict) -> str:
     return "\n".join(lines)
 
 
+def _pid_alive(pid: int) -> bool:
+    """Liveness probe that never signals the target process.
+
+    Bug fix (Windows): ``os.kill(pid, 0)`` is a harmless no-signal probe
+    on POSIX, but on Windows os.kill maps any non-CTRL signal to
+    TerminateProcess — so ``zero status`` used to KILL the running
+    service it was merely checking. On Windows we ask the kernel via a
+    query-only handle instead; POSIX keeps the cheap signal-0 probe.
+    """
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    SYNCHRONIZE = 0x00100000
+    WAIT_TIMEOUT = 0x00000102
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, int(pid)
+    )
+    if not handle:
+        return False
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _service_status() -> dict[str, str]:
     if shutil.which("systemctl"):
         rc = subprocess.run(
@@ -366,10 +641,12 @@ def _service_status() -> dict[str, str]:
     if pid_file.exists():
         pid = pid_file.read_text().strip()
         try:
-            os.kill(int(pid), 0)
+            alive = _pid_alive(int(pid))
+        except ValueError:
+            alive = False
+        if alive:
             return {"kind": "process", "state": f"running(pid {pid})"}
-        except OSError:
-            pass
+        return {"kind": "process", "state": f"stopped (stale pid {pid})"}
     return {"kind": "none", "state": "stopped"}
 
 
@@ -377,14 +654,25 @@ def cmd_start(ns) -> int:
     if shutil.which("systemctl"):
         subprocess.run(["systemctl", "start", SERVICE_NAME], check=False)
         return cmd_status(ns)
+    # Bug fix: the log file was opened before $ZERO_HOME existed, so a
+    # fresh `zero start` crashed with FileNotFoundError. Create it first.
+    _home().mkdir(parents=True, exist_ok=True)
     log = open(_home() / "zero.log", "ab")  # noqa: SIM115
+    spawn: dict = {}
+    if os.name == "nt":
+        # start_new_session is POSIX-only (ValueError on Windows).
+        spawn["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:
+        spawn["start_new_session"] = True
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "zero.main:app", "--host", "127.0.0.1", "--port", "8000"],
         stdout=log,
         stderr=log,
-        start_new_session=True,
+        **spawn,
     )
-    _home().mkdir(parents=True, exist_ok=True)
     (_home() / "zero.pid").write_text(str(proc.pid))
     print(f"started pid={proc.pid} (foreground alternative: zero-develop serve)")
     return 0
@@ -410,16 +698,45 @@ def cmd_restart(ns) -> int:
     return cmd_start(ns)
 
 
+def _journalctl_active_unit() -> bool:
+    """True only when the zero systemd unit actually exists on this host.
+
+    Bug fix: `zero logs` used to exec journalctl whenever the binary
+    existed, even when the service runs as a plain process (`zero start`
+    writes zero.pid/zero.log) — users saw "No entries" while the file
+    had fresh content. Fall back to the file when the unit is absent.
+    """
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return False
+    try:
+        return (
+            subprocess.run(
+                [systemctl, "cat", SERVICE_NAME], capture_output=True, check=False
+            ).returncode
+            == 0
+        )
+    except OSError:
+        return False
+
+
 def cmd_logs(ns) -> int:
-    if shutil.which("journalctl"):
+    # Bug fix: the parser only defined `-n` (dest "n") while this handler
+    # read `ns.lines`, so every `zero logs` crashed with AttributeError.
+    # `-n N` and `--lines N` both work now, and a non-positive N no longer
+    # falls into Python's `[-0:] == [0:]` trap (which printed EVERYTHING).
+    tail = max(0, int(getattr(ns, "lines", 100) or 0))
+    if _journalctl_active_unit():
         os.execvp(
-            "journalctl", ["journalctl", "-u", SERVICE_NAME, "-n", str(ns.lines), "--no-pager"]
+            "journalctl", ["journalctl", "-u", SERVICE_NAME, "-n", str(tail), "--no-pager"]
         )
     log = _home() / "zero.log"
     if not log.exists():
         print("no log file yet")
         return 0
-    lines = log.read_text(errors="replace").splitlines()[-ns.lines :]
+    if tail == 0:
+        return 0
+    lines = log.read_text(errors="replace").splitlines()[-tail:]
     print("\n".join(lines))
     return 0
 
@@ -934,7 +1251,7 @@ def cmd_backup_status(ns) -> int:
     if ns.json or data is None:
         _print({"last": data})
         return 0
-    age_h = (time.time() - float(data.get("epoch", 0))) / 3600.0
+    age_h = (time.time() - float(data.get("epoch") or 0)) / 3600.0
     print(f"last backup: {data.get('path')} ({age_h:.1f}h ago)")
     return 0
 
@@ -943,9 +1260,10 @@ def cmd_backup_status(ns) -> int:
 # parser
 # ----------------------------------------------------------------------
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="zero", description="Zero Dev Telegram management CLI")
-    p.add_argument("--version", action="version", version=f"zero {__version__}")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    parser = argparse.ArgumentParser(prog="zero", description="Zero Dev Telegram management CLI")
+    parser.add_argument("--version", action="version", version=f"zero {__version__}")
+    # Not required: a bare `zero` should print help, not an argparse error.
+    sub = parser.add_subparsers(dest="cmd")
 
     def with_env(sp):
         sp.add_argument("--env-file", default=None)
@@ -970,7 +1288,17 @@ def _build_parser() -> argparse.ArgumentParser:
     st.add_argument("--json", action="store_true")
 
     logs = sub.add_parser("logs", help="tail service logs")
-    logs.add_argument("-n", type=int, default=100)
+    # Bug fix: bare "-n" made argparse derive dest "n" while cmd_logs read
+    # ns.lines — every `zero logs` crashed. Explicit dest + long alias.
+    logs.add_argument(
+        "-n",
+        "--lines",
+        dest="lines",
+        type=int,
+        default=100,
+        metavar="N",
+        help="show the last N lines (default: 100)",
+    )
 
     doc = sub.add_parser("doctor", help="diagnostics")
     doc.add_argument("--json", action="store_true")
@@ -1008,7 +1336,14 @@ def _build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--key-file", default="-")
     pa.add_argument("--models", default="")
     pa.add_argument("--priority", type=int, default=10)
-    pa.add_argument("--probe", action="store_true", default=True)
+    # Bug fix: `--probe` with store_true/default=True could never be
+    # turned off; BooleanOptionalAction gives --probe / --no-probe.
+    pa.add_argument(
+        "--probe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="probe the endpoint before saving (default: yes)",
+    )
     pa.add_argument("--save-unverified", action="store_true")
     pt = pvs.add_parser("test")
     pt.add_argument("--id", required=True)
@@ -1086,7 +1421,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("tui", help="full-screen TUI (requires [tui] extra)")
 
-    return p
+    return parser
 
 
 _HANDLERS = {
@@ -1129,10 +1464,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     handler = _HANDLERS.get(args.cmd)
-    if handler is None:  # pragma: no cover
+    if handler is None:
         parser.print_help()
         return 2
-    return int(handler(args))
+    try:
+        return int(handler(args))
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+    except EOFError:
+        # A piped/closed stdin reached an input()/getpass() prompt
+        # outside the wizard: fail like a usage error, not a traceback.
+        print("\ninput stream closed (EOF) before a value was provided", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -278,9 +278,24 @@ class _InMemoryCursorStore:
 
 
 def _build_binding_adapter(*, services, chat_token: str, cursor_store):
-    """Build a TelegramAdapter bound to one resolved bot credential."""
+    """Build a TelegramAdapter bound to one resolved bot credential.
+
+    Bug fix (real server run, 2026-08-28): the adapter was built with the
+    default ``RetryPolicy`` whose per-request ``timeout_seconds=10``.
+    Long polling asks Telegram to HOLD the request open for
+    ``poll_timeout_seconds`` (25s), so httpx aborted every long poll at
+    10s with TransportError — then the retry wrapper re-sent it twice
+    more, guaranteeing ~30s of doomed requests per polling iteration.
+    The gateway could never receive a real message.
+
+    The per-request budget now always exceeds the long-poll hold
+    (+10s margin), and attempts=1 because a completed long poll IS the
+    wait — the outer polling loop is the retry.
+    """
+    from zero.adapters.messaging import RetryPolicy
     from zero.adapters.telegram import TelegramAdapter
 
+    poll_timeout = 25
     transports = services.interface_transports
     transport = transports.http_transport if transports is not None else None
     return TelegramAdapter(
@@ -288,7 +303,12 @@ def _build_binding_adapter(*, services, chat_token: str, cursor_store):
         transport=transport,
         bot_token=chat_token,
         cursor_store=cursor_store,
-        poll_timeout_seconds=25,
+        poll_timeout_seconds=poll_timeout,
+        retry_policy=RetryPolicy(
+            attempts=1,
+            backoff_seconds=0.25,
+            timeout_seconds=float(poll_timeout) + 10.0,
+        ),
     )
 
 

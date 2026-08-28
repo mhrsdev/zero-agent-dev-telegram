@@ -36,20 +36,27 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-_FTS_SPECIAL = re.compile(r'["\'()*:^{}\[\]|,.\-]')
+_FTS_TOKEN = re.compile(r"[0-9A-Za-z_\u0080-\uffff]+")
 
 
 def _fts_safe_query(query: str) -> str:
     """Sanitize a user query for FTS5 MATCH.
 
-    Strips FTS5 operator/syntax characters and quotes, then joins the
-    remaining terms with OR. Returns an empty string when nothing
-    searchable remains so callers can short-circuit instead of raising.
+    Whitelist approach (real-run fix): task objectives and chat text are
+    arbitrary user content and previously crashed retrieval with
+    ``fts5: syntax error near "/"`` — the old operator blacklist missed
+    characters such as ``/``, ``&``, ``+`` and ``#`` (probe-verified
+    against sqlite FTS5). Every FTS5 operator, quote and syntax
+    character is now excluded by construction: tokens may only contain
+    ASCII letters/digits, underscore and non-ASCII letters (all
+    accepted by the default unicode61 tokenizer), then terms are joined
+    with OR so malformed input degrades to a plain term search instead
+    of raising or silently returning nothing.
     """
     terms = [
         term
-        for term in _FTS_SPECIAL.sub(" ", query or "").split()
-        if term and term.upper() not in {"AND", "OR", "NOT", "NEAR"}
+        for term in _FTS_TOKEN.findall(query or "")
+        if term.upper() not in {"AND", "OR", "NOT", "NEAR"}
     ]
     return " OR ".join(terms)
 

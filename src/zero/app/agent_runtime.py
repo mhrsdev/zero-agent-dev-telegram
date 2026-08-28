@@ -41,7 +41,7 @@ from zero.domain.providers import (
     ProviderUnknownOutcomeError,
     ToolDeclaration,
 )
-from zero.domain.tools import AgentScope
+from zero.domain.tools import AgentScope, ToolError, ToolInvocationDeniedError
 from zero.domain.worktrees import (
     RepositoryId,
     TaskArtifact,
@@ -71,6 +71,25 @@ _MAX_TRUNCATION_BOOSTS_PER_LOOP = 2
 _MAX_BOOSTED_TOKENS = 32768
 _FAILURE_WARN_THRESHOLD = 3
 _FAILURE_ABORT_THRESHOLD = 5
+#: Hermes parity (audit 2026-08-28): a no-content/no-tool-call response
+#: is retried with a bounded nudge instead of silently completing the
+#: task with an empty deliverable. Mirrors the reference empty-response
+#: ladder (post-tool nudge → bounded retries → terminal), right-sized
+#: for the task loop.
+_MAX_EMPTY_RESPONSE_RETRIES = 2
+_EMPTY_RESPONSE_NUDGE = (
+    "Your previous response was empty (no content and no tool calls). "
+    "Process the conversation above and produce your final answer now."
+)
+#: Hermes parity: identical-failure warnings ride ON the tool result as
+#: a bracketed suffix. Injecting a bare ``user`` message between the
+#: tool results of one assistant batch breaks tool-call/result pairing
+#: on strict provider wire formats (tool messages must directly follow
+#: the assistant tool_calls turn).
+_FAILURE_WARN_SUFFIX = (
+    "\n\n[Tool loop warning: identical failure; count={count}; tool={tool}. "
+    "Change your approach or try a different strategy before calling it again.]"
+)
 #: Final toolless request when the round budget is exhausted (Hermes
 #: parity: request a summary instead of hard-failing the turn).
 MAX_TOOL_ROUNDS_NUDGE_REQUEST = (
@@ -188,7 +207,7 @@ class AgentRuntime:
         context_builder: ContextBuilder | None = None,
         agent_type_repo: AgentTypeRepository | None = None,
         compaction: CompactionService | None = None,
-        test_command: tuple[str, ...] | None = ("pytest", "-q"),
+        test_command: tuple[str, ...] | None = None,
         enable_delegation: bool = False,
         approval_gate: Any | None = None,
         metrics: Any | None = None,
@@ -476,14 +495,37 @@ class AgentRuntime:
                             "a coding task requires repository_id when the project does not have exactly one repository"
                         )
                     repository_id = repositories[0].id
+                # Bug fix (real run, 2026-08-28): task worktrees used to
+                # branch only from the repository default revision, so a
+                # task could never see the files its dependency tasks
+                # produced — a "run the tests" task failed because its
+                # worktree had no test suite. A task now branches from its
+                # SUCCEEDED dependency worktrees' branches (last commit =
+                # that task's evidence checkpoint), with clean merges for
+                # multiple dependencies. Diamond DAGs resolve through
+                # normal git merges; conflicts fail the task with a clear
+                # reason instead of silently missing files.
+                base_revision, merge_bases = self._dependency_worktree_bases(
+                    project_id=project_id,
+                    execution_id=execution_id,
+                    task_id=task.id,
+                    actor_id=actor_id,
+                    source=source,
+                )
                 worktree = self._worktrees.create_worktree(
                     project_id=project_id,
                     repository_id=repository_id,
                     execution_id=execution_id,
                     task_id=task.id,
                     actor_id=actor_id,
+                    base_revision=base_revision,
                     source=source,
                 )
+                for merge_base in merge_bases:
+                    self._merge_worktree_base(
+                        worktree=worktree,
+                        branch=merge_base,
+                    )
                 worktree = self._worktrees.activate_worktree(
                     project_id=project_id,
                     worktree_id=worktree.id,
@@ -607,9 +649,21 @@ class AgentRuntime:
                 messages=messages,
                 tools=self._tool_declarations(effective_tool_names),
                 system_message=system_message,
-                # GAP 5: attach a streaming transport exactly when a
-                # client-facing stream consumer is connected.
-                stream=stream_callback is not None,
+                # GAP 5: a client-facing stream consumer taps the token
+                # stream when connected. Real-run fix: stream from the
+                # provider even without a consumer. Background tasks
+                # previously used non-streaming POSTs, so a long
+                # completion (deep sub-agent reviews routinely exceed a
+                # gateway's ~100s edge timeout) never returned response
+                # headers and died with HTTP 524; both same-provider
+                # retry attempts 524'd identically and the task failed.
+                # Streaming receives headers immediately, the gateway
+                # never times out, and the lease is kept alive by the
+                # collect-path heartbeat. The collected CanonicalResponse
+                # is identical either way, and every adapter (including
+                # the test fake via the base-class default) implements
+                # send_request_stream.
+                stream=True,
             )
         except Exception as exc:
             if worktree is not None:
@@ -932,6 +986,118 @@ class AgentRuntime:
             "that you did not perform."
         )
 
+    def _dependency_worktree_bases(
+        self,
+        *,
+        project_id: ProjectId,
+        execution_id: ExecutionId,
+        task_id: TaskId,
+        actor_id: UserId,
+        source: AuditSource,
+    ) -> tuple[str | None, tuple[str, ...]]:
+        """Resolve the git base for this task's worktree from dependencies.
+
+        Returns ``(base_revision, extra_branches_to_merge)``. Each
+        succeeded dependency worktree branch carries that task's
+        committed evidence checkpoint (see
+        ``WorktreeService.complete_worktree``). One dependency becomes
+        the branch base directly; several dependencies use the first as
+        the base and queue the rest for clean merges right after
+        creation. No usable dependency state falls back to the
+        repository default (``None``), preserving historical behavior.
+        """
+        assert self._worktrees is not None and self._worker is not None
+        try:
+            dependencies = self._worker.list_dependencies(
+                execution_id=execution_id,
+                project_id=project_id,
+                actor_id=actor_id,
+                source=source,
+            )
+        except Exception as dep_exc:  # noqa: BLE001 - degraded: default base
+            _LOGGER.debug(
+                "dependency base resolution unavailable for task %s: %s",
+                task_id.value,
+                type(dep_exc).__name__,
+            )
+            return None, ()
+        mine = [
+            dep
+            for dep in dependencies
+            if dep.task_id == task_id and dep.depends_on_task_id != task_id
+        ]
+        if not mine:
+            return None, ()
+        # list_worktrees_for_execution returns every worktree of the
+        # execution regardless of state; get_worktree_for_task only finds
+        # ACTIVE ones, which by definition never includes a succeeded
+        # (completed) dependency worktree.
+        try:
+            execution_worktrees = self._worktrees.list_worktrees_for_execution(
+                project_id,
+                execution_id,
+                actor_id=actor_id,
+                source=source,
+            )
+        except Exception as wt_exc:  # noqa: BLE001 - degraded: default base
+            _LOGGER.debug(
+                "execution worktree listing failed for %s: %s",
+                execution_id.value,
+                type(wt_exc).__name__,
+            )
+            return None, ()
+        branches: list[str] = []
+        for dep in mine:
+            dep_branches = [
+                wt.branch_name
+                for wt in execution_worktrees
+                if wt.task_id == dep.depends_on_task_id
+                and wt.state == "succeeded"
+                and wt.branch_name
+            ]
+            if not dep_branches:
+                continue
+            branch = dep_branches[-1]  # latest worktree of that task
+            if branch not in branches:
+                branches.append(branch)
+        if not branches:
+            return None, ()
+        return branches[0], tuple(branches[1:])
+
+    def _merge_worktree_base(self, *, worktree, branch: str) -> None:
+        """Merge one dependency branch into a freshly created worktree."""
+        assert self._worktrees is not None
+        merge_argv = (
+            "git",
+            "-c", "user.name=Zero Runtime",
+            "-c", "user.email=zero@internal",
+            "merge",
+            "--no-edit",
+            "-q",
+            branch,
+        )
+        import subprocess as _sp
+
+        try:
+            proc = _sp.run(
+                list(merge_argv),
+                cwd=str(worktree.worktree_path),
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except (OSError, _sp.TimeoutExpired) as merge_exc:
+            raise RuntimeEvidenceError(
+                f"dependency branch {branch!r} could not be merged: {merge_exc}"
+            ) from merge_exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()[:300]
+            raise RuntimeEvidenceError(
+                f"dependency branch {branch!r} merge conflict — the "
+                f"decomposition created overlapping parallel edits: {detail}"
+            )
+
     def _tool_declarations(
         self,
         tool_names: tuple[str, ...],
@@ -1071,6 +1237,14 @@ class AgentRuntime:
                 messages=tuple(messages),
                 tools=tuple(self._tool_declarations(tuple(allowed))),
                 max_tokens=1024,
+                # Real-run fix: stream this request too. The non-streaming
+                # sub-agent POST was the exact r5 failure — a deep review
+                # exceeded the gateway's edge timeout before response
+                # headers arrived (HTTP 524) and exhausted both retry
+                # attempts with identical 524s. Streaming returns headers
+                # immediately; the collect path reassembles the same
+                # CanonicalResponse.
+                stream=True,
             )
             final_content = ""
             completed = False
@@ -1112,7 +1286,16 @@ class AgentRuntime:
                             )
                             payload_text = result.model_facing
                         except Exception as exc:  # noqa: BLE001 - tool failure is data
-                            payload_text = f"error: {type(exc).__name__}"
+                            # Hermes parity (audit 2026-08-28): the sub-agent
+                            # needs the failure REASON to self-correct; the
+                            # bare exception class hid e.g. which binary the
+                            # command policy refused. Bounded + redacted.
+                            from zero.domain.audit import redact_sensitive_text
+
+                            detail = redact_sensitive_text(
+                                str(exc) or type(exc).__name__
+                            )[:512]
+                            payload_text = f"error executing tool {call.tool_name!r}: {detail}"
                     messages.append(
                         CanonicalMessage(
                             role="tool",
@@ -1158,9 +1341,9 @@ class AgentRuntime:
         if max_tool_rounds < 1 or max_tool_rounds > 32:
             raise ValueError("max_tool_rounds must be between 1 and 32")
         messages = list(request.messages)
-        if not response.tool_calls:
+        if not response.tool_calls and (response.content or "").strip():
             return response, provider_request_id, messages
-        if self._tools is None:
+        if self._tools is None and response.tool_calls:
             raise RuntimeToolError("provider requested tools but no tool service is wired")
         requested_names = set(tool_names)
         current_response = response
@@ -1203,6 +1386,50 @@ class AgentRuntime:
         failure_signatures: dict[str, int] = {}
         boost_budget = _MAX_TRUNCATION_BOOSTS_PER_LOOP
         breaker_tripped = False
+
+        # ---- empty-response ladder (Hermes parity, audit 2026-08-28) ----
+        # A response with neither content nor tool calls used to complete
+        # the task silently with an empty deliverable (its transcript
+        # evidence dutifully recorded "content": """). Bounded nudge
+        # retries now ask the model to actually produce its answer; if it
+        # still returns nothing, the empty response stands (degraded,
+        # not fatal — evidence gates still apply).
+        empty_retries = 0
+        while (
+            not current_response.tool_calls
+            and not (current_response.content or "").strip()
+            and empty_retries < _MAX_EMPTY_RESPONSE_RETRIES
+        ):
+            empty_retries += 1
+            _renew_lease()
+            if self._metrics is not None:
+                self._metrics.increment(
+                    "agent_runtime_empty_response_retries",
+                    project_id=task.project_id.value,
+                    result="nudged",
+                )
+            messages.append(CanonicalMessage(role="assistant", content="(empty)"))
+            messages.append(CanonicalMessage(role="user", content=_EMPTY_RESPONSE_NUDGE))
+            _LOGGER.warning(
+                "empty response for task %s (retry %d/%d); nudging the model",
+                task.id.value,
+                empty_retries,
+                _MAX_EMPTY_RESPONSE_RETRIES,
+            )
+            empty_request = replace(request, messages=tuple(messages))
+            empty_provider_request, current_response = self._providers.send_request_with_fallback(
+                project_id=task.project_id,
+                actor_id=actor_id,
+                execution_id=execution_id,
+                request=empty_request,
+                cancel_event=cancel_event,
+                source=source,
+                agent_scope=agent_scope,
+                stream_observer=stream_observer,
+            )
+            current_request_id = empty_provider_request.id
+        if not current_response.tool_calls:
+            return current_response, current_request_id, messages
 
         for _round in range(max_tool_rounds):
             _renew_lease()
@@ -1359,47 +1586,112 @@ class AgentRuntime:
                             payload["cause"] = verdict.cause
                         messages.append(_synthetic_tool_error(call.tool_call_id, payload))
                         continue
-                result = self._tools.invoke(
-                    project_id=task.project_id,
-                    actor_id=actor_id,
-                    agent_scope=agent_scope,
-                    tool_name=call.tool_name,
-                    input_data=call_arguments,
-                    execution_id=execution_id.value,
-                    task_id=task.id.value,
-                    source=source,
-                )
+                try:
+                    result = self._tools.invoke(
+                        project_id=task.project_id,
+                        actor_id=actor_id,
+                        agent_scope=agent_scope,
+                        tool_name=call.tool_name,
+                        input_data=call_arguments,
+                        execution_id=execution_id.value,
+                        task_id=task.id.value,
+                        source=source,
+                    )
+                except ToolInvocationDeniedError:
+                    # Denials are approvals-adjacent: feed back, never abort.
+                    if self._metrics is not None:
+                        self._metrics.increment(
+                            "agent_runtime_tool_call_defects",
+                            project_id=task.project_id.value,
+                            result="tool_denied",
+                        )
+                    messages.append(
+                        _synthetic_tool_error(
+                            call.tool_call_id,
+                            {
+                                "error": "tool_denied",
+                                "tool": call.tool_name,
+                                "hint": (
+                                    "This invocation was denied by policy. Use a "
+                                    "permitted alternative or continue without it."
+                                ),
+                            },
+                        )
+                    )
+                    continue
+                except ToolError as tool_exc:
+                    # Bug fix (real run, 2026-08-28): a raised ToolError —
+                    # e.g. run_command refusing a non-allowlisted binary —
+                    # used to propagate and fail the WHOLE task, even
+                    # though every other defect class (bad arguments,
+                    # undeclared tool, approval denial) is recovered by
+                    # feeding the model a structured error. Hermes parity:
+                    # the model gets the failure as its tool result and can
+                    # change approach next round; the identical-failure
+                    # breaker below still bounds repeated bad retries.
+                    # Fail-closed policy is unchanged: the command did not
+                    # run.
+                    if self._metrics is not None:
+                        self._metrics.increment(
+                            "agent_runtime_tool_call_defects",
+                            project_id=task.project_id.value,
+                            result="tool_error_recovered",
+                        )
+                    detail = str(tool_exc) or type(tool_exc).__name__
+                    messages.append(
+                        _synthetic_tool_error(
+                            call.tool_call_id,
+                            {
+                                "error": "tool_execution_failed",
+                                "tool": call.tool_name,
+                                "detail": detail,
+                                "hint": (
+                                    "The tool handler refused this call and nothing "
+                                    "was executed. Adjust the arguments to satisfy "
+                                    "the tool's declared constraints, or use another "
+                                    "declared tool."
+                                ),
+                            },
+                        )
+                    )
+                    signature = (call.tool_name, detail[:120])
+                    count = failure_signatures.get(signature, 0) + 1
+                    failure_signatures[signature] = count
+                    if count >= _FAILURE_ABORT_THRESHOLD:
+                        breaker_tripped = True
+                        abort_after_batch = True
+                    continue
+                # ---- identical-failure loop breaker --------------------
+                # Hermes parity (audit 2026-08-28): the warning rides ON
+                # the tool result as a bracketed suffix instead of being
+                # injected as a bare user message between the batch's
+                # tool results (tool messages must directly follow the
+                # assistant tool_calls turn on strict wire formats).
+                status = getattr(result, "status", "success")
+                if status in ("success", "unknown"):
+                    result_content = result.model_facing
+                else:
+                    signature = (
+                        call.tool_name,
+                        (getattr(result, "error", None) or result.model_facing or "")[:120],
+                    )
+                    count = failure_signatures.get(signature, 0) + 1
+                    failure_signatures[signature] = count
+                    result_content = result.model_facing
+                    if count >= _FAILURE_ABORT_THRESHOLD:
+                        breaker_tripped = True
+                        abort_after_batch = True
+                    elif count == _FAILURE_WARN_THRESHOLD:
+                        result_content += _FAILURE_WARN_SUFFIX.format(
+                            count=count, tool=call.tool_name
+                        )
                 messages.append(
                     CanonicalMessage(
                         role="tool",
-                        content=result.model_facing,
+                        content=result_content,
                         tool_call_id=call.tool_call_id,
                     )
                 )
-                # ---- identical-failure loop breaker --------------------
-                status = getattr(result, "status", "success")
-                if status in ("success", "unknown"):
-                    continue
-                signature = (
-                    call.tool_name,
-                    (getattr(result, "error", None) or result.model_facing or "")[:120],
-                )
-                count = failure_signatures.get(signature, 0) + 1
-                failure_signatures[signature] = count
-                if count == _FAILURE_WARN_THRESHOLD:
-                    messages.append(
-                        CanonicalMessage(
-                            role="user",
-                            content=(
-                                f"Tool {call.tool_name!r} has failed {count} times with an "
-                                "identical error. Change your approach or try a different "
-                                "strategy before calling it again."
-                            ),
-                        )
-                    )
-                elif count >= _FAILURE_ABORT_THRESHOLD:
-                    breaker_tripped = True
-                    abort_after_batch = True
             if abort_after_batch:
                 break
             # Field-preserving reconstruction: replace() carries any
@@ -1551,7 +1843,10 @@ class AgentRuntime:
         if {"test_report", "exit_status", "stdout", "stderr"} & required:
             if not self._test_command:
                 raise RuntimeEvidenceError(
-                    "test evidence was requested but no test command is configured"
+                    "test evidence was requested but no evidence test command is "
+                    "configured; set ZERO_EVIDENCE_TEST_COMMAND (e.g. "
+                    "'python3 -m unittest discover -s tests -v') and make sure the "
+                    "binary is allowlisted by ZERO_WORKTREE_ALLOWED_COMMANDS"
                 )
             command_run, command_artifacts = self._worktrees.run_command(
                 project_id=task.project_id,

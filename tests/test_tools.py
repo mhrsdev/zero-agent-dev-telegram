@@ -607,8 +607,20 @@ def test_model_facing_rendering_is_bounded(services, project_with_owner) -> None
     )
     # The full output is preserved.
     assert result.output["echoed"] == big_message
-    # The model-facing rendering is bounded.
-    assert len(result.model_facing) <= 500
+    # The model-facing rendering is bounded. Real-run fix (2026-08-28):
+    # the historical 500-char cap blinded the coding agent (read_file
+    # showed ~450 chars of a source file); the bound is now large enough
+    # to carry real file content while staying context-safe.
+    from zero.app.tool_service import _MODEL_FACING_CHAR_LIMIT
+
+    assert len(result.model_facing) <= _MODEL_FACING_CHAR_LIMIT
+    # Truncation still engages for pathological outputs (direct render:
+    # the echo tool's own input schema caps message length below this).
+    huge_render = services.tools._render_model_facing(
+        tool, {"echoed": "y" * (_MODEL_FACING_CHAR_LIMIT + 5000)}
+    )
+    assert len(huge_render) <= _MODEL_FACING_CHAR_LIMIT + 200
+    assert "truncated" in huge_render
 
 
 def test_tool_result_redacts_sensitive_handler_output(services, project_with_owner) -> None:

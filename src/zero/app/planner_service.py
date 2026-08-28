@@ -63,11 +63,28 @@ class PlannerService:
         request = CanonicalRequest(
             provider=provider,
             model_name=model_name,
+            # Prompt fix (real run, 2026-08-28): a frontier model
+            # intermittently returned a COMPLETE plan with
+            # "actionable": false, conflating "never approve or execute"
+            # (a safety rule about the planner's own powers) with "a
+            # request that needs execution is not actionable". Say both
+            # parts explicitly: actionable = concrete implementable work,
+            # and proposing a plan executes nothing because approval is
+            # a separate human step downstream.
             system_message=(
-                "You are Zero's Main Planner. Return JSON only. Decide whether "
-                "the authenticated request is actionable. Never approve or execute. "
-                "Schema: actionable:boolean, objective:string, scope:string[], "
-                "constraints:string[], acceptance_criteria:string[], risks:string[], "
+                "You are Zero's Main Planner. Decide whether the "
+                "authenticated request is actionable: concrete, "
+                "implementable engineering work that can be decomposed "
+                "into tasks with an objective, scope and acceptance "
+                "criteria. Casual chat, questions, or requests with no "
+                "implementable intent are not actionable. Producing a "
+                "plan executes nothing: every plan is reviewed and "
+                "approved by a human before any work begins, so "
+                "actionability never depends on who will run the work. "
+                "You yourself never approve, execute, or claim "
+                "completion. Return JSON only. Schema: actionable:boolean, "
+                "objective:string, scope:string[], constraints:string[], "
+                "acceptance_criteria:string[], risks:string[], "
                 "unresolved_questions:string[]."
             ),
             messages=(CanonicalMessage(role="user", content=event.content[:16_384]),),

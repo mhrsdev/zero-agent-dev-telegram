@@ -1,10 +1,70 @@
-"""Network probes used by the wizard/doctor. Read-only, minimal-cost."""
+"""Network probes used by the wizard/doctor. Read-only, minimal-cost.
+
+Hardening (bug fix): every probe used to build headers/URLs directly
+from user input, so a key pasted with a literal ellipsis (a truncated
+copy like ``sk-ab…xy`` — the wizard's own draft mask!) crashed httpx
+with ``UnicodeEncodeError: 'ascii' codec can't encode character
+'\\u2026'`` and took down the wizard with a traceback. All probes now
+
+1. clean/validate secrets first and return ``{"ok": False, "error":
+   "…"}`` for anything that could never be a valid key/token,
+2. treat *any* request-building or transport exception as a probe
+   failure (never let it escape),
+3. guard response body parsing (non-JSON bodies from proxies/guest
+   wifi portals must not crash the caller).
+"""
 
 from __future__ import annotations
 
 import os
 
 import httpx
+
+# Characters that silently corrupt pasted keys: zero-width, BOM, NBSP,
+# bidi controls. Never legitimate in an api key or bot token.
+_INVISIBLE = "".join(
+    chr(c) for c in range(0x200B, 0x200F + 1)
+) + "\u2060\ufeff\u00ad\u00a0"
+
+
+def _clean_secret(value: str) -> str | None:
+    """Strip paste artifacts; return None if the value can't be a secret.
+
+    A returned secret is guaranteed ASCII printable, so it is safe in
+    HTTP headers and URLs.
+    """
+    text = str(value or "").strip().strip(_INVISIBLE).strip()
+    if not text:
+        return None
+    # Invisible characters *inside* the value are removed as well —
+    # they are never meaningful; remaining non-ASCII (e.g. "…" from a
+    # truncated copy) means the user did not paste a real key.
+    cleaned = text.translate({ord(ch): None for ch in _INVISIBLE}).strip()
+    if not cleaned or not cleaned.isascii() or not cleaned.isprintable():
+        return None
+    return cleaned
+
+
+def _secret_error(kind: str = "api key") -> dict[str, object]:
+    return {
+        "ok": False,
+        "error": (
+            f"{kind} contains invalid characters (often a truncated copy "
+            "ending in '…' or pasted with hidden characters) — re-copy "
+            "the full value"
+        ),
+    }
+
+
+def clean_secret(value: str) -> str | None:
+    """Public sanitize hook for UIs: strip paste artifacts from secrets.
+
+    Returns None when the value could never be a valid key/token (e.g.
+    it still contains visible non-ASCII like the '…' of a truncated
+    copy). UIs call this at input time so users get a re-prompt instead
+    of a failing probe later.
+    """
+    return _clean_secret(value)
 
 
 def _telegram_base() -> str:
@@ -14,29 +74,44 @@ def _telegram_base() -> str:
 
 def telegram_get_me(bot_token: str, *, timeout: float = 10.0) -> dict[str, object]:
     """Validate a bot token via getMe; returns {ok, username?, id?, error?}."""
-    url = f"{_telegram_base()}/bot{bot_token}/getMe"
+    token = _clean_secret(bot_token)
+    if token is None:
+        return _secret_error("bot token")
+    url = f"{_telegram_base()}/bot{token}/getMe"
     try:
         resp = httpx.get(url, timeout=timeout)
     except httpx.RequestError as exc:
         return {"ok": False, "error": f"unreachable: {type(exc).__name__}"}
+    except Exception as exc:  # noqa: BLE001 - never crash the wizard
+        return {"ok": False, "error": f"probe failed: {type(exc).__name__}"}
     if resp.status_code != 200:
         return {"ok": False, "error": f"http {resp.status_code}"}
-    data = resp.json()
-    result = data.get("result") or {}
+    try:
+        data = resp.json()
+        result = data.get("result") or {}
+    except ValueError:
+        return {"ok": False, "error": "non-JSON response body"}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "unexpected response body"}
     return {
         "ok": bool(data.get("ok")),
-        "id": result.get("id"),
-        "username": result.get("username"),
-        "can_join_groups": result.get("can_join_groups"),
+        "id": result.get("id") if isinstance(result, dict) else None,
+        "username": result.get("username") if isinstance(result, dict) else None,
+        "can_join_groups": result.get("can_join_groups") if isinstance(result, dict) else None,
     }
 
 
 def openai_list_models(base_url: str, api_key: str, *, timeout: float = 15.0) -> dict[str, object]:
+    key = _clean_secret(api_key)
+    if key is None:
+        return _secret_error()
     url = base_url.rstrip("/") + "/models"
     try:
-        resp = httpx.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=timeout)
+        resp = httpx.get(url, headers={"Authorization": f"Bearer {key}"}, timeout=timeout)
     except httpx.RequestError as exc:
         return {"ok": False, "error": f"unreachable: {type(exc).__name__}"}
+    except Exception as exc:  # noqa: BLE001 - never crash the wizard
+        return {"ok": False, "error": f"probe failed: {type(exc).__name__}"}
     if resp.status_code != 200:
         return {"ok": False, "error": f"http {resp.status_code}"}
     try:
@@ -50,8 +125,11 @@ def anthropic_ping(
     base_url: str, api_key: str, model: str, *, timeout: float = 20.0
 ) -> dict[str, object]:
     """Minimal 1-token completion to validate auth + reachability."""
+    key = _clean_secret(api_key)
+    if key is None:
+        return _secret_error()
     url = base_url.rstrip("/") + "/v1/messages"
-    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+    headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
     payload = {
         "model": model,
         "max_tokens": 1,
@@ -61,6 +139,8 @@ def anthropic_ping(
         resp = httpx.post(url, headers=headers, json=payload, timeout=timeout)
     except httpx.RequestError as exc:
         return {"ok": False, "error": f"unreachable: {type(exc).__name__}"}
+    except Exception as exc:  # noqa: BLE001 - never crash the wizard
+        return {"ok": False, "error": f"probe failed: {type(exc).__name__}"}
     if resp.status_code != 200:
         detail = ""
         if resp.status_code == 429 and resp.headers.get("retry-after"):
@@ -72,6 +152,9 @@ def anthropic_ping(
 def openai_completion_probe(
     base_url: str, api_key: str, model: str, *, timeout: float = 30.0
 ) -> dict[str, object]:
+    key = _clean_secret(api_key)
+    if key is None:
+        return _secret_error()
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
         "model": model,
@@ -81,12 +164,14 @@ def openai_completion_probe(
     try:
         resp = httpx.post(
             url,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers={"Authorization": f"Bearer {key}"},
             json=payload,
             timeout=timeout,
         )
     except httpx.RequestError as exc:
         return {"ok": False, "error": f"unreachable: {type(exc).__name__}"}
+    except Exception as exc:  # noqa: BLE001 - never crash the wizard
+        return {"ok": False, "error": f"probe failed: {type(exc).__name__}"}
     if resp.status_code != 200:
         return {"ok": False, "error": f"http {resp.status_code}"}
     return {"ok": True}
@@ -94,15 +179,24 @@ def openai_completion_probe(
 
 def telegram_recent_chats(bot_token: str, *, timeout: float = 12.0) -> dict[str, object]:
     """Best-effort group discovery from one getUpdates poll (offset skip)."""
-    url = f"{_telegram_base()}/bot{bot_token}/getUpdates?timeout=0"
+    token = _clean_secret(bot_token)
+    if token is None:
+        return {**_secret_error("bot token"), "chats": []}
+    url = f"{_telegram_base()}/bot{token}/getUpdates?timeout=0"
     try:
         resp = httpx.get(url, timeout=timeout)
     except httpx.RequestError as exc:
         return {"ok": False, "error": f"unreachable: {type(exc).__name__}", "chats": []}
+    except Exception as exc:  # noqa: BLE001 - never crash the wizard
+        return {"ok": False, "error": f"probe failed: {type(exc).__name__}", "chats": []}
     if resp.status_code != 200:
         return {"ok": False, "error": f"http {resp.status_code}", "chats": []}
+    try:
+        updates = resp.json().get("result", [])
+    except ValueError:
+        return {"ok": False, "error": "non-JSON response body", "chats": []}
     chats: dict[str, str] = {}
-    for update in resp.json().get("result", []):
+    for update in updates:
         msg = (
             update.get("message")
             or update.get("channel_post")

@@ -210,15 +210,28 @@ def create_app(settings: Settings) -> FastAPI:
                 thread, stop_ev = daemon.start_thread()
                 app.state.backup_daemon = daemon
 
-                @app.router.on_shutdown
-                async def _stop_backup_daemon() -> None:
+                # Bug fix (real server run, 2026-08-28): this used the
+                # decorator form `@app.router.on_shutdown`, but Starlette's
+                # Router.on_shutdown is a plain LIST in every supported
+                # version — "decorating" raised TypeError('list' object is
+                # not callable), the enclosing except swallowed it, and
+                # every boot logged "management layer init skipped" while
+                # the just-started daemon thread leaked (never stopped).
+                # add_event_handler on the router is the supported
+                # registration path and matches the interface-transports
+                # shutdown handler registered above.
+                def _stop_backup_daemon() -> None:
                     stop_ev.set()
                     thread.join(timeout=5)
+
+                app.router.add_event_handler("shutdown", _stop_backup_daemon)
         except Exception as exc:  # noqa: BLE001 - management must never break boot
             import logging as _logging
 
+            # Bug fix: type name alone hid the root cause (the
+            # on_shutdown TypeError above shipped silently for months).
             _logging.getLogger(__name__).warning(
-                "management layer init skipped: %s", type(exc).__name__
+                "management layer init skipped: %s: %s", type(exc).__name__, exc
             )
 
     return app

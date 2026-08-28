@@ -12,6 +12,7 @@ from zero.app.delegation import (
     MAX_DELEGATION_DEPTH,
     current_delegation_depth,
 )
+from zero.app.provider_adapter import ProviderAdapter
 from zero.app.services import build_services
 from zero.config import Settings
 from zero.domain.plans import PlanRevisionContent
@@ -141,6 +142,12 @@ class _DelegatingFakeAdapter:
 
     provider_name = "fake"
     _model_source = None
+
+    # Real-run fix: the runtime now always dispatches streaming requests
+    # (gateway edge-timeout resilience), so test fakes must support the
+    # streaming path. The base-class default wraps send_request — the
+    # exact non-streaming behavior this fake already implements.
+    send_request_stream = ProviderAdapter.send_request_stream
 
     def __init__(self) -> None:
         self.calls: list[dict] = []

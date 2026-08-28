@@ -92,15 +92,27 @@ class SetupService:
             if value.get("channel") not in {"stable", "beta"}:
                 errors.append("channel must be stable|beta")
         elif step == "telegram_mode":
-            if value.get("mode") != "bot_api":
+            # Normalize forgivingly: "Bot-API", "bot-api", "botapi" … all
+            # mean bot_api. Audit follow-up: the interactive wizard used to
+            # discard the raw answer before it ever reached this check, so
+            # even the exact string "bot_api" was rejected (deadlock).
+            mode = str(value.get("mode") or "").strip().lower().replace("-", "_").replace(" ", "_")
+            if mode == "botapi":
+                mode = "bot_api"
+            value["mode"] = mode
+            if mode != "bot_api":
                 errors.append(
-                    "only bot_api is available in this release "
+                    "invalid mode "
+                    + (f"{mode!r} " if mode else "(empty) ")
+                    + "— available options: bot_api "
                     "(user-session mode intentionally not offered)"
                 )
         elif step == "telegram_credentials":
             token = (value.get("token") or "").strip()
             if not token:
                 errors.append("bot token required")
+            elif _bad_secret(token):
+                errors.append(_bad_secret(token))
             else:
                 probe = probes.telegram_get_me(token)
                 if not probe.get("ok"):
@@ -121,11 +133,19 @@ class SetupService:
                 errors.append("provider id required")
             if not key:
                 errors.append("api_key required")
+            elif _bad_secret(key):
+                errors.append(_bad_secret(key))
             if not errors and value.get("probe", True):
                 if proto == "openai_compatible":
                     res = probes.openai_list_models(base, key)
                     if res.get("ok"):
-                        value["discovered_models"] = res.get("models", [])[:200]
+                        discovered = res.get("models", [])[:200]
+                        value["discovered_models"] = discovered
+                        # Previously only discovered_models was recorded,
+                        # so the committed provider ended up with an empty
+                        # models list and routing could never match it.
+                        if not value.get("models"):
+                            value["models"] = discovered[:25]
                     else:
                         errors.append(f"auth/list failed: {res.get('error')}")
                 else:
@@ -136,11 +156,18 @@ class SetupService:
                     value.setdefault("models", [model])
         elif step == "provider_test":
             # Optional explicit completion probe using saved draft values.
+            # Bug fix: the draft stores secrets MASKED (``sk-a…xyz`` — see
+            # _mask) with the raw value under ``_raw``; this probe used to
+            # read the masked value and crash httpx with UnicodeEncodeError
+            # on the ellipsis. Read the raw secret, never the mask.
             draft = self._draft()["data"]
             pa = draft.get("provider_add", {})
             proto = pa.get("protocol")
             base = pa.get("base_url", "")
-            key = pa.get("api_key", "")
+            # Prefer the raw secret; fall back to the stored (masked)
+            # value only so OLD drafts (no _raw yet) get the probe's
+            # clean "invalid characters" rejection instead of a crash.
+            key = (pa.get("_raw") or {}).get("api_key") or pa.get("api_key", "")
             model = (value.get("model") or (pa.get("models") or [""])[0]) if pa else ""
             if not (proto and base and key and model):
                 errors.append("provider/model not configured yet")
@@ -175,18 +202,28 @@ class SetupService:
             if value.get("enabled"):
                 if not value.get("provider_id"):
                     errors.append("websearch.provider_id required when enabled")
-                if not (value.get("api_key") or "").strip():
+                key = (value.get("api_key") or "").strip()
+                if not key:
                     errors.append("websearch api_key required when enabled")
+                elif _bad_secret(key):
+                    errors.append(_bad_secret(key))
         elif step == "backup_policy":
             sched = value.get("schedule", "daily")
             if sched not in {"off", "daily", "hourly"}:
                 errors.append("schedule invalid")
+        elif step == "final_validation":
+            # Real final validation: build the full config from the draft
+            # so schema/cross-field problems surface HERE, with a named
+            # step, instead of as a traceback from commit().
+            try:
+                self.build_preview()
+            except Exception as exc:  # noqa: BLE001 - any config problem
+                errors.append(f"configuration invalid: {exc}")
         elif step in {
             "privacy",
             "updates",
             "memory_storage",
             "agents",
-            "final_validation",
             "test_message",
             "welcome",
         }:
@@ -221,8 +258,8 @@ class SetupService:
                     ref = self._store_secret("websearch-api-key", "api_key", probe_value["api_key"])
                     probe_value["api_key_ref"] = ref
             except Exception as exc:  # noqa: BLE001 - storage failure blocks
-                return StepResult(False, [f"secret store failed: {type(exc).__name__}"])
-            result = StepResult(True, [])
+                return StepResult(False, [f"secret store failed: {type(exc).__name__}"], result.warnings)
+            result = StepResult(True, [], result.warnings)
         draft = self._draft()
         if result.ok:
             secret_keys = {"token", "api_key"}
@@ -244,6 +281,18 @@ class SetupService:
         draft = self._draft()
         idx = STEP_ORDER.index(step) if step in STEP_ORDER else 0
         self._save(draft, STEP_ORDER[max(0, idx - 1)])
+
+    def skip(self, step: str) -> str:
+        """Advance past ``step`` without recording an answer (optional steps).
+
+        The draft keeps no data for the step, so commit-time defaults
+        apply. Returns the next step id so UIs can echo the progress.
+        """
+        draft = self._draft()
+        idx = STEP_ORDER.index(step) if step in STEP_ORDER else 0
+        nxt = STEP_ORDER[min(idx + 1, len(STEP_ORDER) - 1)]
+        self._save(draft, nxt)
+        return nxt
 
     def current(self) -> str:
         d = self.cfg.load_draft()
@@ -285,7 +334,20 @@ class SetupService:
         pa = data.get("provider_add", {})
         ma = data.get("model_assign", {})
         am = data.get("access_mode", {})
-        groups = data.get("groups", {}).get("confirmed", [])
+        # Audit D5 follow-up: every UI used to answer "groups" with a flat
+        # {chat_id, title} payload while only the synthetic "confirmed" list
+        # was read here — so wizard-configured groups silently vanished from
+        # the committed config. Accept both shapes.
+        raw_groups = data.get("groups", {}) or {}
+        groups = list(raw_groups.get("confirmed") or [])
+        if not groups and str(raw_groups.get("chat_id") or "").strip():
+            groups = [
+                {
+                    "chat_id": raw_groups["chat_id"],
+                    "title": raw_groups.get("title") or "",
+                    "kind": raw_groups.get("kind") or "supergroup",
+                }
+            ]
         ws = data.get("websearch", {})
         bk = data.get("backup_policy", {})
         up = data.get("updates", {"channel": "stable"})
@@ -368,6 +430,25 @@ def _mask(value: str | None) -> str:
     if not value:
         return ""
     return value[:4] + "…" + value[-4:] if len(value) > 8 else "…"
+
+
+def _bad_secret(value: str) -> str | None:
+    """Friendly validation message for keys/tokens that can never work.
+
+    HTTP headers are ASCII; a value containing anything else (most
+    commonly the literal ellipsis of a truncated copy like ``sk-a…z``,
+    or invisible paste artifacts) must be rejected with guidance BEFORE
+    any network call — previously it crashed httpx with
+    UnicodeEncodeError and took the wizard down with a traceback.
+    """
+    cleaned = value.strip()
+    if not cleaned:
+        return None  # empty is handled by required-checks
+    if "…" in cleaned:
+        return "value looks like a truncated copy (contains '…') — paste the full token/key"
+    if not cleaned.isascii() or not cleaned.isprintable():
+        return "value contains invalid (non-ASCII or invisible) characters — re-copy the full token/key"
+    return None
 
 
 def _disk_free_gb(path: str) -> float | None:

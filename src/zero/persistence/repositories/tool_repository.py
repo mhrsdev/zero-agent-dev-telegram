@@ -94,6 +94,45 @@ class ToolRepository:
             raise ToolNotFoundError(f"Tool {tool_id} not found")
         return _row_to_tool(row)
 
+    def update_tool_declaration(
+        self,
+        tool_id: ToolId,
+        *,
+        description: str,
+        input_schema: dict,
+        output_schema: dict,
+        commit: bool = True,
+    ) -> None:
+        """Refresh a persistent tool's model-facing declaration.
+
+        Real-run fix (2026-08-28): tool rows persist across process
+        restarts while handlers are re-bound in code. When a trusted
+        server-owned tool's declared schema evolves (e.g. run_command
+        gaining stdout/stderr result fields), the persisted row kept the
+        STALE schema and every invocation failed output validation
+        against a contract the handler no longer satisfies. The
+        declaration is server-owned metadata, so refreshing it on re-bind
+        is safe and keeps the rows in lockstep with the code.
+        """
+        conn = self._database.connect()
+        try:
+            conn.execute(
+                "UPDATE tools SET description = ?, input_schema = ?, output_schema = ? "
+                "WHERE id = ?",
+                (
+                    description,
+                    json.dumps(input_schema),
+                    json.dumps(output_schema),
+                    tool_id.value,
+                ),
+            )
+            if commit:
+                conn.commit()
+        except sqlite3.Error:
+            if commit:
+                conn.rollback()
+            raise
+
     def get_tool_by_name(self, name: str) -> Tool:
         conn = self._database.connect()
         cursor = conn.execute(

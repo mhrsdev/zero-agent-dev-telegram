@@ -346,6 +346,16 @@ class WorktreeService:
         """The configured upper bound for worktree command timeouts."""
         return self._max_timeout_seconds
 
+    @property
+    def allowed_commands(self) -> tuple[str, ...]:
+        """The exact binaries ``run_command`` will execute.
+
+        Public read-only view so tool declarations can advertise the same
+        policy the validator enforces (the model must be able to see the
+        constraints it is expected to satisfy).
+        """
+        return tuple(sorted(self._allowed_commands))
+
     def _ensure_private_worktree_root(self) -> Path:
         root = Path(self._worktree_root)
         if root.exists() and root.is_symlink():
@@ -659,6 +669,33 @@ class WorktreeService:
             except (OSError, WorktreeError):
                 shutil.rmtree(worktree_path, ignore_errors=True)
             raise WorktreeError("failed to resolve created worktree HEAD") from exc
+        self._ensure_worktree_gitignore(Path(worktree_path))
+        # Commit the hygiene baseline immediately: the worktree is clean
+        # right after creation, so capture_diff can never be satisfied by
+        # the untracked .gitignore itself, and the ignore rules ride
+        # along the branch lineage for downstream tasks.
+        self._git_commit_all(
+            Path(worktree_path),
+            "zero: worktree hygiene baseline",
+            worktree_id=worktree_id.value,
+        )
+        # Hermes-audit fix (real bug #15, 2026-08-28): the diff BASE must
+        # include the hygiene baseline. With the tracked-diff capture
+        # actually working again (flag-order fix in capture_diff), the
+        # auto-managed .gitignore otherwise surfaced as a tracked change
+        # in EVERY task's diff artifact — two tasks then "conflicted" on
+        # .gitignore and integration reviews demanded human decisions
+        # for purely server-managed infrastructure. The base is
+        # re-resolved after the baseline commit so diffs show only the
+        # task's own work.
+        try:
+            actual_base = self._git_rev_parse(worktree_path, "HEAD")
+        except (OSError, WorktreeError, subprocess.SubprocessError) as exc:
+            try:
+                self._git_worktree_remove(worktree_path, force=True)
+            except (OSError, WorktreeError):
+                shutil.rmtree(worktree_path, ignore_errors=True)
+            raise WorktreeError("failed to resolve post-baseline worktree HEAD") from exc
         # Record the worktree.
         worktree = Worktree(
             id=worktree_id,
@@ -699,6 +736,37 @@ class WorktreeService:
         )
         return worktree
 
+    def _ensure_worktree_gitignore(self, worktree_path: str) -> None:
+        """Keep interpreter/build noise out of diffs and evidence commits.
+
+        Real-run fix (2026-08-28): ``git add -A`` in the evidence
+        checkpoint committed ``__pycache__/*.pyc`` bytecode, and a later
+        task's diff evidence was satisfied by bytecode churn while the
+        actual required file was never produced. A worktree-local
+        .gitignore (never overwriting one the repository already ships)
+        keeps capture_diff and the commit clean; adding it here is
+        server-owned hygiene, not model-visible work.
+        """
+        ignore = worktree_path / ".gitignore"
+        if ignore.exists():
+            return
+        try:
+            ignore.write_text(
+                (
+                    "# Zero worktree hygiene (auto-managed)\n"
+                    "__pycache__/\n"
+                    "*.py[cod]\n"
+                    ".pytest_cache/\n"
+                    ".mypy_cache/\n"
+                    ".ruff_cache/\n"
+                    ".coverage\n"
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(ignore, 0o600)
+        except OSError as exc:
+            logger.debug("worktree .gitignore write failed: %s", exc)
+
     def activate_worktree(
         self,
         *,
@@ -731,7 +799,19 @@ class WorktreeService:
         succeeded: bool,
         source: AuditSource = "system",
     ) -> Worktree:
-        """Transition a worktree to ``succeeded`` or ``failed``."""
+        """Transition a worktree to ``succeeded`` or ``failed``.
+
+        Bug fix (real run, 2026-08-28): a succeeded worktree used to keep
+        its results as uncommitted working-directory changes, so the task
+        branch held nothing. Downstream tasks (which branch from their
+        dependencies' worktree branches — see the runtime's base
+        resolution) therefore started from the bare repository and could
+        never see earlier tasks' files; a "run the tests" task failed
+        because its worktree contained no test suite. On success the
+        service now commits the full worktree state onto the task branch
+        (internal, server-owned git — deliberately NOT the model-facing
+        run_command policy) so branch refs carry the durable result.
+        """
         self._authz.require_permission(
             actor_id=actor_id,
             project_id=project_id,
@@ -744,8 +824,77 @@ class WorktreeService:
             raise InvalidWorktreeTransitionError(
                 f"Cannot transition worktree from {worktree.state!r} to {new_state!r}"
             )
+        if succeeded:
+            self._commit_worktree_state(worktree)
         self._repo.update_worktree_state(worktree_id, new_state)
         return self._repo.get_worktree(project_id, worktree_id)
+
+    def _commit_worktree_state(self, worktree) -> None:
+        """Commit the whole worktree state onto its task branch.
+
+        Internal git invocation with an injected identity (repositories
+        may not carry user.name/user.email). ``--allow-empty`` keeps
+        file-less tasks (read-only analysis) chainable too. A failed
+        commit is logged and does NOT fail the completion: the evidence
+        artifacts already hold the durable result, and downstream base
+        resolution falls back to the repository default when a branch
+        has no usable commit.
+        """
+
+        worktree_path = Path(worktree.worktree_path)
+        if not worktree_path.is_dir():
+            logger.warning(
+                "worktree %s cannot be committed: path missing", worktree.id.value
+            )
+            return
+        message = f"zero(task {worktree.task_id.value}): evidence checkpoint"
+        self._git_commit_all(worktree_path, message, worktree_id=worktree.id.value)
+
+    def _git_commit_all(
+        self,
+        worktree_path: Path | str,
+        message: str,
+        *,
+        worktree_id: str | None = None,
+    ) -> None:
+        """Commit the full worktree state (internal, server-owned git)."""
+        import subprocess as _sp
+
+        commands = (
+            ["git", "add", "-A", "--"],
+            [
+                "git",
+                "-c", "user.name=Zero Runtime",
+                "-c", "user.email=zero@internal",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m", message,
+            ],
+        )
+        for argv in commands:
+            try:
+                proc = _sp.run(
+                    argv,
+                    cwd=str(worktree_path),
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+            except (OSError, _sp.TimeoutExpired) as exc:
+                logger.warning(
+                    "worktree %s commit error: %s", worktree_id or "?", exc
+                )
+                return
+            if proc.returncode != 0:
+                logger.warning(
+                    "worktree %s commit failed (%s): %s",
+                    worktree_id or "?",
+                    argv[1] if len(argv) > 1 else argv,
+                    (proc.stderr or proc.stdout or "").strip()[:300],
+                )
+                return
 
     def mark_worktree_interrupted(
         self,
@@ -1220,7 +1369,7 @@ class WorktreeService:
         parts: list[str] = []
         # Capture tracked changes.
         try:
-            tracked_output, _returncode, tracked_truncated = _run_bounded_git_output(
+            tracked_output, tracked_returncode, tracked_truncated = _run_bounded_git_output(
                 [
                     "git",
                     "-c",
@@ -1229,9 +1378,16 @@ class WorktreeService:
                     "diff.external=",
                     "-C",
                     worktree.worktree_path,
+                    # Hermes-audit fix (real bug #14, 2026-08-28):
+                    # --no-ext-diff/--no-textconv are options of the
+                    # ``diff`` subcommand, NOT global git options. Before
+                    # the subcommand git exits 129 (stderr devnull-
+                    # swallowed) and the tracked diff was silently EMPTY
+                    # forever — diff evidence only ever showed the
+                    # untracked status section.
+                    "diff",
                     "--no-ext-diff",
                     "--no-textconv",
-                    "diff",
                     worktree.base_revision,
                 ],
                 cwd=worktree.worktree_path,
@@ -1244,6 +1400,14 @@ class WorktreeService:
                 parts.append(tracked_output)
             if tracked_truncated:
                 parts.append("\n[tracked diff truncated by policy]\n")
+            if not tracked_output and tracked_returncode != 0:
+                # Hermes-audit hardening (real bug #14 class, 2026-08-28):
+                # a failed git invocation must never masquerade as "no
+                # changes". Surface the failure in the evidence artifact.
+                parts.append(
+                    f"[git diff failed with exit code {tracked_returncode}; "
+                    "tracked changes could not be captured]\n"
+                )
         except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
             parts.append(f"[Failed to capture tracked diff: {exc}]\n")
         # Capture untracked files.
@@ -1271,6 +1435,26 @@ class WorktreeService:
         except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
             parts.append(f"[Failed to capture status: {exc}]\n")
         diff_content = "".join(parts)
+        # Hermes-parity audit fix (real run r10, 2026-08-28): a chained
+        # aggregation task ("capture the final diff of everything")
+        # branches from succeeded dependency branches whose evidence
+        # checkpoints already contain all earlier work. Its INCREMENTAL
+        # diff is therefore empty even though the execution's real
+        # change set is large — the task failed with "required diff
+        # evidence contains no file change". When this task changed
+        # nothing on top of its base, fall back to the cumulative diff
+        # against the repository's default base revision so aggregate
+        # evidence stays provable and truthful (clearly labeled).
+        if not diff_content.strip():
+            cumulative = self._cumulative_execution_diff(worktree)
+            if cumulative:
+                diff_content = (
+                    "--- Cumulative execution diff ---\n"
+                    "(this task made no changes on top of its dependency "
+                    "branches; the diff below is the whole execution's "
+                    "change set against the repository base revision)\n\n"
+                    + cumulative
+                )
         encoded = diff_content.encode("utf-8")
         if len(encoded) > self._max_output_bytes:
             diff_content = (
@@ -1285,6 +1469,63 @@ class WorktreeService:
             kind="diff",
             content=diff_content,
         )
+
+    def _cumulative_execution_diff(self, worktree) -> str:
+        """Diff the worktree HEAD against the repository's default base.
+
+        Chained tasks branch from succeeded dependency branches whose
+        evidence checkpoints already contain the earlier tasks' committed
+        work, so an aggregation task's incremental diff is empty while
+        the execution's real change set is large. Best-effort: any
+        resolution/transport failure returns ``""`` (the historical
+        empty-diff evidence verdict then applies unchanged).
+        """
+        try:
+            repository = self._repo.get_repository(worktree.project_id, worktree.repository_id)
+        except Exception:  # noqa: BLE001 - best-effort evidence fallback
+            return ""
+        base = (repository.default_base_revision or "").strip()
+        if not base:
+            try:
+                head_output, _rc, _truncated = _run_bounded_git_output(
+                    ["git", "-C", repository.local_path, "rev-parse", "HEAD"],
+                    cwd=repository.local_path,
+                    timeout=30,
+                    env=self._git_environment(),
+                    max_bytes=self._max_output_bytes,
+                )
+                base = head_output.strip()
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                return ""
+        if not base or base == worktree.base_revision:
+            # No dependency chain: the incremental diff IS the cumulative
+            # one, and it was already empty — nothing more to prove.
+            return ""
+        try:
+            output, _rc, truncated = _run_bounded_git_output(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "diff.external=",
+                    "-C",
+                    worktree.worktree_path,
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    f"{base}..HEAD",
+                ],
+                cwd=worktree.worktree_path,
+                timeout=60,
+                env=self._git_environment(),
+                max_bytes=self._max_output_bytes,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return ""
+        if truncated:
+            output += "\n[cumulative diff truncated by policy]\n"
+        return output
 
     def capture_source_snapshot(
         self,

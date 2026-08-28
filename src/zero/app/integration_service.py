@@ -634,8 +634,27 @@ class IntegrationService:
             if self._git_output(target_path, "status", "--porcelain"):
                 raise MergeGateError("Target repository must be clean before combined tests")
             for worktree in source_worktrees:
-                if worktree.base_revision != target_sha:
-                    raise MergeGateError("Source worktree is stale relative to target ref")
+                # Real-run fix (2026-08-28): chained task worktrees branch
+                # from their dependencies' evidence-checkpoint commits, so
+                # their base_revision is legitimately AHEAD of the target
+                # ref; the historical equality check rejected exactly that.
+                # The correct invariant is that the target ref is an
+                # ancestor of the source worktree's branch.
+                source_probe_path = Path(worktree.worktree_path).resolve()
+                source_probe_ref = self._git_output(
+                    source_probe_path, "symbolic-ref", "--short", "HEAD"
+                )
+                source_probe_sha = self._git_output(source_probe_path, "rev-parse", source_probe_ref)
+                if not self._git_status_success(
+                    source_probe_path,
+                    "merge-base",
+                    "--is-ancestor",
+                    target_sha,
+                    source_probe_sha,
+                ):
+                    raise MergeGateError(
+                        "Source worktree branch is not based on the target ref"
+                    )
 
             worktree_id = generate_integration_worktree_id()
             parent = Path(tempfile.gettempdir()) / "zero-integration-worktrees"
@@ -668,10 +687,21 @@ class IntegrationService:
                 source_branch = self._git_output(source_path, "symbolic-ref", "--short", "HEAD")
                 branch_sha = self._git_output(source_path, "rev-parse", source_branch)
                 if branch_sha != target_sha:
+                    # Real-run fix (2026-08-28): task branches now carry
+                    # evidence-checkpoint commits (worktree chaining), so
+                    # this merge actually runs for the first time. The
+                    # historical --no-commit form left MERGE_HEAD pending,
+                    # and the SECOND source's merge then failed with
+                    # "You have not concluded your merge". Each source
+                    # merge is now concluded (committed) before the next
+                    # source is integrated, with an injected identity.
                     self._git(
                         integration_path,
+                        "-c",
+                        "user.name=Zero Integration",
+                        "-c",
+                        "user.email=zero-integration@localhost",
                         "merge",
-                        "--no-commit",
                         "--no-ff",
                         "--no-edit",
                         source_branch,
@@ -1061,7 +1091,22 @@ class IntegrationService:
         if self._git_output(target_path, "status", "--porcelain"):
             raise MergeGateError("Target repository must be clean before integration")
         for worktree in worktrees:
-            if worktree.base_revision != target_sha:
+            # Real-run fix (2026-08-28): chained task worktrees branch from
+            # dependency checkpoint commits (ahead of the target ref), so
+            # base equality no longer holds; the branch must simply contain
+            # the reviewed target revision.
+            source_probe_path = Path(worktree.worktree_path).resolve()
+            source_probe_ref = self._git_output(
+                source_probe_path, "symbolic-ref", "--short", "HEAD"
+            )
+            source_probe_sha = self._git_output(source_probe_path, "rev-parse", source_probe_ref)
+            if not self._git_status_success(
+                source_probe_path,
+                "merge-base",
+                "--is-ancestor",
+                target_sha,
+                source_probe_sha,
+            ):
                 raise MergeGateError("Source worktree is stale relative to target ref")
             source_path = Path(worktree.worktree_path).resolve()
             if not self._git_status_success(
@@ -1108,7 +1153,20 @@ class IntegrationService:
                     source_path, "merge-base", "--is-ancestor", target_sha, branch_sha
                 ):
                     raise MergeGateError("Source ref is not based on the reviewed target revision")
-                self._git(integration_path, "merge", "--no-ff", "--no-edit", source_branch)
+                # Identity injection: a registered repository may not carry
+                # user.name/user.email, and the per-source merge now really
+                # runs now that task branches carry checkpoint commits.
+                self._git(
+                    integration_path,
+                    "-c",
+                    "user.name=Zero Integration",
+                    "-c",
+                    "user.email=zero-integration@localhost",
+                    "merge",
+                    "--no-ff",
+                    "--no-edit",
+                    source_branch,
+                )
                 self._record_evidence(
                     evidence_ids,
                     project_id=project_id,

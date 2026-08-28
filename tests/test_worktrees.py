@@ -697,9 +697,15 @@ def test_failed_task_does_not_corrupt_other_worktree(services, project_with_repo
 # ----------------------------------------------------------------------
 
 
-def test_cleanup_refuses_uncommitted_human_work(services, project_with_repo_and_plan) -> None:
-    """Per PLAN.md M6: 'Cleanup preserves untracked or uncommitted human
-    work unless explicitly authorized.'"""
+def test_succeeded_worktree_commits_state_so_cleanup_is_safe(
+    services, project_with_repo_and_plan
+) -> None:
+    """Real-run fix (2026-08-28): completing a worktree commits its full
+    state onto the task branch (the evidence checkpoint downstream tasks
+    branch from). A succeeded worktree is therefore clean by
+    construction, and cleanup is safe. The commit must carry the files."""
+    import subprocess as sp
+
     owner, project, _plan, handoff, repo = project_with_repo_and_plan
     execution = services.worker.create_execution_from_handoff(
         handoff_id=handoff.id,
@@ -719,15 +725,75 @@ def test_cleanup_refuses_uncommitted_human_work(services, project_with_repo_and_
         task_id=task.id,
         actor_id=owner.id,
     )
-    # Activate the worktree.
     services.worktree.activate_worktree(project_id=project.id, worktree_id=wt.id, actor_id=owner.id)
-    # Create an untracked file (uncommitted human work).
-    (Path(wt.worktree_path) / "human_work.txt").write_text("important")
+    (Path(wt.worktree_path) / "task_output.txt").write_text("produced by the task")
     services.worktree.complete_worktree(
         project_id=project.id,
         worktree_id=wt.id,
         actor_id=owner.id,
         succeeded=True,
+    )
+    # The branch carries the committed evidence checkpoint.
+    log = sp.run(
+        ["git", "log", "--oneline", "-n", "2"],
+        cwd=wt.worktree_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "evidence checkpoint" in log
+    status = sp.run(
+        ["git", "status", "--porcelain"],
+        cwd=wt.worktree_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert status.strip() == ""
+    services.worktree.mark_cleanup_eligible(
+        project_id=project.id,
+        worktree_id=wt.id,
+        actor_id=owner.id,
+    )
+    services.worktree.remove_worktree(
+        project_id=project.id,
+        worktree_id=wt.id,
+        actor_id=owner.id,
+    )
+
+
+def test_cleanup_refuses_uncommitted_work_on_failed_worktree(
+    services, project_with_repo_and_plan
+) -> None:
+    """Per PLAN.md M6: 'Cleanup preserves untracked or uncommitted human
+    work unless explicitly authorized.' The guard applies where it can
+    still occur: FAILED worktrees are not committed at completion."""
+    owner, project, _plan, handoff, repo = project_with_repo_and_plan
+    execution = services.worker.create_execution_from_handoff(
+        handoff_id=handoff.id,
+        project_id=project.id,
+        actor_id=owner.id,
+        task_specs=[TaskSpec(key="A", objective="Task A")],
+    )
+    task = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=services.identity.get_project(execution.project_id).owner_user_id,
+    )[0]
+    wt = services.worktree.create_worktree(
+        project_id=project.id,
+        repository_id=repo.id,
+        execution_id=execution.id,
+        task_id=task.id,
+        actor_id=owner.id,
+    )
+    services.worktree.activate_worktree(project_id=project.id, worktree_id=wt.id, actor_id=owner.id)
+    (Path(wt.worktree_path) / "human_work.txt").write_text("important")
+    services.worktree.complete_worktree(
+        project_id=project.id,
+        worktree_id=wt.id,
+        actor_id=owner.id,
+        succeeded=False,
     )
     services.worktree.mark_cleanup_eligible(
         project_id=project.id,
@@ -963,3 +1029,82 @@ def test_artifact_has_content_hash(services, project_with_repo_and_plan) -> None
     stdout = next(a for a in artifacts if a.kind == "stdout")
     expected_hash = hashlib.sha256(stdout.content.encode("utf-8")).hexdigest()
     assert stdout.content_hash == expected_hash
+
+
+# ----------------------------------------------------------------------
+# Hermes-parity audit (2026-08-28): cumulative execution diff fallback
+# ----------------------------------------------------------------------
+
+
+def test_capture_diff_falls_back_to_cumulative_execution_diff(
+    services, project_with_repo_and_plan
+) -> None:
+    """Real run r10 (2026-08-28): the final "capture the whole diff"
+    task failed with "required diff evidence contains no file change".
+    Its worktree was based on succeeded dependency branches whose
+    evidence checkpoints already contain ALL earlier work, so the
+    incremental diff was empty even though the execution's real change
+    set was large. When a task changes nothing on top of its base,
+    capture_diff must fall back to the cumulative diff against the
+    repository's default base revision (clearly labeled).
+    """
+    import subprocess as sp
+
+    owner, project, _plan, handoff, repo = project_with_repo_and_plan
+    execution = services.worker.create_execution_from_handoff(
+        handoff_id=handoff.id,
+        project_id=project.id,
+        actor_id=owner.id,
+        task_specs=[TaskSpec(key="A", objective="Task A"), TaskSpec(key="B", objective="Task B")],
+    )
+    tasks = services.worker.list_tasks(
+        execution.id,
+        project_id=execution.project_id,
+        actor_id=owner.id,
+    )
+    task_a, task_b = tasks[0], tasks[1]
+
+    # Task A: produce a file, complete with a committed evidence checkpoint.
+    wt_a = services.worktree.create_worktree(
+        project_id=project.id,
+        repository_id=repo.id,
+        execution_id=execution.id,
+        task_id=task_a.id,
+        actor_id=owner.id,
+    )
+    services.worktree.activate_worktree(project_id=project.id, worktree_id=wt_a.id, actor_id=owner.id)
+    (Path(wt_a.worktree_path) / "produced_by_a.py").write_text("VALUE = 1\n")
+    services.worktree.complete_worktree(
+        project_id=project.id,
+        worktree_id=wt_a.id,
+        actor_id=owner.id,
+        succeeded=True,
+    )
+
+    # Task B: chained on A's branch (as agent_runtime's dependency
+    # resolution does), changes NOTHING, then needs diff evidence.
+    log = sp.run(
+        ["git", "-C", wt_a.worktree_path, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    wt_b = services.worktree.create_worktree(
+        project_id=project.id,
+        repository_id=repo.id,
+        execution_id=execution.id,
+        task_id=task_b.id,
+        actor_id=owner.id,
+        base_revision=log,
+    )
+    services.worktree.activate_worktree(project_id=project.id, worktree_id=wt_b.id, actor_id=owner.id)
+
+    diff = services.worktree.capture_diff(
+        project_id=project.id,
+        worktree_id=wt_b.id,
+        task_id=task_b.id,
+        actor_id=owner.id,
+    )
+    assert diff.content.strip(), "aggregation task diff evidence must not be empty"
+    assert "Cumulative execution diff" in diff.content
+    assert "produced_by_a.py" in diff.content

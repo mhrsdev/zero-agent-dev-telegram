@@ -173,10 +173,25 @@ def register_execution_routes(app: FastAPI, services: Services) -> None:
         project_id: str,
         execution_id: str,
     ) -> dict[str, Any]:
-        execution, _actor = execution_in_project(project_id, execution_id, request)
+        execution, actor = execution_in_project(project_id, execution_id, request)
+        # Real-run fix: surface the plan's objective so clients see WHAT
+        # an execution is about, not just an opaque id. Advisory read —
+        # an unavailable revision must not fail the lookup.
+        plan_objective: str | None = None
+        try:
+            revision = services.plans.get_revision(
+                execution.plan_revision_id,
+                project_id=ProjectId(project_id),
+                actor_id=actor,
+                source="web",
+            )
+            plan_objective = revision.content.objective
+        except Exception:  # noqa: BLE001 - enrichment is advisory
+            plan_objective = None
         return {
             "id": execution.id.value,
             "plan_id": execution.plan_id.value,
+            "plan_objective": plan_objective,
             "state": execution.state,
             "blocker_reason": execution.blocker_reason,
             "created_at": execution.created_at,

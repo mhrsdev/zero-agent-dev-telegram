@@ -79,6 +79,7 @@ class SchedulerService:
         decomposer=None,
         decomposition_enabled: bool | None = None,
         parallel_executions: int = 1,
+        repository_resolver=None,
     ) -> None:
         self._plans = plans
         self._worker = worker
@@ -87,6 +88,15 @@ class SchedulerService:
         self._integration = integration
         self._result_delivery = result_delivery
         self._agent_type_repo = agent_type_repo
+        # Optional callable (project_id, actor_id) -> RepositoryId | None
+        # (real-run fix): when the caller passes no repository_id, the
+        # scheduler resolves the project's single registered repository
+        # itself. Without this, managed deployments (the background
+        # worker host never passes repository_id) ran every coding task
+        # as delegate-only: no worktree, no file/shell tools, and
+        # evidence degraded to bare "provider_response" — the agent
+        # could talk but never touch files.
+        self._repository_resolver = repository_resolver
         # Total attempts allowed per task (first run + retries).
         # 0 disables automatic requeueing of failed tasks.
         self._task_max_attempts = max(0, int(task_max_attempts))
@@ -159,7 +169,13 @@ class SchedulerService:
                     key=spec.key,
                     objective=spec.objective,
                     permitted_scope=spec.permitted_scope or revision.content.scope,
-                    expected_evidence=expected_evidence,
+                    # Per-task evidence from the decomposer (real-run
+                    # fix): read/analysis tasks declare
+                    # ["provider_response"], code-changing tasks declare
+                    # ["diff","test_report","exit_status"]. Tasks without
+                    # an explicit choice fall back to the scheduler
+                    # default so behavior is unchanged for old graphs.
+                    expected_evidence=spec.expected_evidence or expected_evidence,
                     agent_type_id=default_agent_type_id,
                 )
             )
@@ -204,13 +220,98 @@ class SchedulerService:
         return current >= scheduled
 
     @staticmethod
-    def _format_execution_result(execution, task_results: list[RuntimeTaskResult]) -> str:
+    def _latest_task_error(
+        worker: WorkerService,
+        task_id: TaskId,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        source: AuditSource,
+    ) -> str:
+        """Latest failed attempt's error text for one task (advisory)."""
+        try:
+            attempts = worker.list_attempts(
+                task_id, project_id=project_id, actor_id=actor_id, source=source
+            )
+        except Exception:  # noqa: BLE001 - enrichment is advisory
+            return ""
+        last = max(attempts, key=lambda a: a.attempt_number, default=None)
+        if last is None or not last.error_message:
+            return ""
+        return redact_sensitive_text(last.error_message)
+
+    def _format_execution_result(
+        self,
+        execution,
+        task_results: list[RuntimeTaskResult],
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        source: AuditSource,
+    ) -> str:
+        """Human-readable execution summary built from durable state.
+
+        Real-run fix: the previous formatter only knew about tasks that
+        ran inside the current tick. When the failing task's exception
+        propagated out of ``run_ready_tasks`` (the nothing-succeeded
+        re-raise), the delivery collapsed to a bare "finished with
+        state: failed." line — no goal, no task titles, no error — which
+        is opaque to a human reading the chat. The formatter now reads
+        the plan goal, every task's objective/state, and failed
+        attempts' errors from durable state; tick-local results remain
+        optional enrichment for completed-task response bodies. Every
+        enrichment step is advisory: durable-state reads must never
+        break the delivery, so any failure degrades to the plain line.
+        """
         lines = [f"Execution {execution.id.value} finished with state: {execution.state}."]
+        if execution.blocker_reason:
+            lines.append(f"Blocker: {redact_sensitive_text(execution.blocker_reason)[:300]}")
+        try:
+            revision = self._plans.get_revision(
+                execution.plan_revision_id,
+                project_id=project_id,
+                actor_id=actor_id,
+                source=source,
+            )
+            goal = redact_sensitive_text(revision.content.objective or "").strip()
+            if goal:
+                lines.append(f"Goal: {goal[:1000]}")
+        except Exception:  # noqa: BLE001 - enrichment is advisory
+            logger.debug("execution result: goal enrichment failed", exc_info=True)
+        try:
+            tasks = self._worker.list_tasks(
+                execution.id, project_id=project_id, actor_id=actor_id, source=source
+            )
+        except Exception:  # noqa: BLE001 - enrichment is advisory
+            tasks = []
+        if tasks:
+            lines.append("")
+            lines.append("Tasks:")
+            for task in tasks:
+                objective = redact_sensitive_text(task.objective or "").strip()
+                lines.append(f"- [{task.state}] {objective[:500]}")
+                if task.blocker_reason:
+                    lines.append(
+                        "  blocked: " + redact_sensitive_text(task.blocker_reason)[:300]
+                    )
+                if task.state == "failed":
+                    error_text = self._latest_task_error(
+                        self._worker,
+                        task.id,
+                        project_id=project_id,
+                        actor_id=actor_id,
+                        source=source,
+                    )
+                    if error_text:
+                        lines.append(f"  error: {error_text[:500]}")
+        # Tick-local response bodies stay as optional enrichment: they
+        # only exist for tasks that happened to run inside this tick.
         for result in task_results:
             if result.task.execution_id != execution.id:
                 continue
             content = redact_sensitive_text(result.response.content or "")[:4000]
-            lines.append(f"Task {result.task.id.value}: {content}")
+            if content:
+                lines.append(f"Result of task {result.task.id.value}: {content}")
         return "\n".join(lines)[:32_000]
 
     def run_once(
@@ -241,6 +342,16 @@ class SchedulerService:
         errors: list[str] = []
         results: list[RuntimeTaskResult] = []
         default_agent_type_id = self._default_agent_type_id(project_id)
+        # Resolve the project's single repository when the caller did not
+        # pin one (real-run fix — see __init__ comment): coding tasks then
+        # get worktrees + the workspace toolset and real file evidence
+        # (diff, test_report, exit_status) instead of delegate-only runs.
+        effective_repository_id = repository_id
+        if effective_repository_id is None and self._repository_resolver is not None:
+            try:
+                effective_repository_id = self._repository_resolver(project_id, actor_id)
+            except Exception:  # noqa: BLE001 - resolution is advisory
+                effective_repository_id = None
         handoffs = self._plans.list_unclaimed_handoffs(
             project_id,
             limit=max_handoffs,
@@ -258,7 +369,7 @@ class SchedulerService:
                 )
                 evidence = (
                     ("diff", "test_report", "exit_status")
-                    if repository_id is not None
+                    if effective_repository_id is not None
                     else ("provider_response",)
                 )
                 task_specs, dependency_specs = self._task_specs_for_revision(
@@ -310,7 +421,7 @@ class SchedulerService:
                 lease_owner=lease_owner,
                 provider=provider,
                 model_name=model_name,
-                repository_id=repository_id,
+                repository_id=effective_repository_id,
                 max_tasks=budget,
                 source=source,
             )
@@ -470,7 +581,13 @@ class SchedulerService:
                     )
                     if current.state not in {"completed", "failed", "cancelled"}:
                         continue
-                    content = self._format_execution_result(current, results)
+                    content = self._format_execution_result(
+                        current,
+                        results,
+                        project_id=project_id,
+                        actor_id=actor_id,
+                        source=source,
+                    )
                     for binding in self._result_delivery.list_enabled_bindings(project_id):
                         delivery = self._result_delivery.enqueue_execution_result(
                             project_id=project_id,

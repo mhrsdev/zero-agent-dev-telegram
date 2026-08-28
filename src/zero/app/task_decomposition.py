@@ -35,6 +35,22 @@ from zero.app.worker_service import DependencySpec, TaskSpec
 from zero.domain.audit import redact_sensitive_text
 from zero.domain.providers import CanonicalResponse, ToolDeclaration
 
+#: Evidence labels a decomposed task may demand. Mirrors AgentRuntime's
+#: _SUPPORTED_EVIDENCE (kept local to avoid a heavyweight import cycle):
+#: anything outside this set makes the whole graph invalid, and the
+#: runtime refuses tasks whose required evidence it cannot prove.
+_SUPPORTED_EVIDENCE_LABELS = frozenset(
+    {
+        "provider_response",
+        "diff",
+        "test_report",
+        "exit_status",
+        "stdout",
+        "stderr",
+        "source_snapshot",
+    }
+)
+
 logger = logging.getLogger(__name__)
 
 MAX_TASKS = 256
@@ -75,6 +91,15 @@ DECOMPOSITION_SYSTEM_PROMPT = (
     '  "objective": one concrete outcome,\n'
     '  "scope": array of scope strings (may be empty),\n'
     '  "depends_on": array of earlier task keys this task requires.\n'
+    '  "evidence": optional array. Evidence is verified at THAT task\'s\n'
+    '    completion and failure blocks the pipeline, so match it to what\n'
+    '    can actually hold true then:\n'
+    '    - read-only analysis/review tasks: ["provider_response"]\n'
+    '    - tasks that create files BEFORE the test suite exists: ["diff"]\n'
+    '    - the ONE task that runs and verifies the full test suite (after\n'
+    '      tests exist): ["test_report","exit_status"] — NO diff: a\n'
+    '      verification task may legitimately change nothing, and an\n'
+    '      empty diff would fail it\n'
     "Rules: at most 32 tasks; keep objectives independently verifiable; "
     "dependencies must reference existing keys and form a DAG. "
     "If the plan is simple enough for one task, return exactly one."
@@ -112,6 +137,29 @@ _EMITTED_TASK_SCHEMA: dict = {
                         "items": {"type": "string"},
                         "description": "Keys of EARLIER tasks this task requires. DAG only.",
                     },
+                    "evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "provider_response",
+                                "diff",
+                                "test_report",
+                                "exit_status",
+                                "stdout",
+                                "stderr",
+                                "source_snapshot",
+                            ],
+                        },
+                        "description": (
+                            "Durable proof this task must produce. Use "
+                            "[\"provider_response\"] for read/analysis/review "
+                            "tasks that change no files; use "
+                            "[\"diff\", \"test_report\", \"exit_status\"] for "
+                            "tasks that create or modify code. Omit to get "
+                            "the scheduler default."
+                        ),
+                    },
                 },
                 "required": ["key", "objective"],
                 "additionalProperties": False,
@@ -147,6 +195,17 @@ DECOMPOSITION_SYSTEM_PROMPT_STRICT = (
     '   - "scope": array of scope label strings (may be empty);\n'
     '   - "depends_on": array of EARLIER task keys, forming a DAG; every '
     "dependency MUST reference an already-declared key; never itself.\n"
+    '   - "evidence": optional array naming the durable proof the task '
+    "must produce. Evidence is verified immediately at that task's "
+    "completion and a failed check blocks the pipeline, so require only "
+    "what can truly hold at that point: [\"provider_response\"] for "
+    "read/analysis/review tasks that change no files; [\"diff\"] for "
+    "tasks that create or modify files while the test suite does not yet "
+    "exist; [\"test_report\",\"exit_status\"] (NO diff — a verification "
+    "task may legitimately change nothing, and an empty diff would fail "
+    "it) ONLY for the task that runs and verifies the complete test "
+    "suite (it must depend on the tests-existing task). Reserve "
+    "test_report for at most one task per plan.\n"
     "4. At most 32 tasks. Keep objectives independently verifiable. "
     "If — and only if — the plan genuinely fits one task, return exactly one."
 )
@@ -197,6 +256,7 @@ def validate_decomposition(payload_text: str) -> DecompositionGraph | None:
     keys_seen: set[str] = set()
     objectives: dict[str, str] = {}
     scopes: dict[str, tuple[str, ...]] = {}
+    evidences: dict[str, tuple[str, ...]] = {}
     order: list[str] = []
     for entry in raw:
         if not isinstance(entry, dict):
@@ -215,9 +275,21 @@ def validate_decomposition(payload_text: str) -> DecompositionGraph | None:
         if not isinstance(raw_scope, (list, tuple)):
             return None
         scope = tuple(str(item)[:256] for item in list(raw_scope)[:64] if str(item).strip())
+        raw_evidence = entry.get("evidence")
+        evidence: tuple[str, ...] = ()
+        if raw_evidence is not None:
+            if not isinstance(raw_evidence, (list, tuple)):
+                return None
+            cleaned: list[str] = []
+            for item in list(raw_evidence)[:8]:
+                if not isinstance(item, str) or item.strip() not in _SUPPORTED_EVIDENCE_LABELS:
+                    return None
+                cleaned.append(item.strip())
+            evidence = tuple(dict.fromkeys(cleaned))
         keys_seen.add(key)
         objectives[key] = objective
         scopes[key] = scope
+        evidences[key] = evidence
         order.append(key)
     edge_count = 0
     dependencies: list[DependencySpec] = []
@@ -243,7 +315,7 @@ def validate_decomposition(payload_text: str) -> DecompositionGraph | None:
             key=key,
             objective=objectives[key],
             permitted_scope=scopes[key],
-            expected_evidence=(),
+            expected_evidence=evidences[key],
         )
         for key in order
     )

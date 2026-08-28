@@ -207,6 +207,14 @@ class ProviderService:
         self._provider_max_attempts = max(1, min(8, int(provider_max_attempts)))
         self._adapters: dict[str, ProviderAdapter] = {}
         self._fallback_chain: tuple[str, ...] = ()
+        # Hermes parity (audit 2026-08-28): fallback entries are (provider,
+        # model) pairs. The wizard/config's ``routing.fallback_models``
+        # promise model-level failover within the primary provider — a
+        # single-gateway deployment previously had a DEGENERATE chain
+        # (only one adapter registered) so model outages could never
+        # route anywhere. ``_fallback_models`` extends the chain with
+        # same-provider alternative models before other providers.
+        self._fallback_models: tuple[str, ...] = ()
         self._register_default_adapters(include_fake=include_fake)
 
     def _register_default_adapters(self, *, include_fake: bool) -> None:
@@ -231,7 +239,7 @@ class ProviderService:
         Per the release audit (Hermes parity): provider selection and
         fallback routing must be a real capability. The chain is tried
         in order when the primary attempt fails with a retryable error
-        class (transient/rate_limit); auth failures, policy refusals,
+        class (transient/rate_limit/auth_failure); policy refusals,
         context limits, cancellations, and unknown outcomes are never
         retried on another provider.
         """
@@ -240,8 +248,34 @@ class ProviderService:
             raise ValueError(f"fallback providers not registered: {unknown}")
         self._fallback_chain = tuple(chain)
 
+    def set_fallback_models(self, models: tuple[str, ...]) -> None:
+        """Configure ordered fallback MODEL names on the primary provider.
+
+        Hermes fallback chain entries are (provider, model) pairs; the
+        deployment's routing config promises alternative models on the
+        same gateway. Each entry is validated against the provider's
+        resolvable models lazily at dispatch time (an unknown fallback
+        model is skipped, never fatal).
+        """
+        cleaned: list[str] = []
+        for name in models:
+            value = str(name).strip()
+            if value and value not in cleaned:
+                cleaned.append(value)
+        self._fallback_models = tuple(cleaned)
+
+    @property
+    def fallback_models(self) -> tuple[str, ...]:
+        """Ordered same-provider fallback model names."""
+        return self._fallback_models
+
     #: Error classes eligible for another provider attempt.
-    FALLBACK_ELIGIBLE_CLASSES: frozenset[str] = frozenset({"transient", "rate_limit"})
+    #: Hermes parity (audit 2026-08-28): ``auth_failure`` joins the set —
+    # a bad/expired primary credential must escalate to the fallback
+    # chain instead of killing the task when a healthy fallback exists.
+    FALLBACK_ELIGIBLE_CLASSES: frozenset[str] = frozenset(
+        {"transient", "rate_limit", "auth_failure"}
+    )
 
     def send_request_with_fallback(
         self,
@@ -268,20 +302,30 @@ class ProviderService:
         """
         from zero.domain.providers import CanonicalRequest as _CanonicalRequest
 
-        chain: list[str] = [request.provider]
+        # Hermes parity (audit 2026-08-28): the chain is a list of
+        # (provider, model) pairs. Same-provider fallback MODELS come
+        # first (the deployment's routing.fallback_models contract),
+        # then other registered providers with the original model.
+        # Each attempt is its own durable provider request (the hash
+        # includes model_name), so a fallback never replays an
+        # uncertain outcome.
+        chain: list[tuple[str, str]] = [(request.provider, request.model_name)]
+        for model_name in self._fallback_models:
+            if model_name != request.model_name and (request.provider, model_name) not in chain:
+                chain.append((request.provider, model_name))
         for name in self._fallback_chain:
-            if name != request.provider and name not in chain:
-                chain.append(name)
+            if name != request.provider and all(name != p for p, _m in chain):
+                chain.append((name, request.model_name))
         last_exc: Exception | None = None
-        for index, provider_name in enumerate(chain):
+        for index, (provider_name, model_name) in enumerate(chain):
             if cancel_event is not None and cancel_event.is_set():
                 raise last_exc or RuntimeError("cancelled before dispatch")
             attempt_request = (
                 request
-                if provider_name == request.provider
+                if (provider_name, model_name) == (request.provider, request.model_name)
                 else _CanonicalRequest(
                     provider=provider_name,
-                    model_name=request.model_name,
+                    model_name=model_name,
                     messages=request.messages,
                     tools=request.tools,
                     tool_choice=request.tool_choice,
@@ -906,6 +950,18 @@ class ProviderService:
         exc_str = str(exc).lower()
         if isinstance(exc, ProviderCancelledError):
             return "cancelled"
+        # Real-run fix: a stream that ended without its terminal marker
+        # never produced a completed response — the runtime consumed no
+        # result (partial deltas are discarded when the collect path
+        # raises), so an in-process redelivery cannot double-spend a
+        # result. Same argument as the 5xx/edge-timeout classes: the
+        # provider may have completed the generation server-side, but
+        # operationally the request is retryable. Observed twice in the
+        # r7 real run (gateway dropped the SSE body mid-generation).
+        # Checked BEFORE the ProviderUnknownOutcomeError isinstance
+        # branch, which would otherwise short-circuit to unknown.
+        if "ended without a terminal message marker" in exc_str:
+            return "transient"
         if isinstance(exc, ProviderUnknownOutcomeError):
             return "unknown_outcome"
         if isinstance(exc, ProviderRequestStateError) and "lease was lost" in exc_str:

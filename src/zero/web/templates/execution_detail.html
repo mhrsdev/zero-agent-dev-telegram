@@ -4,6 +4,7 @@
 <h1>Execution</h1>
 <p><strong>Execution ID:</strong> <code>{{ execution.id }}</code></p>
 <p><strong>Plan:</strong> <code>{{ execution.plan_id }}</code></p>
+{% if execution.goal %}<p><strong>Goal:</strong> {{ execution.goal }}</p>{% endif %}
 <p><strong>State:</strong> <span class="badge badge-{% if execution.state == 'completed' %}success{% elif execution.state == 'failed' or execution.state == 'cancelled' %}error{% elif execution.state == 'paused' %}warning{% else %}pending{% endif %}">{{ execution.state }}</span></p>
 {% if execution.blocker_reason %}
 <p><strong>Blocker:</strong> {{ execution.blocker_reason }}</p>

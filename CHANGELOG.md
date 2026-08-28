@@ -4,6 +4,320 @@ All notable changes to Zero Develop are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions
 are milestone-based rather than semver until 1.0.
 
+## [Unreleased] — real-server hardening (live gateway + autonomous pipeline)
+
+Fixes proven against a live server (`uvicorn zero.main:app`) driving a
+real Telegram bot, a real OpenAI-compatible provider, and real
+multi-agent executions; each item below corresponds to an observed
+real-run failure.
+
+### Fixed
+
+- **The Telegram gateway could never receive a message**: the polling
+  worker built its adapter with the default per-request HTTP timeout
+  (10 s) while asking Telegram to hold the long poll open for 25 s —
+  every long poll was aborted client-side, retried twice, and logged
+  ``TransportError`` every ~33 s. The binding adapter now uses a
+  per-request budget exceeding the long-poll hold (+10 s margin) and
+  ``attempts=1`` (a completed long poll IS the wait). Healthy 25 s
+  poll cycles verified live; real human messages now arrive and are
+  policy-evaluated (``ignored_unlinked`` / ``ignored_disabled`` as
+  designed).
+- **Management layer silently skipped on every boot**: the backup
+  daemon shutdown hook used the decorator form
+  ``@app.router.on_shutdown``, but Starlette's ``Router.on_shutdown``
+  is a plain list — "decorating" raised ``TypeError``, the broad
+  except swallowed it, and the just-started daemon thread leaked each
+  boot. Registered via ``app.router.add_event_handler`` instead; the
+  catch-all warning now logs the error message, not just its type.
+- **One refused tool call failed the whole task**: a raised
+  ``ToolError`` from ``ToolService.invoke`` (e.g. ``run_command``
+  refusing a non-allowlisted binary) propagated out of the agent
+  tool loop and failed the task, even though invalid arguments,
+  undeclared tools, and approval denials are recovered by feeding the
+  model a structured error. Raised tool errors and denials now feed
+  back as synthetic tool results (Hermes parity); the
+  identical-failure loop breaker still bounds pathological retries.
+- **The command allowlist was secret from the model**: ``run_command``
+  described itself as "allowlisted" without naming the allowed
+  binaries, so a frontier model naturally requested ``bash -c "…"``.
+  The declaration now enumerates the exact permitted binaries and the
+  no-shell rule, read from the enforcing service so advertisement and
+  policy cannot drift.
+- **Hidden ``pytest -q`` evidence command**: ``AgentRuntime``'s
+  constructor defaulted ``test_command`` to ``("pytest", "-q")`` and
+  ``build_services`` never passed one — every task whose
+  ``expected_evidence`` required a test report failed with
+  "command 'pytest' is not permitted". The evidence command is now
+  explicit configuration (``ZERO_EVIDENCE_TEST_COMMAND``); unset means
+  evidence-demanding tasks fail closed with a configuration hint.
+- **Task worktrees could not see their dependencies' work**: every
+  worktree branched from the bare repository default and succeeded
+  worktrees never committed, so a "run the tests" task ran against a
+  worktree with no test suite. Succeeded worktrees now commit their
+  full state onto the task branch (evidence checkpoint), and a task's
+  worktree branches from its succeeded dependency worktree branches
+  (clean git merges for diamond DAGs; conflicts fail with a clear
+  reason).
+- **Bytecode noise satisfied diff evidence**: ``git add -A`` in the
+  new checkpoint committed ``__pycache__/*.pyc``, so a task's diff
+  evidence could pass on bytecode churn alone (a real task claimed
+  completion without writing its file). New worktrees carry a
+  worktree-local ``.gitignore`` committed as a hygiene baseline, and
+  evidence commits stay clean.
+- **Evidence validation broke on content deduplication**:
+  ``store_artifact`` deduplicates by content hash, so a later attempt
+  producing a byte-identical diff received the earlier artifact row
+  whose ``provenance`` COLUMN carried the earlier task/attempt — and
+  the validator rejected it ("evidence artifact does not belong to
+  task"). Validation now honors the per-store ``artifact_provenance``
+  rows (any row matching this task/attempt), matching the documented
+  "deduplication does not merge provenance" contract.
+- **The model could not see command output**: ``run_command`` returned
+  only ``run_id``/``state``/``exit_code``/``artifact_ids`` — no
+  stdout/stderr — so the agent could not read test failures or probe
+  output and honestly reported objectives unmet. Bounded
+  ``stdout``/``stderr`` are now declared result fields.
+- **The model-facing render was capped at 500 characters**: a coding
+  agent's ``read_file`` showed ~450 characters of a source file and
+  every tool result was effectively invisible. The bounded render is
+  now 20 000 characters (context-safe while carrying real content),
+  with truncation still explicit.
+- **Persisted tool schemas never evolved**: tool rows survive restarts
+  while handlers re-bind in code; when a server-owned tool's declared
+  schema changed, invocations failed output validation against the
+  stale contract. The declaration is refreshed in lockstep on re-bind.
+- **The interactive chat silently ran toolless**:
+  ``ChatService._granted_tool_names`` called ``repo.get_tool`` — a
+  method that has never existed (the accessor is ``get_tool_by_id``) —
+  the degraded path swallowed the error, and no granted tool was ever
+  declared to the chat model regardless of capability grants.
+- **Decomposer evidence guidance matched fantasy, not reality**: the
+  prompt's own example attached ``["diff","test_report","exit_status"]``
+  to every code-changing task, so the first file-creation task failed
+  its unittest run (no tests exist yet). The guidance now maps
+  evidence to what can hold at each task's completion (read-only →
+  ``provider_response``; pre-suite file work → ``diff``; the single
+  suite-verification task → ``test_report``+``exit_status``, no diff).
+
+## [Unreleased] — Hermes deep-read parity audit (2026-08-28)
+
+A full cross-reference of this codebase against the audited Hermes
+agent reference (nousresearch/hermes-agent — agent loop, tool
+execution/safety, context compaction, error classification/fallback)
+produced the following fixes; each is regression-tested (16 new tests
+in ``tests/test_hermes_parity_audit.py`` plus updates) and most are
+verified against the live server and real provider.
+
+### Fixed
+
+- **Model-level fallback routing did not exist**: the setup wizard
+  writes ``routing.fallback_models`` into config.yaml, but the runtime
+  consulted only provider-level fallbacks — with a single gateway
+  adapter the chain was degenerate, so a primary-model outage failed
+  every task despite configured alternatives. New
+  ``ZERO_OPENAI_FALLBACK_MODELS`` (ordered, deduplicated) feeds
+  ``ProviderService.set_fallback_models``; ``send_request_with_fallback``
+  now routes through (provider, model) pairs — same-provider
+  alternative models first, then other providers. Verified live three
+  times: real gateway 524 storms on the primary model automatically
+  advanced to claude-opus-4-8 and claude-opus-4-8-thinking before any
+  task failure.
+- **Auth failures never reached the fallback chain**: the
+  OpenAI-compatible adapter raised a generic "HTTP 401" error that
+  classified as ``invalid_request`` (terminal), so a bad/expired
+  primary API key killed tasks even with a healthy fallback configured.
+  401/403 now raise auth-flavored errors (matching the Anthropic
+  adapter) and ``auth_failure`` is fallback-eligible (Hermes parity:
+  fail fast, then failover).
+- **The tracked-changes diff was silently empty forever (real bug
+  #14)**: ``capture_diff`` invoked
+  ``git --no-ext-diff --no-textconv diff <base>`` — but those flags
+  belong to the ``diff`` subcommand, not git's global options, so git
+  exited 129 with stderr swallowed and the "Tracked changes" section
+  of every diff artifact was always empty (evidence showed only the
+  untracked status section). Flag order fixed; a nonzero diff exit
+  code is now surfaced in the artifact instead of masquerading as "no
+  changes". Live r13 diff artifacts carry 200+ real tracked ``+``
+  lines for the first time.
+- **The hygiene baseline leaked into every task diff (real bug #15)**:
+  once tracked diffs actually worked, the auto-committed worktree
+  ``.gitignore`` baseline appeared as a tracked change in every
+  task's diff — two tasks then "conflicted" on ``.gitignore`` and
+  integration reviews demanded human decisions for server-managed
+  infrastructure. ``base_revision`` is re-resolved after the baseline
+  commit so diffs show only the task's own work.
+- **Chained aggregation tasks could not prove diff evidence (real bug
+  #16)**: the final "capture the whole diff" task branches from
+  succeeded dependency branches whose evidence checkpoints already
+  contain all earlier work — its incremental diff is empty even
+  though the execution's change set is large, so the task failed with
+  "required diff evidence contains no file change" (observed live in
+  r10). ``capture_diff`` now falls back to a clearly-labeled
+  cumulative diff against the repository's default base revision when
+  a task changed nothing on top of its base.
+- **Empty model responses completed tasks silently**: a response with
+  neither content nor tool calls returned an empty deliverable (the
+  transcript evidence dutifully recorded ``"content": ""``). The tool
+  loop now runs a bounded empty-response ladder (nudge retries, Hermes
+  parity) before accepting an empty terminal.
+- **Identical-failure steering broke tool-call/result pairing**: the
+  warn message was injected as a bare ``user`` message BETWEEN one
+  batch's tool results — strict provider wire formats require tool
+  messages to directly follow the assistant tool_calls turn. The
+  steering now rides on the failing tool result as a bracketed
+  suffix (Hermes parity).
+- **Handler failures hid their reasons**: ``ToolService`` converted
+  unexpected handler exceptions to a bare "Tool 'x' handler failed",
+  leaving the model blind to which path was unreadable or which
+  binary the policy refused. The error now carries the bounded,
+  secret-redacted underlying reason (``Error executing tool 'x':
+  <Type>: <detail>``); delegation and chat tool errors likewise
+  include the reason instead of a bare exception class name.
+- **Chat executed guessed arguments**: unparseable tool-call JSON was
+  silently coerced to ``{}`` and the tool EXECUTED with empty inputs.
+  Invalid arguments now return a structured
+  ``invalid_tool_arguments`` error without invoking the handler
+  (Hermes parity: guessed arguments are never executed).
+
+## [Unreleased] — setup wizard UnicodeEncodeError (masked-key probe) + probe hardening
+
+### Fixed
+
+- **`zero setup` crashed at step 7/18 (Provider test)** with
+  ``UnicodeEncodeError: 'ascii' codec can't encode character '\u2026'
+  in position 11``: the wizard stores draft secrets *masked*
+  (``sk-a…xyz`` — the mask's ellipsis is exactly header position 11 of
+  ``Bearer sk-a…``) with the raw value under ``_raw``, but the
+  provider-test validation probed the masked value read back from the
+  draft. It now probes the raw secret; old drafts without ``_raw``
+  fall back to the stored value so the probe's clean rejection
+  applies (never a traceback).
+- **Probes can no longer crash on bad secrets**: all five network
+  probes (``telegram_get_me``, ``telegram_recent_chats``,
+  ``openai_list_models``, ``openai_completion_probe``,
+  ``anthropic_ping``) now sanitize/validate keys and tokens first
+  (strip invisible paste artifacts: zero-width, NBSP, BOM; reject
+  non-ASCII such as a literal ``…`` from a truncated copy) and treat
+  *any* request-building/transport/body-parsing exception as a normal
+  ``{"ok": false, "error": "…"}`` result. A non-JSON 200 body (proxy
+  portal) no longer raises either.
+- **Paste-safe secret input**: the CLI wizard strips invisible
+  characters from pasted tokens/keys at the prompt and rejects values
+  that still contain visible non-ASCII with an actionable message
+  ("value looks like a truncated copy (contains '…') — paste the full
+  token/key") BEFORE any network call; the same validation runs in
+  ``SetupService.validate`` so TUI/GUI/non-interactive paths get it
+  too.
+- **Wizard retry menu on validation failure**: a failed step used to
+  re-ask every field, so a transient probe error (``unreachable:
+  ConnectError``) forced retyping the whole step. After a failure the
+  wizard now asks ``[Enter=retry same answers · r=re-enter · b=back ·
+  s=skip]``; re-entry pre-fills fields with the last attempted values.
+- Regression suite ``tests/test_probe_hardening.py`` (12 tests) covers
+  the masked-key replay of the reported crash end-to-end, dirty-secret
+  rejection for every probe (no network, no raise), raw-vs-masked
+  probing, and the retry menu. Full suite: 932 passed.
+
+## [Unreleased] — `zero logs` crash + service-status Windows fix
+
+### Fixed
+
+- **`zero logs` crashed for everyone** (``AttributeError: 'Namespace'
+  object has no attribute 'lines'``): the subparser defined only
+  ``-n`` (argparse derives dest ``n``) while ``cmd_logs`` read
+  ``ns.lines``. The parser now defines ``-n/--lines`` with an explicit
+  dest; a non-positive ``-n 0`` no longer falls into Python's
+  ``[-0:] == [0:]`` slice trap (which dumped the entire log).
+- **`zero logs` ignored the file log whenever journalctl existed**:
+  the handler exec'd ``journalctl -u zero`` even when the service runs
+  as a plain process (``zero start`` writes ``zero.pid``/``zero.log``)
+  and no systemd unit is installed — operators saw "No entries" while
+  ``zero.log`` had fresh content. journalctl is now used only when the
+  zero unit actually exists (``systemctl cat zero`` succeeds); the
+  file branch is the fallback.
+- **`zero status` killed the running service on Windows**:
+  ``os.kill(pid, 0)`` is a harmless liveness probe on POSIX, but on
+  Windows os.kill maps any non-CTRL signal to ``TerminateProcess`` —
+  so merely checking status terminated the bot. Status detection now
+  uses a query-only process handle (``OpenProcess`` +
+  ``WaitForSingleObject``) on Windows; POSIX keeps signal-0. Stale or
+  garbage pid files are reported as ``stopped (stale pid N)`` instead
+  of crashing.
+- **EOF on prompts**: a closed/piped stdin reaching an
+  ``input()``/``getpass()`` prompt outside the wizard (e.g. ``zero
+  telegram add-bot`` in a script) escaped as a raw traceback; ``main``
+  now exits 2 with a one-line message (the wizard already handled
+  Ctrl+C/EOF from the previous fix).
+- **`providers add --probe` was a no-op**: ``store_true`` with
+  ``default=True`` could never disable probing; it is now
+  ``--probe/--no-probe`` (default: probe).
+- **`backup-status`** no longer crashes when ``last-backup.json`` has
+  a null ``epoch``.
+- Regression tests for all of the above added to
+  ``tests/test_manage_cli.py`` (10 new tests; full suite 920 passed).
+
+## [Unreleased] — TUI crash + setup wizard deadlock fixes
+
+### Fixed
+
+- **TUI (`zero tui`) render crash**: every data panel overrode
+  ``_render(self, payload)``, which collides with the private
+  ``Widget._render()`` framework hook that Textual >= 0.86 calls with
+  zero arguments during layout — the compositor died with
+  ``TypeError: OverviewPanel._render() missing 1 required positional
+  argument: 'o'`` on any screen refresh. The per-panel hook is renamed
+  to ``_render_payload`` and ``refresh_data`` now renders data-layer
+  errors in-panel instead of killing the app.
+- **TUI panel switching (`DuplicateIds`)**: panels were re-mounted with
+  the fixed id ``main`` after ``remove_children()``, which is
+  asynchronous in Textual >= 1.0 — the stale widget still held the id,
+  so pressing keys 2–9 crashed with ``DuplicateIds``. New panels mount
+  first (id-free) and old panels are pruned by explicit reference; 'r'
+  now refreshes every panel type including the providers DataTable;
+  admin login for the chat stream moved off the UI event loop (the TUI
+  no longer freezes until HTTP timeout).
+- **Setup wizard deadlock (`zero setup`)**: the interactive driver only
+  mapped a handful of steps and fed an empty value dict to every other
+  step — typing the exact valid answer ``bot_api`` at ``telegram_mode``
+  still failed validation in an infinite loop (same for the silently
+  dropped ``environment`` answer and the unmapped ``model_assign``
+  step, which deadlocked next). The wizard is now form-driven from the
+  shared ``WIZARD_STEPS`` specs: it shows each field's label, available
+  options, defaults and required flags, accepts option indices and
+  forgiving variants (``Bot-API`` → ``bot_api``), can skip optional
+  steps ('s'), navigates back ('b') at any prompt, and pauses cleanly
+  on Ctrl+C with ``zero setup --resume``.
+- **Wizard could never store secrets on a fresh host**: the engine
+  bridge loaded settings strictly, so ``zero setup`` failed with
+  ``ZERO_ENV is required`` the moment it tried to store the bot token —
+  before the wizard had any .env to read. The management CLI now loads
+  with the documented development fallback (explicit ZERO_ENV still
+  wins), matching ``zero-develop serve``.
+- **Wizard answers silently dropped**: groups answered in any UI never
+  reached the committed config (only a synthetic ``confirmed`` list was
+  read while every UI wrote a flat ``{chat_id, title}`` payload);
+  openai_compatible providers committed with an empty models list
+  (discovery wrote only ``discovered_models``). Both shapes are now
+  consumed and discovery populates ``models``.
+- **final_validation step now validates**: it builds the full config
+  from the draft so schema/cross-field errors surface at a named step
+  with a readable message instead of a traceback from ``commit()``.
+- **`zero setup --non-interactive` without `--step`** now fails with
+  guidance instead of attempting a guaranteed-to-fail commit;
+  ``--resume`` reports where the draft stands.
+- **`zero start` on a fresh home** created ``zero.pid``'s directory
+  after opening the log inside it (FileNotFoundError); the daemonized
+  spawn also crashed on Windows (``start_new_session`` is POSIX-only)
+  and now uses ``DETACHED_PROCESS`` there.
+- **Bare `zero`** now prints the full help (exit 2) instead of
+  argparse's terse missing-argument error; Ctrl+C anywhere in the CLI
+  exits 130 without a traceback.
+- Regression suite added: ``tests/test_tui_wizard_regressions.py``
+  (17 tests) guards the render-hook collision, the bot_api session from
+  the bug report, step-form coverage, input parsing and final
+  validation.
+
 ## [Unreleased] — Hermes-parity hardening (G1 + G2)
 
 ### Added

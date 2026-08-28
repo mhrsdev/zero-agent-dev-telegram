@@ -232,7 +232,13 @@ class ChatService:
             if grant.agent_scope != agent_scope:
                 continue
             try:
-                tool = self._tools._tool_repo.get_tool(grant.tool_id)
+                # Bug fix (real run, 2026-08-28): this called
+                # ``get_tool`` — a method the repository has never had
+                # (the real accessor is ``get_tool_by_id``) — so the
+                # lookup raised, the degraded path swallowed it, and the
+                # interactive chat silently ran TOOLLESS no matter what
+                # capabilities were granted.
+                tool = self._tools._tool_repo.get_tool_by_id(grant.tool_id)
             except Exception as grant_exc:  # noqa: BLE001
                 logger.debug("granted tool %s unavailable: %s", grant.tool_id, grant_exc)
                 continue
@@ -260,12 +266,37 @@ class ChatService:
         arguments_text: str,
         source: AuditSource,
     ) -> dict[str, Any]:
+        # Hermes parity (audit 2026-08-28): unparseable arguments are
+        # never executed with guessed (empty) inputs — the model receives
+        # a structured error so it can re-issue the call.
         try:
             input_data = json.loads(arguments_text) if arguments_text.strip() else {}
-        except json.JSONDecodeError:
-            input_data = {}
+        except json.JSONDecodeError as decode_exc:
+            return {
+                "tool_name": tool_name,
+                "arguments": {},
+                "result": json.dumps(
+                    {
+                        "error": "invalid_tool_arguments",
+                        "detail": f"arguments are not valid JSON: {decode_exc.msg}",
+                        "hint": "Re-issue this tool call with a JSON object "
+                        "whose keys match the declared schema.",
+                    },
+                    ensure_ascii=False,
+                ),
+            }
         if not isinstance(input_data, dict):
-            input_data = {}
+            return {
+                "tool_name": tool_name,
+                "arguments": {},
+                "result": json.dumps(
+                    {
+                        "error": "invalid_tool_arguments",
+                        "detail": "arguments must decode to a JSON object",
+                    },
+                    ensure_ascii=False,
+                ),
+            }
         try:
             result = self._tools.invoke(  # type: ignore[union-attr]
                 project_id=project_id,
@@ -278,10 +309,15 @@ class ChatService:
         except ToolInvocationDeniedError as exc:
             return {"tool_name": tool_name, "arguments": input_data, "result": f"denied: {exc}"}
         except Exception as exc:  # noqa: BLE001 - tool failure is a result, not a crash
+            # Hermes parity (audit 2026-08-28): the failure REASON (bounded,
+            # redacted) reaches the model instead of a bare class name.
+            from zero.domain.audit import redact_sensitive_text
+
+            detail = redact_sensitive_text(str(exc) or type(exc).__name__)[:512]
             return {
                 "tool_name": tool_name,
                 "arguments": input_data,
-                "result": f"error: {type(exc).__name__}",
+                "result": f"error executing tool {tool_name!r}: {type(exc).__name__}: {detail}",
             }
         return {
             "tool_name": tool_name,

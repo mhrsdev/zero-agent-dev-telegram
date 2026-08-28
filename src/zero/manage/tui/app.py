@@ -34,7 +34,14 @@ def run() -> int:
     from zero.manage.tui import data
 
     class _Panel(Static):
-        """Base panel: pulls a fresh payload from the data layer."""
+        """Base panel: pulls a fresh payload from the data layer.
+
+        NOTE: the per-panel hook is deliberately named ``_render_payload``.
+        Textual >= 0.86 introduced its own ``Widget._render()`` framework
+        hook (called by the compositor with NO arguments), so any subclass
+        overriding ``_render(self, payload)`` crashed layout with
+        "TypeError: _render() missing 1 required positional argument".
+        """
 
         source = "overview"  # data.<source>() name
 
@@ -42,16 +49,22 @@ def run() -> int:
             self.refresh_data()
 
         def refresh_data(self) -> None:
-            payload = getattr(data, self.source)()
-            self.update(self._render(payload))
+            try:
+                payload = getattr(data, self.source)()
+                body = self._render_payload(payload)
+            except Exception as exc:  # noqa: BLE001 - a broken payload must
+                # never take the whole TUI down (compositor re-enters render
+                # during layout, so exceptions here are fatal crashes).
+                body = f"[data error] {type(exc).__name__}: {exc}"
+            self.update(body)
 
-        def _render(self, payload):
+        def _render_payload(self, payload):
             return str(payload)
 
     class OverviewPanel(_Panel):
         BORDER_TITLE = "Overview"
 
-        def _render(self, o):
+        def _render_payload(self, o):
             lines = [
                 f"environment : {o['environment']}",
                 f"config      : {o['config_path']}",
@@ -86,7 +99,7 @@ def run() -> int:
         source = "telegram_screen"
         BORDER_TITLE = "Telegram"
 
-        def _render(self, t):
+        def _render_payload(self, t):
             tg = t["telegram"]
             head = (
                 f"mode={tg.get('mode', '-')} bot={tg.get('bot', '-')} "
@@ -99,7 +112,7 @@ def run() -> int:
         source = "groups_screen"
         BORDER_TITLE = "Groups"
 
-        def _render(self, rows):
+        def _render_payload(self, rows):
             if not rows:
                 return "no groups configured\n(add via Wizard or `zero telegram groups add`)"
             header = f"{'chat id':<20}{'title':<26}{'state':<6}{'limits'}"
@@ -136,7 +149,7 @@ def run() -> int:
         source = "usage_screen"
         BORDER_TITLE = "Usage (estimates)"
 
-        def _render(self, rows):
+        def _render_payload(self, rows):
             if not rows:
                 return "no usage recorded yet"
             lines = [
@@ -157,7 +170,7 @@ def run() -> int:
         source = "system_screen"
         BORDER_TITLE = "System"
 
-        def _render(self, s):
+        def _render_payload(self, s):
             return (
                 f"python      : {s['python']}\n"
                 f"disk free   : {s['disk_free_gb']} GB\n"
@@ -169,7 +182,7 @@ def run() -> int:
         source = "backups_screen"
         BORDER_TITLE = "Backups"
 
-        def _render(self, b):
+        def _render_payload(self, b):
             lines = [
                 f"schedule: {b['schedule']}  archives: {len(b['archives'])}",
             ]
@@ -184,7 +197,7 @@ def run() -> int:
         source = "diagnostics_screen"
         BORDER_TITLE = "Diagnostics (doctor)"
 
-        def _render(self, report):
+        def _render_payload(self, report):
             sym = {"ok": "[ OK ]", "warn": "[WARN]", "fail": "[FAIL]"}
             body = "\n".join(
                 f"{sym[c['status']]} {c['name']}: {c['detail']}" for c in report["checks"]
@@ -306,32 +319,39 @@ def run() -> int:
         def compose(self) -> ComposeResult:
             yield Header()
             with VerticalScroll(id="body"):
-                yield OverviewPanel(id="main")
+                yield OverviewPanel()
             yield Footer()
 
-        def on_mount(self) -> None:
-            panel = self.query_one("#main")
-            panel.refresh_data()
-
-        def action_show_panel(self, key: str) -> None:
-            if key == self.current:
+        def _show_panel(self, key: str, force: bool = False) -> None:
+            if key == self.current and not force:
                 return
             body = self.query_one("#body", VerticalScroll)
-            body.remove_children()
             self.current = key
             if key == "chat":
                 from textual.containers import Vertical
                 from textual.widgets import Input
 
-                holder = Vertical(id="main")
+                holder = Vertical()
+                # Mount the holder into the DOM first (children can only
+                # be mounted into an already-mounted widget), THEN fill
+                # it. Old panels are pruned by explicit reference —
+                # remove_children() is asynchronous in Textual >= 1.0, so
+                # the old remove-first-then-mount order crashed every
+                # panel switch with DuplicateIds.
+                previous = list(body.children)
                 body.mount(holder)
-                stream = ChatStreamPanel(id="chat-stream")
+                if previous:
+                    body.remove_children(previous)
+                stream = ChatStreamPanel()
                 pw_input = Input(placeholder="admin password", password=True)
-                holder.mount(Input(placeholder="execution id (exec_…)", id="chat-exec"))
+                exec_input = Input(placeholder="execution id (exec_…)", id="chat-exec")
+                holder.mount(exec_input)
                 holder.mount(pw_input)
                 holder.mount(stream)
 
                 def handle_submitted(message) -> None:
+                    import threading
+
                     from textual.widgets import Input as _Input
 
                     if not isinstance(message, _Input.Submitted):
@@ -341,16 +361,29 @@ def run() -> int:
                     exec_value = message.value.strip()
                     if not exec_value:
                         return
-                    cookie = _admin_login(pw_input.value)
-                    stream.start_stream(exec_value, cookie)
+
+                    def worker() -> None:
+                        # Blocking HTTP login must stay off the UI event
+                        # loop or the whole TUI freezes until timeout.
+                        cookie = _admin_login(pw_input.value)
+                        stream.start_stream(exec_value, cookie)
+
+                    threading.Thread(target=worker, daemon=True).start()
 
                 self._chat_handler = handle_submitted
-                body.query_one("#chat-exec").focus()
+                exec_input.focus()
                 return
             widget_cls = PANELS[key]
-            widget = widget_cls(id="main")
+            widget = widget_cls()
+            previous = list(body.children)
             body.mount(widget)
-            widget.refresh_data()
+            if previous:
+                body.remove_children(previous)
+            if hasattr(widget, "refresh_data"):
+                widget.refresh_data()
+
+        def action_show_panel(self, key: str) -> None:
+            self._show_panel(key)
 
         def on_input_submitted(self, event) -> None:
             handler = getattr(self, "_chat_handler", None)
@@ -358,11 +391,9 @@ def run() -> int:
                 handler(event)
 
         def action_refresh_panel(self) -> None:
-            panel = self.query_one("#main")
-            if hasattr(panel, "refresh_data"):
-                panel.refresh_data()
-            elif isinstance(panel, ProvidersScreen):
-                pass
+            # Re-mount the current panel fresh. The old per-widget branch
+            # never refreshed the providers DataTable at all.
+            self._show_panel(self.current, force=True)
 
     ZeroTUI().run()
     return 0

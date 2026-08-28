@@ -329,6 +329,7 @@ def build_services(
         authorization_service,
         metrics=metrics_service,
         task_max_attempts=settings.task_max_attempts,
+        agent_type_repo=agent_type_repo,
     )
     worktree_service = WorktreeService(
         worktree_repo,
@@ -394,6 +395,14 @@ def build_services(
     # retryable failures (Hermes parity, Phase 6).
     if len(provider_service.registered_provider_names) > 1:
         provider_service.set_fallback_chain(tuple(provider_service.registered_provider_names))
+    # Model-level fallback routing (Hermes parity, audit 2026-08-28):
+    # the setup wizard writes ``routing.fallback_models`` into
+    # config.yaml, promising alternative models on the same gateway.
+    # ZERO_OPENAI_FALLBACK_MODELS carries that contract into the
+    # runtime so a primary-model outage routes to the next model
+    # instead of failing the task.
+    if settings.openai_fallback_models:
+        provider_service.set_fallback_models(settings.openai_fallback_models)
 
     def _llm_compaction_summarizer(*, project_id, execution_id, actor_id, messages):
         """LLM checkpoint summarizer for compaction (Hermes parity).
@@ -509,6 +518,15 @@ def build_services(
         metrics=metrics_service,
         compaction=compaction_service,
         enable_delegation=True,
+        # Bug fix (real run, 2026-08-28): the runtime used to fall back to
+        # a hidden default test command ("pytest -q") that the worktree
+        # command policy does not allowlist — every task whose
+        # expected_evidence required a test report failed with
+        # "command 'pytest' is not permitted". The evidence command is now
+        # explicit operator configuration; when unset, evidence-demanding
+        # tasks fail closed with a configuration hint instead of a policy
+        # violation.
+        test_command=settings.evidence_test_command or None,
     )
     # GAP 10 / S7: wire the LLM task decomposer into the production
     # scheduler. The flag (ZERO_DECOMPOSITION_ENABLED) still gates the
@@ -523,6 +541,19 @@ def build_services(
             else None
         )
     )
+
+    def _resolve_single_repository(project_id, actor_id):
+        """Return the project's sole registered repository id, else None.
+
+        Wired as the scheduler's repository_resolver (real-run fix): the
+        managed worker host never passes repository_id, so coding tasks
+        used to run delegate-only with no file/shell tools.
+        """
+        repos = worktree_service.list_repositories(
+            project_id, actor_id=actor_id, source="system"
+        )
+        return repos[0].id if len(repos) == 1 else None
+
     scheduler_service = SchedulerService(
         plans=plan_service,
         worker=worker_service,
@@ -534,6 +565,7 @@ def build_services(
         task_max_attempts=settings.task_max_attempts,
         decomposer=TaskDecomposer(providers=provider_service, analytics=decomposition_analytics),
         parallel_executions=settings.tick_parallel_executions,
+        repository_resolver=_resolve_single_repository,
     )
     backup_service = BackupService(database)
     canary_service = SecretCanaryScan(

@@ -606,7 +606,16 @@ class InterfaceAdapterService:
                 actor_id=user_id,
                 source=binding.platform,  # type: ignore[arg-type]
                 origin_kind="authenticated_human",
-                content=_event_content(event.content),
+                # Bug fix: this used to pass _event_content(event.content) —
+                # the 200-char redacted *log preview* — so every Telegram
+                # message longer than 200 chars was silently destroyed
+                # before the planner ever saw it (the model then correctly
+                # refused such truncated requests as not actionable).
+                # ingest_conversation_event applies full-content redaction
+                # itself (plan_service redact_sensitive_text), so hand it
+                # the complete message; the preview helper stays only on
+                # the InterfaceEventLogEntry.event_content fields below.
+                content=event.content,
                 external_event_id=event.external_event_id,
             )
         except DuplicateConversationEventError:

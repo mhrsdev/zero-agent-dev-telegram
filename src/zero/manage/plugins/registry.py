@@ -19,6 +19,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from zero.domain.tools import ToolAlreadyExistsError
 from zero.manage.core.config import zero_home
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,21 @@ def load_plugins(tool_service, *, config=None, secret_store=None) -> list[str]:
             )
             register(context)
             loaded.append(label)
+        except ToolAlreadyExistsError:
+            # Idempotent restart: tool rows are durable, so reloading the
+            # SAME plugin after a reboot always lands here. register_tool
+            # binds the fresh handler (and inline flag) into the
+            # process-local map BEFORE the duplicate-name check, so the
+            # tool is fully operational — count it as loaded, not as a
+            # failure. (Real-run finding: every restart logged "plugin
+            # failed to load: ToolAlreadyExistsError" for healthy
+            # plugins, and skip-on-duplicate would leave the durable row
+            # pointing at a handler this process never re-bound.)
+            loaded.append(label)
+            logger.info(
+                "plugin %s: tool already registered — handler re-bound (idempotent reload)",
+                label,
+            )
         except Exception as exc:  # noqa: BLE001 - isolation is the contract
             logger.warning("plugin %s failed to load: %s", label, type(exc).__name__)
     return loaded

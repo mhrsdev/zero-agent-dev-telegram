@@ -342,7 +342,14 @@ class ProviderAdapter(ABC):
         *,
         cancel_event: Event | None = None,
     ) -> Iterator[CanonicalStreamEvent]:
-        """Yield canonical events; adapters may override for true SSE."""
+        """Yield canonical events; adapters may override for true SSE.
+
+        Real-run fix: the default must emit ``tool_call_delta`` events
+        for the wrapped response's tool calls. Dropping them made every
+        default-streamed response look like plain text — the runtimes'
+        tool loop saw no delegation call and sub-agent tests silently
+        degraded (the parent "answered" instead of delegating).
+        """
         if cancel_event is not None and cancel_event.is_set():
             from zero.domain.providers import ProviderCancelledError
 
@@ -350,6 +357,8 @@ class ProviderAdapter(ABC):
         response = self.send_request(request)
         if response.content:
             yield CanonicalStreamEvent(kind="text_delta", text=response.content)
+        for call in response.tool_calls:
+            yield CanonicalStreamEvent(kind="tool_call_delta", tool_call=call)
         if response.usage is not None:
             yield CanonicalStreamEvent(kind="usage", usage=response.usage)
         yield CanonicalStreamEvent(
@@ -491,6 +500,17 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
         if response.status_code >= 400:
             # Do not include the provider body: error bodies commonly echo
             # credential fragments or request content.
+            # Bug fix (Hermes-parity audit, 2026-08-28): 401/403 must carry
+            # an auth-flavored message so ``ProviderService._classify_error``
+            # maps them to ``auth_failure`` (fail fast, escalate to the
+            # fallback chain) instead of ``invalid_request``. The
+            # Anthropic adapter already raised auth-flavored errors; this
+            # adapter's generic message made a bad/expired primary API key
+            # look like a request defect, silently skipping fallback.
+            if response.status_code in (401, 403):
+                raise ProviderError(
+                    f"provider auth failed with status {response.status_code}"
+                )
             detail = _rate_limit_detail(response) if response.status_code == 429 else ""
             raise ProviderError(
                 f"provider HTTP request failed with status {response.status_code}{detail}"
@@ -552,7 +572,43 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
         *,
         cancel_event: Event | None = None,
     ) -> Iterator[CanonicalStreamEvent]:
-        """Consume OpenAI-compatible SSE without buffering the response."""
+        """Consume OpenAI-compatible SSE with outcome-aware errors.
+
+        Real-run fix: a transport failure BEFORE any stream event was
+        consumed is a pure connection failure — no response data ever
+        existed, so there is nothing to double-deliver and the request
+        is safely retryable (same class as ConnectError). Only a break
+        AFTER data started flowing stays ``unknown_outcome``: the
+        provider may have completed the generation, and the project's
+        durable-state philosophy reserves that case for operator
+        reconciliation. A gateway blip at second ~28 (r7 run: HTTP
+        RemoteProtocolError before the first SSE event) previously
+        wedged the whole execution as ``paused`` pending human
+        reconciliation; it now retries like any transient failure.
+        """
+        saw_any_event = False
+        try:
+            for event in self._openai_stream_events(request, cancel_event=cancel_event):
+                saw_any_event = True
+                yield event
+        except httpx.ConnectError as exc:
+            raise ProviderError("provider connection failed") from exc
+        except httpx.RequestError as exc:
+            if not saw_any_event:
+                raise ProviderError(
+                    "provider stream connection failed before any stream data"
+                ) from exc
+            raise ProviderUnknownOutcomeError(
+                "provider request outcome is unknown"
+            ) from exc
+
+    def _openai_stream_events(
+        self,
+        request: CanonicalRequest,
+        *,
+        cancel_event: Event | None = None,
+    ) -> Iterator[CanonicalStreamEvent]:
+        """Raw SSE consumption (transport errors propagate to the wrapper)."""
         clean_messages, _stripped = validate_tool_messages(request.messages)
         payload: dict[str, Any] = {
             "model": request.model_name,
@@ -564,109 +620,116 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
         if request.tools:
             payload["tools"] = _render_tools(request.tools)
             _apply_tool_choice(payload, request, protocol="openai-compatible")
-        try:
-            with self._client.stream(
-                "POST",
-                f"{self._base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            ) as response:
-                if response.status_code >= 400:
-                    raise ProviderError(
-                        f"provider HTTP request failed with status {response.status_code}"
-                    )
-                tool_call_ids_by_index: dict[int, str] = {}
-                saw_message_end = False
-                for raw_line in response.iter_lines():
-                    if cancel_event is not None and cancel_event.is_set():
-                        from zero.domain.providers import ProviderCancelledError
+        with self._client.stream(
+            "POST",
+            f"{self._base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        ) as response:
+            if response.status_code >= 400:
+                raise ProviderError(
+                    f"provider HTTP request failed with status {response.status_code}"
+                )
+            tool_call_ids_by_index: dict[int, str] = {}
+            saw_message_end = False
+            saw_any_data = False
+            for raw_line in response.iter_lines():
+                if cancel_event is not None and cancel_event.is_set():
+                    from zero.domain.providers import ProviderCancelledError
 
-                        raise ProviderCancelledError("provider stream cancelled")
-                    line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-                    line = line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_text = line[5:].strip()
-                    if data_text == "[DONE]":
-                        if not saw_message_end:
-                            raise ProviderUnknownOutcomeError(
-                                "provider stream ended without a terminal message marker"
-                            )
-                        return
-                    try:
-                        data = json.loads(data_text)
-                    except (TypeError, json.JSONDecodeError) as exc:
-                        raise ProviderError("provider returned invalid stream JSON") from exc
-                    if not isinstance(data, Mapping):
-                        raise ProviderError("provider returned an invalid stream event")
-                    provider_message_id = str(data["id"]) if data.get("id") is not None else None
-                    usage = self._normalize_usage(data.get("usage"))
-                    if data.get("usage") is not None:
-                        yield CanonicalStreamEvent(
-                            kind="usage",
-                            usage=usage,
-                            provider_message_id=provider_message_id,
+                    raise ProviderCancelledError("provider stream cancelled")
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_text = line[5:].strip()
+                if data_text == "[DONE]":
+                    if not saw_message_end:
+                        raise ProviderUnknownOutcomeError(
+                            "provider stream ended without a terminal message marker"
                         )
-                    choices = data.get("choices")
-                    if not isinstance(choices, list) or not choices:
-                        continue
-                    choice = choices[0]
-                    if not isinstance(choice, Mapping):
-                        continue
-                    delta = choice.get("delta")
-                    if isinstance(delta, Mapping):
-                        text = delta.get("content")
-                        if isinstance(text, str) and text:
-                            yield CanonicalStreamEvent(
-                                kind="text_delta",
-                                text=text,
-                                provider_message_id=provider_message_id,
-                            )
-                        for raw_call in delta.get("tool_calls") or []:
-                            if not isinstance(raw_call, Mapping):
-                                continue
-                            function = raw_call.get("function")
-                            if not isinstance(function, Mapping):
-                                continue
-                            raw_index = raw_call.get("index")
-                            try:
-                                call_index = int(raw_index)
-                            except (TypeError, ValueError):
-                                call_index = None
-                            call_id = str(raw_call.get("id") or "")
-                            if call_index is not None and call_id:
-                                tool_call_ids_by_index[call_index] = call_id
-                            elif call_index is not None:
-                                call_id = tool_call_ids_by_index.get(call_index, "")
-                            yield CanonicalStreamEvent(
-                                kind="tool_call_delta",
-                                tool_call=ToolCallResult(
-                                    tool_name=str(function.get("name") or ""),
-                                    tool_call_id=call_id,
-                                    arguments=str(function.get("arguments") or ""),
-                                    result="",
-                                ),
-                                provider_message_id=provider_message_id,
-                            )
-                    finish_reason = choice.get("finish_reason")
-                    if finish_reason:
-                        saw_message_end = True
-                        yield CanonicalStreamEvent(
-                            kind="message_end",
-                            finish_reason=str(finish_reason),
-                            provider_message_id=provider_message_id,
-                        )
-                if not saw_message_end:
-                    raise ProviderUnknownOutcomeError(
-                        "provider stream ended without a terminal message marker"
+                    return
+                try:
+                    data = json.loads(data_text)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ProviderError("provider returned invalid stream JSON") from exc
+                if not isinstance(data, Mapping):
+                    raise ProviderError("provider returned an invalid stream event")
+                # A parsed provider event proves data was flowing; a later
+                # break is mid-generation (unknown), not pre-response
+                # (retryable transport failure).
+                saw_any_data = True
+                provider_message_id = str(data["id"]) if data.get("id") is not None else None
+                usage = self._normalize_usage(data.get("usage"))
+                if data.get("usage") is not None:
+                    yield CanonicalStreamEvent(
+                        kind="usage",
+                        usage=usage,
+                        provider_message_id=provider_message_id,
                     )
-        except httpx.ConnectError as exc:
-            raise ProviderError("provider connection failed") from exc
-        except httpx.RequestError as exc:
-            raise ProviderUnknownOutcomeError("provider request outcome is unknown") from exc
+                choices = data.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                choice = choices[0]
+                if not isinstance(choice, Mapping):
+                    continue
+                delta = choice.get("delta")
+                if isinstance(delta, Mapping):
+                    text = delta.get("content")
+                    if isinstance(text, str) and text:
+                        yield CanonicalStreamEvent(
+                            kind="text_delta",
+                            text=text,
+                            provider_message_id=provider_message_id,
+                        )
+                    for raw_call in delta.get("tool_calls") or []:
+                        if not isinstance(raw_call, Mapping):
+                            continue
+                        function = raw_call.get("function")
+                        if not isinstance(function, Mapping):
+                            continue
+                        raw_index = raw_call.get("index")
+                        try:
+                            call_index = int(raw_index)
+                        except (TypeError, ValueError):
+                            call_index = None
+                        call_id = str(raw_call.get("id") or "")
+                        if call_index is not None and call_id:
+                            tool_call_ids_by_index[call_index] = call_id
+                        elif call_index is not None:
+                            call_id = tool_call_ids_by_index.get(call_index, "")
+                        yield CanonicalStreamEvent(
+                            kind="tool_call_delta",
+                            tool_call=ToolCallResult(
+                                tool_name=str(function.get("name") or ""),
+                                tool_call_id=call_id,
+                                arguments=str(function.get("arguments") or ""),
+                                result="",
+                            ),
+                            provider_message_id=provider_message_id,
+                        )
+                finish_reason = choice.get("finish_reason")
+                if finish_reason:
+                    saw_message_end = True
+                    yield CanonicalStreamEvent(
+                        kind="message_end",
+                        finish_reason=str(finish_reason),
+                        provider_message_id=provider_message_id,
+                    )
+            if not saw_message_end:
+                if not saw_any_data:
+                    # EOF (or transport break) before a single provider
+                    # event: no response data ever existed, so this is a
+                    # retryable transport failure, not an unknown outcome.
+                    raise ProviderError(
+                        "provider stream connection failed before any stream data"
+                    )
+                raise ProviderUnknownOutcomeError(
+                    "provider stream ended without a terminal message marker"
+                )
 
     @staticmethod
     def _render_messages(
@@ -1157,109 +1220,140 @@ class AnthropicMessagesProviderAdapter(ProviderAdapter):
         *,
         cancel_event: Event | None = None,
     ) -> Iterator[CanonicalStreamEvent]:
+        """Outcome-aware errors (see OpenAI-compatible wrapper): a break
+        before the first consumed SSE event is a retryable transport
+        failure, not an unknown outcome."""
+        saw_any_event = False
+        try:
+            for event in self._anthropic_stream_events(request, cancel_event=cancel_event):
+                saw_any_event = True
+                yield event
+        except httpx.ConnectError as exc:
+            raise ProviderError("provider connection failed") from exc
+        except httpx.RequestError as exc:
+            if not saw_any_event:
+                raise ProviderError(
+                    "provider stream connection failed before any stream data"
+                ) from exc
+            raise ProviderUnknownOutcomeError(
+                "provider request outcome is unknown"
+            ) from exc
+
+    def _anthropic_stream_events(
+        self,
+        request: CanonicalRequest,
+        *,
+        cancel_event: Event | None = None,
+    ) -> Iterator[CanonicalStreamEvent]:
         body = self._build_body(request)
         body["stream"] = True
         saw_message_stop = False
+        saw_any_data = False
         stop_reason: str | None = None
         provider_message_id: str | None = None
         usage_map: dict[str, int] = {}
         blocks_by_index: dict[int, dict[str, Any]] = {}
-        try:
-            with self._client.stream(
-                "POST",
-                self._endpoint(),
-                headers=self._headers(),
-                json=body,
-            ) as response:
-                if response.status_code >= 400:
-                    raise ProviderError(
-                        f"provider HTTP request failed with status {response.status_code}"
-                    )
-                for raw_line in response.iter_lines():
-                    if cancel_event is not None and cancel_event.is_set():
-                        from zero.domain.providers import ProviderCancelledError
+        with self._client.stream(
+            "POST",
+            self._endpoint(),
+            headers=self._headers(),
+            json=body,
+        ) as response:
+            if response.status_code >= 400:
+                raise ProviderError(
+                    f"provider HTTP request failed with status {response.status_code}"
+                )
+            for raw_line in response.iter_lines():
+                if cancel_event is not None and cancel_event.is_set():
+                    from zero.domain.providers import ProviderCancelledError
 
-                        raise ProviderCancelledError("provider stream cancelled")
-                    line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-                    line = line.strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload_text = line[5:].strip()
-                    if not payload_text:
-                        continue
-                    try:
-                        event = json.loads(payload_text)
-                    except json.JSONDecodeError as exc:
-                        raise ProviderError("provider returned invalid stream JSON") from exc
-                    if not isinstance(event, Mapping):
-                        continue
-                    event_type = event.get("type")
-                    if event_type == "message_start":
-                        message = event.get("message")
-                        if isinstance(message, Mapping):
-                            provider_message_id = (
-                                str(message["id"]) if message.get("id") is not None else None
-                            )
-                            raw_usage = message.get("usage")
-                            if isinstance(raw_usage, Mapping):
-                                for key in (
-                                    "input_tokens",
-                                    "output_tokens",
-                                    "cache_creation_input_tokens",
-                                    "cache_read_input_tokens",
-                                ):
-                                    value = raw_usage.get(key)
-                                    if isinstance(value, int):
-                                        usage_map[key] = value
-                    elif event_type == "content_block_start":
-                        index = event.get("index")
-                        block = event.get("content_block")
-                        if isinstance(index, int) and isinstance(block, Mapping):
-                            blocks_by_index[index] = {
-                                "type": block.get("type"),
-                                "name": block.get("name"),
-                                "id": block.get("id"),
-                                "text": "",
-                                "partial_json": "",
-                            }
-                    elif event_type == "content_block_delta":
-                        index = event.get("index")
-                        delta = event.get("delta")
-                        if not isinstance(index, int) or not isinstance(delta, Mapping):
-                            continue
-                        state = blocks_by_index.setdefault(
-                            index,
-                            {"type": delta.get("type"), "text": "", "partial_json": ""},
+                    raise ProviderCancelledError("provider stream cancelled")
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                payload_text = line[5:].strip()
+                if not payload_text:
+                    continue
+                try:
+                    event = json.loads(payload_text)
+                except json.JSONDecodeError as exc:
+                    raise ProviderError("provider returned invalid stream JSON") from exc
+                if not isinstance(event, Mapping):
+                    continue
+                # A parsed provider event proves data was flowing; a later
+                # break is mid-generation (unknown), not pre-response
+                # (retryable transport failure).
+                saw_any_data = True
+                event_type = event.get("type")
+                if event_type == "message_start":
+                    message = event.get("message")
+                    if isinstance(message, Mapping):
+                        provider_message_id = (
+                            str(message["id"]) if message.get("id") is not None else None
                         )
-                        delta_type = delta.get("type")
-                        if delta_type == "text_delta":
-                            text = str(delta.get("text") or "")
-                            state["text"] += text
-                            if text:
-                                yield CanonicalStreamEvent(
-                                    kind="text_delta",
-                                    text=text,
-                                    provider_message_id=provider_message_id,
-                                )
-                        elif delta_type == "input_json_delta":
-                            state["partial_json"] += str(delta.get("partial_json") or "")
-                    elif event_type == "message_delta":
-                        delta = event.get("delta")
-                        if isinstance(delta, Mapping) and delta.get("stop_reason"):
-                            stop_reason = str(delta["stop_reason"])
-                        raw_usage = event.get("usage")
+                        raw_usage = message.get("usage")
                         if isinstance(raw_usage, Mapping):
-                            for key, value in raw_usage.items():
+                            for key in (
+                                "input_tokens",
+                                "output_tokens",
+                                "cache_creation_input_tokens",
+                                "cache_read_input_tokens",
+                            ):
+                                value = raw_usage.get(key)
                                 if isinstance(value, int):
                                     usage_map[key] = value
-                    elif event_type == "message_stop":
-                        saw_message_stop = True
-        except httpx.ConnectError as exc:
-            raise ProviderError("provider connection failed") from exc
-        except httpx.RequestError as exc:
-            raise ProviderUnknownOutcomeError("provider request outcome is unknown") from exc
+                elif event_type == "content_block_start":
+                    index = event.get("index")
+                    block = event.get("content_block")
+                    if isinstance(index, int) and isinstance(block, Mapping):
+                        blocks_by_index[index] = {
+                            "type": block.get("type"),
+                            "name": block.get("name"),
+                            "id": block.get("id"),
+                            "text": "",
+                            "partial_json": "",
+                        }
+                elif event_type == "content_block_delta":
+                    index = event.get("index")
+                    delta = event.get("delta")
+                    if not isinstance(index, int) or not isinstance(delta, Mapping):
+                        continue
+                    state = blocks_by_index.setdefault(
+                        index,
+                        {"type": delta.get("type"), "text": "", "partial_json": ""},
+                    )
+                    delta_type = delta.get("type")
+                    if delta_type == "text_delta":
+                        text = str(delta.get("text") or "")
+                        state["text"] += text
+                        if text:
+                            yield CanonicalStreamEvent(
+                                kind="text_delta",
+                                text=text,
+                                provider_message_id=provider_message_id,
+                            )
+                    elif delta_type == "input_json_delta":
+                        state["partial_json"] += str(delta.get("partial_json") or "")
+                elif event_type == "message_delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, Mapping) and delta.get("stop_reason"):
+                        stop_reason = str(delta["stop_reason"])
+                    raw_usage = event.get("usage")
+                    if isinstance(raw_usage, Mapping):
+                        for key, value in raw_usage.items():
+                            if isinstance(value, int):
+                                usage_map[key] = value
+                elif event_type == "message_stop":
+                    saw_message_stop = True
 
         if not saw_message_stop:
+            if not saw_any_data:
+                # EOF (or transport break) before a single provider
+                # event: retryable transport failure, not unknown outcome.
+                raise ProviderError(
+                    "provider stream connection failed before any stream data"
+                )
             raise ProviderUnknownOutcomeError(
                 "provider stream ended without a terminal message marker"
             )

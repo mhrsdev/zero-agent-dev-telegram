@@ -91,6 +91,12 @@ class Settings(BaseModel):
     openai_api_key: SecretStr | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
+    #: Ordered same-provider fallback models for ``send_request_with_fallback``
+    #: (Hermes parity, audit 2026-08-28). Comma-separated via
+    #: ``ZERO_OPENAI_FALLBACK_MODELS``; empty keeps the historical
+    #: single-model behavior. Matches the routing contract the setup
+    #: wizard writes to config.yaml (``routing.fallback_models``).
+    openai_fallback_models: tuple[str, ...] = ()
     openai_timeout_seconds: float = 60.0
     anthropic_api_key: SecretStr | None = None
     anthropic_base_url: str = "https://api.anthropic.com"
@@ -138,6 +144,13 @@ class Settings(BaseModel):
     polling_interval_seconds: float = 1.0
     combined_test_command: tuple[str, ...] = ()
     combined_test_timeout_seconds: int = 300
+    # Per-task evidence verification command (run by the agent runtime's
+    # evidence collector when a task's expected_evidence requires a test
+    # report/exit status). Empty = test evidence cannot be proven at the
+    # runtime level and requesting it fails closed with an explicit
+    # configuration hint. Must name a binary the worktree command policy
+    # allowlists, e.g. "python3 -m unittest discover -s tests -v".
+    evidence_test_command: tuple[str, ...] = ()
 
     # ------------------------------------------------------------------
     # Derived properties
@@ -319,6 +332,19 @@ class Settings(BaseModel):
         openai_model = raw.get("ZERO_OPENAI_MODEL", "gpt-4o-mini")
         if not openai_model.strip():
             raise ConfigError("ZERO_OPENAI_MODEL must not be empty.")
+        # Ordered same-provider fallback models (Hermes parity). Entries
+        # are trimmed and de-duplicated; the primary model itself is
+        # dropped from the list at composition time (it is always tried
+        # first) rather than being an error.
+        fallback_models_raw = str(raw.get("ZERO_OPENAI_FALLBACK_MODELS", "") or "")
+        openai_fallback_models = tuple(
+            dict.fromkeys(  # de-duplicate, preserve order
+                part.strip() for part in fallback_models_raw.split(",") if part.strip()
+            )
+        )
+        openai_fallback_models = tuple(
+            name for name in openai_fallback_models if name != openai_model.strip()
+        )
         timeout_raw = raw.get("ZERO_OPENAI_TIMEOUT_SECONDS", "60")
         try:
             openai_timeout_seconds = float(timeout_raw)
@@ -407,6 +433,11 @@ class Settings(BaseModel):
         combined_test_timeout_seconds = int(
             _read_positive_float(raw, "ZERO_COMBINED_TEST_TIMEOUT_SECONDS", 300.0)
         )
+        evidence_test_command = tuple(
+            item.strip()
+            for item in (raw.get("ZERO_EVIDENCE_TEST_COMMAND") or "").split()
+            if item.strip()
+        )
 
         telegram_mode = raw.get("ZERO_TELEGRAM_MODE", "bot_api").strip().lower()
         if telegram_mode not in {"bot_api", "user_session"}:
@@ -422,6 +453,7 @@ class Settings(BaseModel):
             openai_api_key=openai_api_key,
             openai_base_url=openai_base_url,
             openai_model=openai_model,
+            openai_fallback_models=openai_fallback_models,
             openai_timeout_seconds=openai_timeout_seconds,
             anthropic_api_key=anthropic_api_key,
             anthropic_base_url=anthropic_base_url,
@@ -445,6 +477,7 @@ class Settings(BaseModel):
             polling_interval_seconds=polling_interval_seconds,
             combined_test_command=combined_test_command,
             combined_test_timeout_seconds=combined_test_timeout_seconds,
+            evidence_test_command=evidence_test_command,
             pg_pool_min=pg_pool_min,
             pg_pool_max=pg_pool_max,
             telegram_mode=telegram_mode,  # type: ignore[arg-type]

@@ -95,7 +95,7 @@ WIZARD_STEPS: dict[str, WizardStep] = {
             "provider_add",
             "AI provider",
             fields=(
-                _f("id", "Provider id", required=True),
+                _f("id", "Provider id", required=True, default="openai-primary"),
                 _f(
                     "protocol",
                     "Protocol",
@@ -103,7 +103,12 @@ WIZARD_STEPS: dict[str, WizardStep] = {
                     options=("openai_compatible", "anthropic"),
                     default="openai_compatible",
                 ),
-                _f("base_url", "Base URL", required=True),
+                _f(
+                    "base_url",
+                    "Base URL",
+                    required=True,
+                    default="https://api.openai.com/v1",
+                ),
                 _f("api_key", "API key", kind="password", required=True),
             ),
         ),

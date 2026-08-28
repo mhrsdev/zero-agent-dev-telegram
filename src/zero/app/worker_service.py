@@ -27,6 +27,7 @@ per scheduled attempt ID.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import defaultdict, deque
 from datetime import UTC, datetime
@@ -77,6 +78,8 @@ from zero.persistence.repositories.execution_repository import (
     ExecutionRepository,
 )
 from zero.persistence.repositories.plan_repository import PlanRepository
+
+logger = logging.getLogger(__name__)
 
 
 def _now_utc_iso() -> str:
@@ -199,6 +202,7 @@ class WorkerService:
         *,
         metrics: Any | None = None,
         task_max_attempts: int = 0,
+        agent_type_repo: Any | None = None,
     ) -> None:
         self._execution_repo = execution_repo
         self._plan_repo = plan_repo
@@ -206,6 +210,11 @@ class WorkerService:
         self._artifact_repo = artifact_repo
         self._authz = authorization_service
         self._metrics = metrics
+        # Optional: when wired (production composition does), restart
+        # recovery also releases agent-type instance leases held by
+        # interrupted tasks; without it, leaked "running" instances
+        # permanently exhaust the type's concurrency budget.
+        self._agent_type_repo = agent_type_repo
         # Total attempts allowed per task (first run + retries). When a
         # failed task still holds retry budget, the execution pauses
         # ("awaiting automatic retry") instead of terminating as failed,
@@ -622,11 +631,6 @@ class WorkerService:
             for expected in task.expected_evidence
             if expected not in _EVIDENCE_KINDS
         }
-        expected_provenance = {
-            "execution_id": task.execution_id.value,
-            "task_id": task.id.value,
-            "attempt_id": attempt_id.value,
-        }
         for artifact_id in unique_ids:
             try:
                 artifact = self._artifact_repo.get_artifact(task.project_id, artifact_id)
@@ -634,23 +638,66 @@ class WorkerService:
                 raise MissingEvidenceError(
                     f"evidence artifact {artifact_id.value} is not in the task project"
                 ) from exc
-            try:
-                provenance = json.loads(artifact.provenance or "")
-            except (TypeError, json.JSONDecodeError) as exc:
-                raise MissingEvidenceError(
-                    f"evidence artifact {artifact_id.value} has invalid provenance"
-                ) from exc
-            if not isinstance(provenance, dict) or any(
-                provenance.get(key) != value for key, value in expected_provenance.items()
+
+            def _parse_provenance(text: str | None):
+                try:
+                    loaded = json.loads(text or "")
+                except (TypeError, json.JSONDecodeError):
+                    return None
+                return loaded if isinstance(loaded, dict) else None
+
+            # Bug fix (real run, 2026-08-28): artifact content deduplication
+            # may return an artifact row whose `provenance` COLUMN carries
+            # the FIRST storer's identity (e.g. an earlier attempt that
+            # produced a byte-identical diff). The provenance contract is
+            # per-STORE, not per-content: every store_artifact call appends
+            # an independent artifact_provenance row ("Deduplication does
+            # not merge provenance"). The validator therefore must check
+            # whether ANY provenance row matches this task/attempt, not
+            # just the stale first-store column.
+            expected_provenance = {
+                "execution_id": task.execution_id.value,
+                "task_id": task.id.value,
+                "attempt_id": attempt_id.value,
+            }
+            matching_rows: list[dict] = []
+            column_provenance = _parse_provenance(artifact.provenance)
+            if column_provenance is not None and all(
+                column_provenance.get(key) == value
+                for key, value in expected_provenance.items()
             ):
+                matching_rows.append(column_provenance)
+            try:
+                rows = self._artifact_repo.list_provenance(
+                    task.project_id, artifact_id
+                )
+            except Exception as prov_exc:  # noqa: BLE001 - fail closed below
+                rows = []
+                logger.debug(
+                    "provenance listing failed for artifact %s: %s",
+                    artifact_id.value,
+                    type(prov_exc).__name__,
+                )
+            for row in rows:
+                row_provenance = _parse_provenance(getattr(row, "provenance", None))
+                if row_provenance is None:
+                    continue
+                if all(
+                    row_provenance.get(key) == value
+                    for key, value in expected_provenance.items()
+                ):
+                    matching_rows.append(row_provenance)
+            if not matching_rows:
                 raise MissingEvidenceError(
                     f"evidence artifact {artifact_id.value} does not belong to "
                     f"task {task.id.value} and attempt {attempt_id.value}"
                 )
-            labels = provenance.get("evidence_labels", ())
-            if not isinstance(labels, (list, tuple, set)):
-                labels = ()
-            label_set = {str(label) for label in labels}
+            labels: list[str] = []
+            for row_provenance in matching_rows:
+                row_labels = row_provenance.get("evidence_labels", ())
+                if isinstance(row_labels, (list, tuple, set)):
+                    labels.extend(str(item) for item in row_labels)
+            label_set = set(labels)
             # Model-produced transcript artifacts are excluded from legacy
             # freeform matching: a model could otherwise satisfy any
             # human-acceptance label by echoing its text into a response.
@@ -1105,8 +1152,13 @@ class WorkerService:
         if all_completed:
             execution = self._execution_repo.get_execution(execution_id)
             if is_valid_execution_transition(execution.state, "completed"):
+                # Blocker hygiene (real-run fix): the r7 completion was
+                # delivered as "finished with state: completed" while
+                # still carrying the stale pause-time blocker "task
+                # failed or blocked" — misleading to humans reading the
+                # delivery. A completed execution has no open blocker.
                 self._execution_repo.update_execution_state(
-                    execution_id, "completed", commit=commit
+                    execution_id, "completed", blocker_reason="", commit=commit
                 )
                 self._discard_cancellation_event(execution_id)
             return
@@ -1306,6 +1358,75 @@ class WorkerService:
             )
         return self._execution_repo.get_task(task_id, project_id=project_id)
 
+    def reconcile_blocked_task(
+        self,
+        *,
+        execution_id: ExecutionId,
+        project_id: ProjectId | None = None,
+        task_id: TaskId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> Task:
+        """Operator reconciliation for a blocked task (``blocked -> ready``).
+
+        Real-run fix: ``mark_provider_outcome_unknown`` blocks a task and
+        pauses the execution demanding "reconciliation required", but no
+        service method performed that reconciliation — the task state
+        machine explicitly permits ``blocked -> ready`` ("ready: human
+        unblocked") yet the dead-end had no operator path. Typical
+        reconciliation: the operator inspected the provider request log,
+        confirmed the ambiguous request produced no consumed result, and
+        unblocks the task for a fresh attempt. Audited like every other
+        transition; readiness is recomputed so downstream tasks follow
+        the graph normally.
+        """
+        project_id = self._require_project_scope(
+            project_id=project_id,
+            actor_id=actor_id,
+            permission="execution.start",
+            source=source,
+        )
+        execution = self._execution_repo.get_execution(execution_id, project_id=project_id)
+        task = self._execution_repo.get_task(task_id, project_id=project_id)
+        if task.execution_id != execution_id or task.project_id != execution.project_id:
+            raise TaskNotFoundError(f"Task {task_id} does not belong to execution {execution_id}")
+        if is_terminal_task_state(task.state):
+            raise InvalidTaskTransitionError(
+                f"Task {task_id} is terminal ({task.state!r}); cannot reconcile"
+            )
+        if task.state != "blocked":
+            raise InvalidTaskTransitionError(
+                f"Task {task_id} is in state {task.state!r}, cannot reconcile"
+            )
+        with self._execution_repo._database.transaction():
+            self._execution_repo.update_task_state(
+                task.id,
+                "ready",
+                blocker_reason=None,
+                commit=False,
+            )
+            self._recompute_readiness(execution_id, commit=False)
+            self._snapshot(execution_id, "task_reconciled", commit=False)
+            self._audit_repo.insert(
+                AuditEvent(
+                    id=AuditEventId(generate_audit_event_id()),
+                    project_id=execution.project_id,
+                    actor_id=actor_id,
+                    source=source,
+                    operation="task.reconcile",
+                    target_type="task",
+                    target_id=task.id.value,
+                    result="success",
+                    redacted_summary=f"Task {task.id.value} reconciled by operator; requeued",
+                    correlation_id=execution_id.value,
+                    created_at=_now_utc_iso(),
+                ),
+                commit=False,
+            )
+        if self._metrics is not None:
+            self._metrics.increment("task_transitions_total", result="success", source=source)
+        return self._execution_repo.get_task(task_id, project_id=project_id)
+
     def schedule_task_retry(
         self,
         *,
@@ -1500,6 +1621,21 @@ class WorkerService:
                     latest = running_attempts[-1]
                     self._execution_repo.update_attempt_state(latest.id, "unknown", commit=False)
                 self._execution_repo.update_task_state(task.id, "ready", commit=False)
+                # Release agent-type instance leases the dead worker held
+                # (real-run fix): otherwise the leaked "running" instances
+                # keep consuming the type's max_concurrent_instances
+                # budget and every later claim fails with
+                # ConcurrencyLimitExceededError. Best-effort: recovery of
+                # the task graph must not depend on the optional repo.
+                if self._agent_type_repo is not None:
+                    try:
+                        self._agent_type_repo.finish_running_instances_for_task(
+                            task.id, "cancelled", commit=False
+                        )
+                    except Exception:  # noqa: BLE001 - bookkeeping is advisory
+                        logger.debug(
+                            "instance lease release failed for task %s", task.id.value
+                        )
             # Recompute readiness for pending tasks and reconcile the
             # execution state from the durable task graph. Ready work is
             # schedulable and therefore resumes a paused execution; only a

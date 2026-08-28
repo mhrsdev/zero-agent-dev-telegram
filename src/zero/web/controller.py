@@ -632,6 +632,19 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
                 }
                 for t in tasks_raw
             ]
+            # Real-run fix: show the plan goal so the page names WHAT the
+            # execution is doing instead of only opaque ids. Advisory.
+            plan_goal = None
+            try:
+                revision = services.plans.get_revision(
+                    execution.plan_revision_id,
+                    project_id=ProjectId(project_id),
+                    actor_id=actor,
+                    source="web",
+                )
+                plan_goal = revision.content.objective
+            except Exception:  # noqa: BLE001 - enrichment is advisory
+                plan_goal = None
         except (ExecutionError, ProjectNotFoundError, ValueError):
             raise HTTPException(status_code=404, detail="request failed")
         return templates.TemplateResponse(
@@ -647,6 +660,7 @@ def create_web_router(services: Services, settings: Settings) -> APIRouter:
                 execution={
                     "id": execution.id.value,
                     "plan_id": execution.plan_id.value,
+                    "goal": plan_goal,
                     "state": execution.state,
                     "blocker_reason": execution.blocker_reason,
                     "created_at": execution.created_at,

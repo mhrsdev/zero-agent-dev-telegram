@@ -532,7 +532,14 @@ def test_runtime_failure_breaker_steers_then_aborts_to_summary(services) -> None
     )
     assert result.task.state == "completed"  # graceful summary, not a kill
     full_context = json.dumps([m for m in captured[-1].messages], default=str)
-    assert "has failed 3 times with an identical error" in full_context
+    # Hermes-parity warn: the steering rides ON the failing tool result
+    # as a bracketed suffix (never a bare user message between tool
+    # results — that breaks tool-call/result pairing on strict wires).
+    assert "identical failure; count=3" in full_context
+    warn_rows = [m for m in captured[-1].messages if "identical failure" in str(m)]
+    assert warn_rows, "warn suffix missing from the loop context"
+    assert all(m.role == "tool" for m in warn_rows)
+    assert all(m.tool_call_id for m in warn_rows)
 
 
 # ----------------------------------------------------------------------
