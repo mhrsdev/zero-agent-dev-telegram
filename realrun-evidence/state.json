@@ -1094,7 +1094,7 @@
         },
         {
           "kind": "decision",
-          "content": "Test suite consolidated per sub-agent review: duplicate cases removed, 30 → 23 tests, coverage judged still adequate."
+          "content": "Test suite consolidated per sub-agent review: duplicate cases removed, 30 \u2192 23 tests, coverage judged still adequate."
         },
         {
           "kind": "decision",
@@ -1566,7 +1566,7 @@
   },
   "s6_toolcall_proof": {
     "elapsed_s": 3.5,
-    "reply": "7 words (39 characters, longest word 8 letters — \"verified\").",
+    "reply": "7 words (39 characters, longest word 8 letters \u2014 \"verified\").",
     "tool_calls": [
       {
         "tool": "wordcount",
@@ -1584,5 +1584,48 @@
   },
   "textcase_r21_casual_event": "realrun-479eb1b92b48",
   "textcase_r21_casual_checked": "ingested as conversation event evt_9al40hnpwq2a5d8745dml95o; no actionable plan proposed",
-  "textcase_r21_handoff_id": "ph_1sdxcrnpqirnrkqlbn2ozbn0"
+  "textcase_r21_handoff_id": "ph_1sdxcrnpqirnrkqlbn2ozbn0",
+  "s7_console_session_regressions": {
+    "scenario": "s7_console_session_regressions",
+    "timestamp_utc": "2026-08-28T23:55:47Z",
+    "results": [
+      {
+        "scenario": "A_bare_zero_develop_help",
+        "ok": true,
+        "detail": "rc=2, help printed=True, argparse_error=False"
+      },
+      {
+        "scenario": "B_serve_busy_port",
+        "ok": true,
+        "detail": "rc=1, friendly=True, traceback=False"
+      },
+      {
+        "scenario": "C_serve_managed_running",
+        "ok": true,
+        "detail": "rc=1, message=True"
+      },
+      {
+        "scenario": "D_start_on_occupied_port",
+        "ok": true,
+        "detail": "rc=1, refusal=True, no_doomed_spawn=True"
+      },
+      {
+        "scenario": "F_stop_honesty_and_start_guard",
+        "ok": true,
+        "detail": "stop_rc=0, start_rc=1"
+      },
+      {
+        "scenario": "E_full_wizard_replay_real_send",
+        "ok": true,
+        "detail": "rc=0, deadloop_recovered=True, telegram_message_id=296, completed=True"
+      },
+      {
+        "scenario": "E2_committed_config",
+        "ok": true,
+        "detail": "config_written=True"
+      }
+    ],
+    "telegram_test_message_id": "296",
+    "wizard_home": "/home/z/my-project/scripts/realrun/s7-home-e"
+  }
 }

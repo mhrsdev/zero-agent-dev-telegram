@@ -1,0 +1,102 @@
+Zero Dev Telegram — setup wizard
+(answers are saved · 'b'=back · 's'=skip optional · Ctrl+C to pause/resume)
+
+────────────────────────────────────────────────────────────────
+Step 1/18 · Welcome & installation summary
+  config home : /home/z/my-project/scripts/realrun/s7-home-e
+  version     : 0.1.0
+  Press Enter to continue ('b'=back, 's'=skip):   ok -> environment
+
+────────────────────────────────────────────────────────────────
+Step 2/18 · Server & environment check
+  Environment (options: development, production; default: development):   ok -> version
+
+────────────────────────────────────────────────────────────────
+Step 3/18 · Version channel
+  Channel (options: stable, beta; default: stable):   ok -> telegram_mode
+
+────────────────────────────────────────────────────────────────
+Step 4/18 · Telegram connection mode
+  Mode (options: bot_api; default: bot_api): /home/z/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/lib/python3.12/getpass.py:91: GetPassWarning: Can not control echo on the terminal.
+  passwd = fallback_getpass(prompt, stream)
+Warning: Password input may be echoed.
+  Bot token (from @BotFather) (required): 
+  ok -> telegram_credentials
+
+────────────────────────────────────────────────────────────────
+Step 5/18 · Telegram bot token
+  ok -> provider_add
+
+────────────────────────────────────────────────────────────────
+Step 6/18 · AI provider
+  Provider id (default: openai-primary; required):   Protocol (options: openai_compatible, anthropic; default: openai_compatible):   Base URL (default: https://api.openai.com/v1; required): Warning: Password input may be echoed.
+  API key (required): 
+  ok -> provider_test
+
+────────────────────────────────────────────────────────────────
+Step 7/18 · Provider test completion
+  (optional step)
+  Model to test (default: claude-opus-4-8-thinking; required):   ok -> model_assign
+
+────────────────────────────────────────────────────────────────
+Step 8/18 · Model routing
+  Primary model (default: claude-opus-4-8-thinking; required):   Fallback models (comma separated):   ok -> access_mode
+
+────────────────────────────────────────────────────────────────
+Step 9/18 · Access policy
+  Who can use the bot? (options: owner_only, users, groups, users_and_groups, public; default: owner_only):   ok -> groups
+
+────────────────────────────────────────────────────────────────
+Step 10/18 · Groups
+  (Enter at chat id skips — add later via: zero telegram groups add)
+  Group chat id:   Group title: Warning: Password input may be echoed.
+  Bot token (for discovery) (Enter=keep previous): 
+  ok -> agents
+
+────────────────────────────────────────────────────────────────
+Step 11/18 · Agents
+  Default agent (default: main_worker):   ok -> memory_storage
+
+────────────────────────────────────────────────────────────────
+Step 12/18 · Memory & storage
+  (optional step)
+  Press Enter to continue ('b'=back, 's'=skip):   ok -> websearch
+
+────────────────────────────────────────────────────────────────
+Step 13/18 · Web search (optional)
+  (optional step)
+  Enable web search (y/n):   Search provider id (must match a configured AI provider id): Warning: Password input may be echoed.
+  Search API key: 
+  ! websearch.provider_id required when enabled
+  ! websearch api_key required when enabled
+  [Enter=retry same answers · r=re-enter · b=back · s=skip]:   ! websearch.provider_id required when enabled
+  ! websearch api_key required when enabled
+  same answers failed twice — re-asking this step's fields
+  Enable web search (y/n; default: True):   Search provider id (must match a configured AI provider id): Warning: Password input may be echoed.
+  Search API key: 
+  ok -> privacy
+
+────────────────────────────────────────────────────────────────
+Step 14/18 · Privacy & telemetry
+  Enable telemetry (y/n):   ok -> updates
+
+────────────────────────────────────────────────────────────────
+Step 15/18 · Update policy
+  Channel (options: stable, beta; default: stable):   Auto-apply updates (y/n):   ok -> backup_policy
+
+────────────────────────────────────────────────────────────────
+Step 16/18 · Backup policy
+  Schedule (options: daily, hourly, off; default: daily):   Retention count (default: 7):   ok -> final_validation
+
+────────────────────────────────────────────────────────────────
+Step 17/18 · Final validation
+  Press Enter to continue ('b'=back, 's'=skip):   ok -> test_message
+
+────────────────────────────────────────────────────────────────
+Step 18/18 · Send test message
+  (optional step)
+  Chat id for the test message:   ~ test message delivered (message_id 296)
+  ok — setup complete
+
+────────────────────────────────────────────────────────────────
+configuration written: /home/z/my-project/scripts/realrun/s7-home-e/config.yaml

@@ -13,6 +13,66 @@ real-run failure.
 
 ### Fixed
 
+- **The setup wizard's final "Send test message" step never sent anything**
+  (reported console session, Windows): it collected a chat id, stored it in
+  the draft, and moved on — nothing was delivered, yet the step read as
+  verified; the CLI even printed the self-referencing transition
+  ``ok -> test_message`` as the last line. A provided chat id now performs
+  the real Bot-API ``sendMessage`` round-trip (new hardened probe
+  ``telegram_send_message`` reporting the Telegram message id, with
+  Telegram's own error description surfaced on failure), an empty chat id
+  keeps the optional-step skip semantics, a resumed draft without a
+  resolvable bot token soft-passes with a warning, and the wizard now
+  prints "ok — setup complete" instead of the self-transition (same fix
+  for the skipped-last-step path).
+
+- **The wizard's "Enter=retry same answers" was a dead loop for
+  deterministic validation errors** (same session: websearch enabled with
+  the required provider id/key left empty — Enter failed identically
+  forever). One identical failure now automatically re-asks the step's
+  fields prefilled with the previous answers, while transient probe/network
+  errors keep their one-keypress retry.
+
+- **``zero-develop serve`` died on an ugly bind traceback when the service
+  was already running** (WinError 10048 / EADDRINUSE in the reported
+  session) and still exited 0. It now pre-checks the managed pid file and
+  the port: a running managed service or a busy port prints an actionable
+  refusal ("stop it first ('zero stop') or choose another port:
+  zero-develop serve --port 8001") and exits 1.
+
+- **``zero start`` spawned blindly**: no already-running guard (a second
+  start overwrote ``zero.pid`` with a process doomed to die on the bind
+  error) and no post-spawn verification — success was reported before the
+  process had proven it survived startup. It now refuses when the service
+  is already running, refuses when port 8000 is already occupied (checking
+  whether the occupant is a healthy Zero service outside this pid file),
+  and after spawning verifies liveness via ``Popen.poll()`` (the previous
+  signal-0 probe never noticed a zombie child) plus a /healthz wait guarded
+  against crediting a foreign service, with the log tail printed if the
+  child dies. ``zero stop`` also stopped claiming "stopped" when nothing
+  was running.
+
+- **The dev-key banner lied on every start**: ``zero-develop serve`` printed
+  "generated a development encryption key" even when an existing key was
+  merely reloaded (operators reasonably read that as rotation; the key is
+  never rotated) — the banner now distinguishes generated vs reused, and
+  the .env persistence is idempotent instead of rewriting the file each
+  run. The stale guidance ("run 'zero setup'") shown to operators who had
+  already configured the installation now points at ``zero start``.
+
+- **``zero-develop`` bare invocation printed argparse's terse "the
+  following arguments are required: command"** instead of the full help
+  (``zero`` already printed help) — both CLIs now share the same contract.
+
+- **The websearch step accepted a provider id that could never validate**:
+  ``ZeroConfig`` requires ``websearch.provider_id`` to reference a
+  configured provider, but the wizard checked it nowhere, so an honest
+  answer only exploded at commit — after all 18 steps were answered. The
+  step now validates the id against the providers that will exist in the
+  committed config (draft + existing), lists the available ids, explains
+  the constraint in the prompt label, and ``model_assign`` warns when a
+  fallback model equals the primary (no resilience).
+
 - **Tool declarations fought the model instead of steering it** (real run,
   5-minute window 2026-08-28): ``capture_diff`` declared a zero-property
   object schema with ``additionalProperties=False``, so a frontier model

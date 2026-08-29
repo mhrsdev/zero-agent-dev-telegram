@@ -33,7 +33,10 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Zero Develop multi-agent control plane",
     )
     parser.add_argument("--version", action="version", version=f"zero-develop {__version__}")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    # Not required: a bare `zero-develop` must print the full help (same
+    # contract as `zero`), not argparse's terse "error: the following
+    # arguments are required: command".
+    subparsers = parser.add_subparsers(dest="command")
 
     serve = subparsers.add_parser("serve", help="run the ASGI app with managed workers")
     serve.add_argument("--host", default="127.0.0.1")
@@ -106,24 +109,32 @@ def _ensure_development_secret_key(settings: Settings, env_file: str | None) -> 
     key_file = home / "secret.key"
     try:
         home.mkdir(parents=True, exist_ok=True)
-        if key_file.exists():
+        reused = key_file.exists()
+        if reused:
             key = key_file.read_text(encoding="utf-8").strip()
-        else:
+            reused = bool(key)
+        if not reused:
             key = _secrets.token_urlsafe(48)
             key_file.write_text(key, encoding="utf-8")
             os.chmod(key_file, 0o600)
-        # Persist for future processes via the supported .env path.
+        # Persist for future processes via the supported .env path — but
+        # only when the exact key line is not already there (rewriting
+        # the file on every run was needless I/O and made the banner
+        # claim a fresh key was "generated" each start).
         env_path = Path(env_file) if env_file else home / ".env"
+        key_line = f"ZERO_SECRET_KEY={key}"
         lines: list[str] = []
         if env_path.is_file():
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+        if key_line not in lines:
             lines = [
                 line
-                for line in env_path.read_text(encoding="utf-8").splitlines()
+                for line in lines
                 if not line.startswith("ZERO_SECRET_KEY=")
             ]
-        lines.append(f"ZERO_SECRET_KEY={key}")
-        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        os.chmod(env_path, 0o600)
+            lines.append(key_line)
+            env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            os.chmod(env_path, 0o600)
     except OSError as exc:
         print(
             f"[zero] could not persist a development secret key ({exc}); "
@@ -133,12 +144,74 @@ def _ensure_development_secret_key(settings: Settings, env_file: str | None) -> 
         )
         return settings
     os.environ["ZERO_SECRET_KEY"] = key
+    # Honesty fix: the old message said "generated" on EVERY serve run
+    # even when an existing key was merely reloaded — operators reasonably
+    # read that as the key being rotated (it is not).
+    verb = "reusing the existing" if reused else "generated a"
     print(
-        f"[zero] generated a development encryption key at {key_file} "
+        f"[zero] {verb} development encryption key at {key_file} "
         "(local-only; run 'zero setup' for production).",
         file=sys.stderr,
     )
     return Settings.load(env_file=env_file, zero_env_fallback="development")
+
+
+def _managed_service_pid() -> int | None:
+    """PID of the managed service ($ZERO_HOME/zero.pid) when it is alive."""
+    home = Path(os.environ.get("ZERO_HOME", str(Path.home() / ".zero")))
+    pid_file = home / "zero.pid"
+    if not pid_file.is_file():
+        return None
+    try:
+        pid = int(pid_file.read_text().strip())
+    except ValueError:
+        return None
+    from zero.manage.cli import _pid_alive
+
+    return pid if _pid_alive(pid) else None
+
+
+def _port_available(host: str, port: int) -> bool:
+    """True when a server could bind (host, port) right now."""
+    import socket
+
+    # Something LISTENING there accepts the connection: definitively busy.
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return False
+    except OSError:
+        pass
+    # Not accepting — try a real bind (no SO_REUSEADDR, so a foreign
+    # listener or a bound-but-paused socket still reports busy).
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, port))
+    except OSError:
+        return False
+    return True
+
+
+def _dev_serve_banner(home: Path) -> list[str]:
+    """The two guidance lines printed when ZERO_ENV is not set.
+
+    Bug fix: the second line always said "run 'zero setup'" even when a
+    configured installation already existed — precisely the operator
+    state in the reported session (setup done, then confused about why
+    `zero-develop serve` still assumed development).
+    """
+    first = "[zero] ZERO_ENV is not set; assuming 'development' (local SQLite at ./zero_develop.db)."
+    if (home / "config.yaml").is_file():
+        second = (
+            f"[zero] A configured installation exists at {home / 'config.yaml'} — "
+            "run 'zero start' for that service, or export ZERO_ENV=production "
+            "with its required secrets."
+        )
+    else:
+        second = (
+            "[zero] For production run 'zero setup' or export ZERO_ENV=production "
+            "with its required secrets."
+        )
+    return [first, second]
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -147,6 +220,35 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     from zero.app.api import create_app
     from zero.app.observability_service import configure_logging
 
+    # Bug fix (WinError 10048 / EADDRINUSE): serve used to walk into
+    # uvicorn and die on an ugly bind traceback whenever the managed
+    # service (or anything else) already held the port — and the process
+    # still exited 0. Detect both cases first and fail with guidance.
+    managed_pid = _managed_service_pid()
+    if managed_pid is not None:
+        print(
+            f"[zero] the Zero service is already running (pid {managed_pid}, "
+            "from 'zero start') — a foreground server cannot bind the same port.",
+            file=sys.stderr,
+        )
+        print(
+            "[zero] stop it first ('zero stop') or choose another port: "
+            "zero-develop serve --port 8001",
+            file=sys.stderr,
+        )
+        return 1
+    if not _port_available(args.host, args.port):
+        print(
+            f"[zero] {args.host}:{args.port} is already in use by another process.",
+            file=sys.stderr,
+        )
+        print(
+            "[zero] stop that process or choose another port: "
+            "zero-develop serve --port 8001",
+            file=sys.stderr,
+        )
+        return 1
+
     # Bare-start usability (installation audit R2): `zero-develop serve`
     # with no configuration starts a local development server instead of
     # failing closed without guidance. Production keeps requiring an
@@ -154,16 +256,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     # safe development defaults may be assumed automatically.
     dev_default = not ("ZERO_ENV" in os.environ or _env_file_declares_zero_env(args.env_file))
     if dev_default:
-        print(
-            "[zero] ZERO_ENV is not set; assuming 'development' "
-            "(local SQLite at ./zero_develop.db).",
-            file=sys.stderr,
-        )
-        print(
-            "[zero] For production run 'zero setup' or export ZERO_ENV=production "
-            "with its required secrets.",
-            file=sys.stderr,
-        )
+        for line in _dev_serve_banner(Path(os.environ.get("ZERO_HOME", str(Path.home() / ".zero")))):
+            print(line, file=sys.stderr)
         settings = Settings.load(
             env_file=args.env_file,
             zero_env_fallback="development",
@@ -238,6 +332,11 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if not getattr(args, "command", None):
+        # Mirror `zero`: bare invocation prints the full help (exit 2 =
+        # usage, never a traceback).
+        parser.print_help()
+        return 2
     handlers = {
         "serve": _cmd_serve,
         "migrate": _cmd_migrate,

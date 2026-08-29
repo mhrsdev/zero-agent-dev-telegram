@@ -168,7 +168,10 @@ WIZARD_STEPS: dict[str, WizardStep] = {
             "Web search (optional)",
             fields=(
                 _f("enabled", "Enable web search", kind="bool"),
-                _f("provider_id", "Search provider id"),
+                # ZeroConfig requires websearch.provider_id to reference a
+                # configured provider; say so up front (validation also
+                # enforces it with the available ids).
+                _f("provider_id", "Search provider id (must match a configured AI provider id)"),
                 _f("api_key", "Search API key", kind="password"),
             ),
             optional=True,

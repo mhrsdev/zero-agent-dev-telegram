@@ -177,6 +177,52 @@ def openai_completion_probe(
     return {"ok": True}
 
 
+def telegram_send_message(
+    bot_token: str, chat_id: str, text: str, *, timeout: float = 12.0
+) -> dict[str, object]:
+    """Deliver one message via the Bot API (setup 'send test message' step).
+
+    Bug fix context: the final wizard step only COLLECTED a chat id and
+    never sent anything, so operators believed delivery worked when
+    nothing had been verified. This probe performs the real
+    ``sendMessage`` round-trip and reports the Telegram message id.
+    """
+    token = _clean_secret(bot_token)
+    if token is None:
+        return _secret_error("bot token")
+    url = f"{_telegram_base()}/bot{token}/sendMessage"
+    try:
+        resp = httpx.post(url, json={"chat_id": chat_id, "text": text}, timeout=timeout)
+    except httpx.RequestError as exc:
+        return {"ok": False, "error": f"unreachable: {type(exc).__name__}"}
+    except Exception as exc:  # noqa: BLE001 - never crash the wizard
+        return {"ok": False, "error": f"probe failed: {type(exc).__name__}"}
+    if resp.status_code != 200:
+        # Telegram reports bad chat ids as http 400 + a description; the
+        # description is the actionable part ("chat not found", "bot is
+        # not a member ..."), so surface it instead of a bare status.
+        detail = ""
+        try:
+            detail = str(resp.json().get("description") or "")
+        except ValueError:
+            pass
+        return {
+            "ok": False,
+            "error": f"http {resp.status_code}{(' — ' + detail) if detail else ''}",
+        }
+    try:
+        data = resp.json()
+        result = data.get("result") or {}
+    except ValueError:
+        return {"ok": False, "error": "non-JSON response body"}
+    if not data.get("ok"):
+        return {"ok": False, "error": str(data.get("description") or "sendMessage rejected")}
+    return {
+        "ok": True,
+        "message_id": result.get("message_id") if isinstance(result, dict) else None,
+    }
+
+
 def telegram_recent_chats(bot_token: str, *, timeout: float = 12.0) -> dict[str, object]:
     """Best-effort group discovery from one getUpdates poll (offset skip)."""
     token = _clean_secret(bot_token)

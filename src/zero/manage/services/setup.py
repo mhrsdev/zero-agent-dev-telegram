@@ -183,6 +183,20 @@ class SetupService:
             primary = (value.get("primary_model") or "").strip()
             if not primary:
                 errors.append("primary_model required")
+            # Bug fix (silent footgun): the wizard accepted a fallback
+            # identical to the primary (e.g. both "claude-opus-5") with no
+            # complaint — such a "fallback" retries the exact same capacity
+            # and adds no resilience. Surface a non-blocking warning.
+            raw_csv = value.get("fallback_models_csv")
+            if raw_csv is None and isinstance(value.get("fallback_models"), (list, tuple)):
+                fallbacks = [str(f).strip() for f in value["fallback_models"] if str(f).strip()]
+            else:
+                fallbacks = [f.strip() for f in str(raw_csv or "").split(",") if f.strip()]
+            if primary and primary in fallbacks:
+                warnings.append(
+                    f"fallback model '{primary}' equals the primary model — "
+                    "a fallback adds no resilience; consider a different model"
+                )
         elif step == "access_mode":
             mode = value.get("mode")
             if mode not in {"owner_only", "users", "groups", "users_and_groups", "public"}:
@@ -202,6 +216,25 @@ class SetupService:
             if value.get("enabled"):
                 if not value.get("provider_id"):
                     errors.append("websearch.provider_id required when enabled")
+                else:
+                    # Commit-trap fix: ZeroConfig rejects a websearch
+                    # provider_id that references no provider — that used
+                    # to surface only at commit(), AFTER all 18 steps were
+                    # answered (rc 2, whole session wasted). Validate here,
+                    # with the ids that will exist in the committed config.
+                    known = self._known_provider_ids()
+                    pid = str(value["provider_id"]).strip()
+                    if not known:
+                        errors.append(
+                            "no provider is configured yet — websearch reuses a "
+                            "configured provider; answer the Provider step first "
+                            "(or skip websearch)"
+                        )
+                    elif pid not in known:
+                        errors.append(
+                            f"websearch.provider_id {pid!r} does not match a configured "
+                            f"provider (available: {', '.join(sorted(known))})"
+                        )
                 key = (value.get("api_key") or "").strip()
                 if not key:
                     errors.append("websearch api_key required when enabled")
@@ -224,13 +257,92 @@ class SetupService:
             "updates",
             "memory_storage",
             "agents",
-            "test_message",
             "welcome",
         }:
             pass
+        elif step == "test_message":
+            # Bug fix: this step only COLLECTED a chat id — the message was
+            # never sent, so "Send test message" verified nothing (the CLI
+            # even printed the self-referencing transition "ok ->
+            # test_message"). An empty chat id keeps the old skip
+            # semantics (optional step); a provided chat id now performs
+            # the real sendMessage round-trip.
+            chat = str(value.get("chat_id") or "").strip()
+            if chat:
+                token = self._resolve_bot_token()
+                if not token:
+                    warnings.append(
+                        "bot token not available in this session (resumed draft) — "
+                        "test message not sent; verify delivery via the running bot"
+                    )
+                else:
+                    r = probes.telegram_send_message(
+                        token, chat, "Zero setup complete — this is a test message."
+                    )
+                    if r.get("ok"):
+                        value["sent_message_id"] = r.get("message_id")
+                        # Visible confirmation — the CLI prints warnings but
+                        # stays silent on a plain ok, and this step's whole
+                        # point is proof of delivery.
+                        warnings.append(f"test message delivered (message_id {r.get('message_id')})")
+                    else:
+                        errors.append(f"test message failed: {r.get('error')}")
         else:
             errors.append(f"unknown step {step}")
         return StepResult(not errors, errors, warnings or None)
+
+    def _resolve_bot_token(self) -> str | None:
+        """Best-effort bot token for the test-message step.
+
+        Prefers the raw token captured earlier in THIS wizard session
+        (the draft stores it under ``telegram_credentials._raw``); for a
+        resumed draft only the masked value remains, so fall back to the
+        engine's encrypted store when an engine is wired. Any failure
+        degrades to None — the step then soft-passes with a warning.
+        """
+        data = self._draft()["data"]
+        tc = data.get("telegram_credentials", {}) or {}
+        raw = probes.clean_secret((tc.get("_raw") or {}).get("token") or "")
+        if raw:
+            return raw
+        try:
+            ref = self.cfg.load().telegram.bot_token_ref
+            if not ref:
+                return None
+            engine = self.engine_factory() if self.engine_factory else None
+            services = getattr(engine, "services", engine)
+            resolver = getattr(getattr(services, "secrets", None), "resolve_value", None)
+            if resolver is None:
+                return None
+            project = getattr(services, "management_project", None)
+            if project is None:
+                return None
+            return probes.clean_secret(
+                resolver(
+                    project_id=project.id,
+                    secret_id=ref,
+                    actor_id=project.owner_user_id,
+                )
+            )
+        except Exception:  # noqa: BLE001 - best-effort only, never crash
+            return None
+
+    def _known_provider_ids(self) -> set[str]:
+        """Provider ids that will exist in the committed config: the draft's
+        provider_add (this session) plus any already-configured providers."""
+        ids: set[str] = set()
+        data = self._draft()["data"]
+        pa_id = (data.get("provider_add", {}) or {}).get("id")
+        if pa_id:
+            ids.add(str(pa_id).strip())
+        try:
+            for p in self.cfg.load().providers:
+                ids.add(p.id)
+        except ConfigError:
+            # No config yet (fresh wizard run) — the draft's provider_add
+            # is the only source at this point.
+            return ids
+        return ids
 
     # -- answer + navigation ----------------------------------------------
     def answer(self, step: str, value: dict[str, Any]) -> StepResult:

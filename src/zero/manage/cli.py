@@ -309,11 +309,13 @@ def _interactive_setup(setup) -> int:
                 continue
             if action == "skip":
                 if step == STEP_ORDER[-1]:
+                    print("  skipped — setup complete")
                     break
                 nxt = setup.skip(step)
                 print(f"  skipped -> {nxt}")
                 continue
 
+            last_errors: list[str] | None = None
             while True:
                 result = setup.answer(step, value)
                 for e in result.errors or []:
@@ -327,6 +329,29 @@ def _interactive_setup(setup) -> int:
                 # ConnectError") forced retyping the whole step. Offer a
                 # retry with the same answers first.
                 can_skip = bool(spec and spec.optional) or step == "groups"
+                # Bug fix (dead-loop): "Enter=retry same answers" can never
+                # fix a DETERMINISTIC validation error (e.g. the websearch
+                # step with required provider_id/api_key left empty) — the
+                # identical answers fail identically forever, which is
+                # exactly what happened in the reported Windows session.
+                # Keep the one-keypress retry for transient probe/network
+                # errors, but after ONE identical failure automatically
+                # re-ask the step's fields (prefilled with the previous
+                # answers) instead of looping.
+                if last_errors is not None and list(result.errors or []) == last_errors:
+                    print("  same answers failed twice — re-asking this step's fields")
+                    value, action2 = _collect_step_answers(setup, step, spec, prefill=value)
+                    if action2 == "back":
+                        setup.back(step)
+                        print(f"  <- back to {setup.current()}")
+                        action = "back"
+                        break
+                    if action2 == "skip":
+                        action = "skip"
+                        break
+                    last_errors = None
+                    continue
+                last_errors = list(result.errors or [])
                 opts = "Enter=retry same answers · r=re-enter · b=back"
                 if can_skip:
                     opts += " · s=skip"
@@ -349,20 +374,28 @@ def _interactive_setup(setup) -> int:
                     if action2 == "skip":
                         action = "skip"
                         break
+                    last_errors = None
                     continue
                 # Enter (or anything else): retry with the same answers —
-                # the usual fix for a transient network error.
+                # the usual fix for a transient network error. A second
+                # identical failure re-asks the fields automatically (see
+                # the dead-loop fix above).
             if action == "back":
                 continue
             if action == "skip":
                 if step == STEP_ORDER[-1]:
+                    print("  skipped — setup complete")
                     break
                 nxt = setup.skip(step)
                 print(f"  skipped -> {nxt}")
                 continue
-            print(f"  ok -> {setup.current()}")
             if step == STEP_ORDER[-1]:
+                # Bug fix: the last step used to print the self-referencing
+                # transition "ok -> test_message" (answer() cannot advance
+                # past the final step) — report completion instead.
+                print("  ok — setup complete")
                 break
+            print(f"  ok -> {setup.current()}")
     except (KeyboardInterrupt, EOFError):
         print(f"\npaused at step '{setup.current()}' — resume with: zero setup --resume")
         return 130
@@ -650,10 +683,77 @@ def _service_status() -> dict[str, str]:
     return {"kind": "none", "state": "stopped"}
 
 
+def _healthz_ok(url: str, timeout: float = 1.0) -> bool:
+    """Loopback-only health probe; never goes through a system proxy."""
+    import urllib.request
+
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except Exception:  # noqa: BLE001 - any error means "not healthy yet"
+        return False
+
+
+def _last_log_lines(count: int) -> list[str]:
+    log = _home() / "zero.log"
+    try:
+        return log.read_text(errors="replace").splitlines()[-count:]
+    except OSError:
+        return []
+
+
+def _port_busy(host: str, port: int) -> bool:
+    """True when (host, port) cannot be bound right now."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((host, port))
+    except OSError:
+        return True
+    return False
+
+
 def cmd_start(ns) -> int:
     if shutil.which("systemctl"):
         subprocess.run(["systemctl", "start", SERVICE_NAME], check=False)
         return cmd_status(ns)
+    # Bug fix: a second `zero start` used to spawn a doomed duplicate that
+    # died on the bind error (WinError 10048 / EADDRINUSE) while
+    # overwriting zero.pid with its dead pid — exactly the reported
+    # Windows session. Refuse with guidance when the service is running.
+    pid_file = _home() / "zero.pid"
+    if pid_file.exists():
+        try:
+            running_pid = int(pid_file.read_text().strip())
+            if _pid_alive(running_pid):
+                print(
+                    f"service already running (pid {running_pid}); "
+                    "use 'zero restart' to reload it or 'zero stop' first"
+                )
+                return 1
+        except ValueError:
+            pass
+    # Bug fix: never spawn a child doomed to lose the bind race — and
+    # never mistake ANOTHER healthy service on the port for the one we
+    # just spawned (its /healthz would answer for the child that is
+    # about to die). Refuse up front with an actionable message.
+    if _port_busy("127.0.0.1", 8000):
+        if _healthz_ok("http://127.0.0.1:8000/healthz"):
+            print(
+                "port 8000 already serves a healthy Zero service that this "
+                "pid file does NOT manage — stop that process first, or use "
+                "'zero status' to inspect it"
+            )
+        else:
+            print("port 8000 is already in use by another process — stop it first")
+        return 1
     # Bug fix: the log file was opened before $ZERO_HOME existed, so a
     # fresh `zero start` crashed with FileNotFoundError. Create it first.
     _home().mkdir(parents=True, exist_ok=True)
@@ -673,8 +773,45 @@ def cmd_start(ns) -> int:
         stderr=log,
         **spawn,
     )
+    # The child owns its inherited duplicate now; keeping the parent-side
+    # handle open leaked an fd (and tripped ResourceWarning under pytest).
+    log.close()
     (_home() / "zero.pid").write_text(str(proc.pid))
     print(f"started pid={proc.pid} (foreground alternative: zero-develop serve)")
+    # Bug fix: `zero start` used to report success without confirming the
+    # process survived startup — a bind failure killed it seconds later
+    # and the pid file kept pointing at a dead process. Verify liveness
+    # and wait for /healthz. The window must cover a COLD first start
+    # (imports + fresh-database migrations) on slow hosts, not just a
+    # warm restart; a healthy boot still reports within a few seconds.
+    deadline = time.time() + 25.0
+    while time.time() < deadline:
+        # BUG FIX: _pid_alive(proc.pid) is wrong for OUR OWN child — on
+        # POSIX a dead child stays a zombie until reaped, so signal-0
+        # kept reporting "alive" forever and the bind-failure death was
+        # never noticed. Popen.poll() reaps AND reports the exit.
+        if proc.poll() is not None:
+            print("service process exited during startup; last log lines:", file=sys.stderr)
+            for line in _last_log_lines(5):
+                print(f"  {line}", file=sys.stderr)
+            return 1
+        if _healthz_ok("http://127.0.0.1:8000/healthz"):
+            # Guard the health answer against the spawn/bind race: a child
+            # that lost the port to a foreign process dies right after
+            # startup — never credit a foreign service for ours.
+            time.sleep(0.5)
+            if proc.poll() is not None:
+                print("service process exited during startup; last log lines:", file=sys.stderr)
+                for line in _last_log_lines(5):
+                    print(f"  {line}", file=sys.stderr)
+                return 1
+            print(f"service healthy at http://127.0.0.1:8000 (pid={proc.pid})")
+            return 0
+        time.sleep(0.25)
+    print(
+        "warning: process is alive but /healthz has not responded yet "
+        "(first start may still be migrating) — check `zero logs`"
+    )
     return 0
 
 
@@ -683,12 +820,16 @@ def cmd_stop(ns) -> int:
         subprocess.run(["systemctl", "stop", SERVICE_NAME], check=False)
         return 0
     pid_file = _home() / "zero.pid"
-    if pid_file.exists():
-        try:
-            os.kill(int(pid_file.read_text().strip()), 15)
-        except (OSError, ValueError):
-            pass
-        pid_file.unlink(missing_ok=True)
+    # Honesty fix: `zero stop` used to print "stopped" even when nothing
+    # was running (no pid file), which masked real state confusion.
+    if not pid_file.exists():
+        print("service not running (no pid file)")
+        return 0
+    try:
+        os.kill(int(pid_file.read_text().strip()), 15)
+    except (OSError, ValueError):
+        pass
+    pid_file.unlink(missing_ok=True)
     print("stopped")
     return 0
 

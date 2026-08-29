@@ -124,8 +124,32 @@ window, execution **completed 5/5** right after, rich Telegram delivery
 Post-fix live proof: a fresh `capture_diff` invocation **with extra
 arguments succeeds end-to-end** against a real worktree
 (`tests/test_tool_schema_steering.py`), and a fresh live LLM tool round
-(`wordcount`) completes in 3.5 s with a correct result. Total defects fixed
-across the session: **45**.
+(`wordcount`) completes in 3.5 s with a correct result.
+
+---
+
+### Phase H — Operator console session (Windows) (7 bugs)
+
+A real operator console session (`zero setup` → `zero` → `zero start` →
+`zero-develop serve`) was replayed end-to-end against the real Telegram
+Bot API and the real provider, and exposed seven operator-facing defects:
+
+| # | Symptom | Root cause | Fix |
+|---|---------|-----------|-----|
+| H1 | Step 18/18 "Send test message" collected a chat id and **never sent anything**; the last line printed the self-referencing transition `ok -> test_message` | The step only stored the chat id; no send existed | Real Bot-API `sendMessage` probe (`telegram_send_message`) reporting the message id; Telegram's own error description surfaced on failure; empty chat id keeps skip semantics; resumed drafts without a resolvable token soft-pass with a warning; "ok — setup complete" replaces the self-transition |
+| H2 | Step 13/18 websearch: "Enter=retry same answers" **failed identically forever** for deterministic errors (required provider id/key left empty) | The retry menu was designed for transient probe errors only | One identical failure now auto re-asks the step's fields (prefilled); transient errors keep the one-keypress retry |
+| H3 | `zero-develop serve` on the running service's port: ugly `WinError 10048` traceback, exit code 0 | No pre-check of the managed pid file or port occupancy | Friendly refusal with guidance ("stop it first ('zero stop') or choose another port: zero-develop serve --port 8001"), exit 1 |
+| H4 | `zero start` spawned blindly: no already-running guard (second start overwrote `zero.pid` with a doomed pid) and no post-spawn verification | Blind `Popen` + immediate success print | Refuses when running; refuses when port 8000 is occupied (distinguishing a healthy Zero service outside the pid file); post-spawn `Popen.poll()` liveness (a zombie child defeats signal-0 probes) + /healthz wait guarded against crediting a foreign service; log tail on death; `zero stop` honest when nothing runs |
+| H5 | "generated a development encryption key" printed on **every** serve run though the key was merely reloaded | Banner didn't distinguish generated vs reused; .env rewritten each run | "reusing the existing" vs "generated" wording; idempotent .env persistence; stale "run 'zero setup'" guidance replaced by "run 'zero start'" when a config exists |
+| H6 | Bare `zero-develop` printed argparse's terse error | `required=True` subparsers, unlike `zero` | Both CLIs print the full help (exit 2) on bare invocation |
+| H7 | The websearch step accepted a `provider_id` that **only exploded at commit** — after all 18 steps (ZeroConfig requires it to reference a configured provider); a fallback equal to the primary was silently accepted | Step validation didn't mirror the config validator | Step validates the id against draft+existing providers and lists the available ids; prompt label explains the constraint; duplicate fallback warns |
+
+Replay proof (`realrun-evidence/` driver `s7_console_session.py`, 7/7
+scenarios): the full 18-step wizard ran with the **real bot token, real
+provider probes and real group** — the reported websearch keystrokes
+recovered via the new auto re-ask, and the final step **delivered a real
+Telegram test message** (message id 296) with visible confirmation.
+Total defects fixed across the session: **52**.
 
 ---
 
@@ -146,12 +170,13 @@ across the session: **45**.
 | Plugins | `user:wordcount` invoked by real LLM in chat and directly |
 | HTTP / CLI | 110 OpenAPI paths; `/capabilities` all-available; `/web/login`, `/admin/login` 200; protected routes 401/403; `zero status` / `zero doctor` 9/9 OK |
 | Final pipeline | 11/11 tasks COMPLETED (textcase_final); post-fix rerun textcase_r21 COMPLETED 10/10 with **capture_diff 9/9 first-try successes, zero validation failures**; final worktrees contain full packages with passing unittest suites (13 and 16 tests OK) |
+| Operator console | Full `zero setup` wizard replayed live (real token/provider/group): websearch dead-loop recovered, real test message delivered (msg id 296), config committed; `zero start`/`zero-develop serve` conflict scenarios refuse cleanly (7/7 s7 scenarios) |
 
 ## 4. Test Suite
 
-- Final: **994 passed / 15 skipped / 0 failed** (1,009 collected across 95
-  files; start of session: 920).
-- 74+ new regression tests across 11 new test files; `ruff` clean on every
+- Final: **1,020 passed / 15 skipped / 0 failed** (1,035 collected across
+  96 files; start of session: 920).
+- 99+ new regression tests across 12 new test files; `ruff` clean on every
   changed file.
 - One pre-existing golden-table failure (`test_api_route_surface`) is excluded
   from the historical count and was verified to fail on a clean stash too
