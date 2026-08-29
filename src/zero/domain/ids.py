@@ -207,5 +207,10 @@ def generate_callback_token_id() -> str:
     return f"ct_{_generate_token()}"
 
 
+def generate_chat_message_id() -> str:
+    """Stable ID for one durable conversational transcript turn."""
+    return f"chm_{_generate_token()}"
+
+
 def generate_tool_approval_id() -> str:
     return f"ta_{_generate_token()}"

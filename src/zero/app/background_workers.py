@@ -35,6 +35,15 @@ from zero.config import Settings
 
 logger = logging.getLogger("zero.workers")
 
+#: Periodic getMe heartbeat budget (Hermes parity, round 5): Hermes
+#: probes ``get_me`` every 90s so a wedged TCP socket (CLOSE-WAIT) or a
+#: silently blocked long-poll is detected even when no error fires.
+_POLLING_HEARTBEAT_SECONDS = 90.0
+#: Warn after this long without ANY successful Telegram round trip
+#: (poll or heartbeat probe) — the operator sees "the gateway went
+#: deaf at about this time" instead of an unbounded silent stall.
+_POLLING_STALL_SECONDS = 300.0
+
 
 @dataclass
 class WorkerHostStatus:
@@ -199,11 +208,56 @@ class BackgroundWorkerHost:
         error_reported: set[str] = set()
         hint_reported: set[str] = set()
         identity_verified: set[str] = set()
+        # Heartbeat + stall watchdog state (Hermes parity, round 5):
+        # the loop start counts as provisional success so a quiet but
+        # healthy start is not flagged before the first window elapses.
+        last_heartbeat = _loop_monotonic()
+        last_success = last_heartbeat
+        stall_reported = False
         try:
             while not self._stop.is_set():
                 polled_any = False
                 now = _loop_monotonic()
-                for binding_poll in self._telegram_poll_targets():
+                poll_targets = self._telegram_poll_targets()
+                # ---- periodic getMe heartbeat (runs between polling
+                # ---- cycles; never interrupts an in-flight poll).
+                if poll_targets and now - last_heartbeat >= _POLLING_HEARTBEAT_SECONDS:
+                    last_heartbeat = now
+                    try:
+                        _hb_project, _hb_binding, hb_token = poll_targets[0]
+                        hb_adapter = _build_binding_adapter(
+                            services=self._services,
+                            chat_token=hb_token,
+                            cursor_store=cursor_store,
+                        )
+                        me = await asyncio.to_thread(hb_adapter.get_me)
+                        last_success = _loop_monotonic()
+                        stall_reported = False
+                        logger.info(
+                            "polling heartbeat: bot @%s alive (id=%s)",
+                            me.get("username"),
+                            me.get("id"),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - probe is diagnostic
+                        # A failed heartbeat must NOT touch per-binding
+                        # backoff state: polling itself may still work.
+                        logger.debug(
+                            "polling heartbeat probe failed: %s", type(exc).__name__
+                        )
+                if (
+                    poll_targets
+                    and not stall_reported
+                    and now - last_success >= _POLLING_STALL_SECONDS
+                ):
+                    stall_reported = True
+                    logger.warning(
+                        "polling: no successful Telegram round trip for %.0fs — "
+                        "the long-poll path may be silently stalled (dead TCP "
+                        "socket or filtered network); if this persists, check "
+                        "ZERO_TELEGRAM_PROXY_URL / HTTPS_PROXY",
+                        now - last_success,
+                    )
+                for binding_poll in poll_targets:
                     if self._stop.is_set():
                         break
                     _project, binding, token = binding_poll
@@ -242,6 +296,10 @@ class BackgroundWorkerHost:
                         )
                         polled_any = polled_any or bool(updates)
                         self.status.polling_iterations += 1
+                        # A successful poll IS a successful round trip:
+                        # it clears the stall watchdog.
+                        last_success = _loop_monotonic()
+                        stall_reported = False
                         backoff_step.pop(bid, None)
                         conflict_reported.discard(bid)
                         had_error_streak = bid in error_reported or bid in hint_reported

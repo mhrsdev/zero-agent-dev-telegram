@@ -1,0 +1,87 @@
+ZERO-AGENT-DEV-TELEGRAM — FIX NOTES v4 (Hermes-parity + hardest-level real verification)
+=========================================================================================
+Commits: ea051da (Hermes-parity messaging overhaul) + 55ee64e (live round-5 findings)
+Grade: A — full report in realrun-evidence/round5/GRADE_REPORT.md (inside this package)
+
+WHAT WAS DONE SINCE v3
+----------------------
+1. HERMES-PARITY OVERHAUL (commit ea051da). The hermes-agent codebase was read
+   end-to-end for everything messaging-related (Telegram gateway, long polling,
+   sessions, foreground/background workers, media, reply anchoring, plan cards).
+   Gaps found in Zero were fixed to Hermes parity:
+   - media/document intake on Telegram (photos, documents, voice) — handled
+     without crashing, content downloaded via getFile, echoed into the agent
+     context;
+   - reply anchoring: replies go to the originating chat/thread; if Telegram
+     rejects the reply anchor (400, thread-not-found) the chunk is re-sent
+     without it — the message is NEVER lost;
+   - plan cards with inline buttons (approve/decline) delivered to the real
+     group, approved via callback tokens;
+   - conversational chat bridge: non-actionable messages now get a real LLM
+     chat answer (previously silently dropped);
+   - web_search tool wired at boot and granted to the main worker;
+   - long-polling budget + heartbeat watchdogs for the polling worker.
+
+2. TWO NEW LIVE BUGS FOUND DURING THE HARDEST-LEVEL PASS (commit 55ee64e):
+   a) SSE-ONLY GATEWAY. Your gateway (api.justwoker.icu) answers every
+      chat/completions request that declares TOOLS with text/event-stream
+      chunks, even when streaming was NOT requested. The planner (no tools)
+      got clean JSON, but every conversational reply with granted tools died
+      with "provider returned invalid JSON". FIX: the adapter now aggregates
+      the SSE stream (text concatenated, tool calls merged by index, last
+      usage/finish_reason win). Hermes reference: anthropic_adapter documents
+      the same SSE-only gateway class. Proven live: real SSE body → clean
+      answer, finish_reason=stop, usage 87/814.
+   b) MCP RESTART CRASH. On a reused database, every engine boot re-registered
+      MCP tools and hit ToolAlreadyExistsError. FIX: registration is now
+      idempotent — existing tool rows are refreshed in place.
+
+3. E2E INFRA. scripts/run_round5_e2e.py runs the WHOLE real-credentials E2E
+   (fresh setup → real engine on :8010 → 16 phases → teardown) as one command;
+   the driver resolves live ids from the engine DB; the operator identity is
+   pre-linked deterministically (real group members were racing the one-shot
+   auto-link bootstrap).
+
+VERIFICATION (all re-run on this exact tree, all with REAL credentials)
+-----------------------------------------------------------------------
+- Full suite: 1099 passed / 16 skipped / 1 failed — the 1 failure is the
+  optional `textual` GUI extra not installed in this environment; identical on
+  the untouched baseline → pre-existing env gap, not a regression. Locally run:
+      pip install -e ".[textual]"
+- Real-credentials E2E: 16/16 phases PASS — including REAL delivery to your
+  group (message_id=389 this run), REAL claude-opus-5 chat with a live web
+  search, MCP tool registration, live polling identity @SandboxEnvironmentBot.
+- Transport resilience: 10/10 (real sendMessage message_id=394; dead-proxy
+  cause detail + redaction; 2/4/8s backoff; one-time proxy hint).
+- Port fixes: 8/8. Dead-bot fixes: 14/14. Real processes: 18/18.
+- Live SSE proof vs your real gateway: PASS.
+
+WHAT TO DO ON WINDOWS
+---------------------
+1. Replace your local repo with this package (or pull once you grant push
+   access — commits 30c18e8, 24903ff, b0e3889, ea051da, 55ee64e are ready).
+2. pip install -e .        (first time already done? skip)
+3. zero start              → production engine (honors config.yaml port)
+4. zero-develop serve --port 8001 → dev engine, separate DB
+5. zero logs               → you WANT to see:
+       config sync: created telegram binding for chat -1004406039396
+       polling:...: Telegram bot online: @SandboxEnvironmentBot (id=8753924431)
+6. If api.telegram.org is filtered on your network:
+       set ZERO_TELEGRAM_PROXY_URL=socks5h://127.0.0.1:1080     (cmd)
+       $env:ZERO_TELEGRAM_PROXY_URL="socks5h://127.0.0.1:1080"  (PowerShell)
+   then restart `zero start`. Everything (polling + outbound + doctor probes)
+   goes through the proxy; DNS resolves through it too (socks5h).
+
+راهنمای فارسی (خلاصه)
+---------------------
+همه‌چیز با اتصال واقعی تست شد و نمرهٔ نهایی A شد (گزارش کامل داخل پکیج،
+realrun-evidence/round5/GRADE_REPORT.md):
+- ۱۶ فاز تست واقعی از جمله ارسال پیام واقعی به گروه شما (message_id=389)،
+  گفتگوی واقعی با claude-opus-5 و جست‌وجوی وب زنده — همه PASS.
+- دو باگ جدید در همین دور پیدا و تعمیر شد: پاسخ‌های SSE گیت‌وی شما (پیام‌های
+  چت ابزاردار از کار می‌افتادند) و کرش ثبت دوبارهٔ ابزارهای MCP بعد از ری‌استارت.
+- برای فیلترینگ: متغیر محیطی ZERO_TELEGRAM_PROXY_URL را مثل بالا ست کنید و
+  zero start را دوباره اجرا کنید. لاگ سالم این خط است:
+  "Telegram bot online: @SandboxEnvironmentBot".
+- اگر باز هم مشکلی دیدید، خروجی `zero logs` را بفرستید — اولین خطای هر زنجیره
+  حالا دلیل واقعی شبکه‌ای را هم نشان می‌دهد (توکن همیشه مخفی می‌ماند).

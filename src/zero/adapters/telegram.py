@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from threading import Event
 from typing import Any
 
-from zero.domain.interfaces import NormalizedEvent
+from zero.domain.interfaces import MediaAttachment, NormalizedEvent
 
 from .messaging import (
     AdapterError,
@@ -23,8 +23,68 @@ from .messaging import (
     safe_render_text,
     verify_secret_header,
 )
+from .telegram_render import chunk_telegram_text, render_telegram_html
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_media(message: Mapping[str, Any]) -> list[MediaAttachment]:
+    """Pull media references off a raw Telegram message payload.
+
+    Hermes parity (round 5 gap 3): the canonical envelope used to drop
+    every attachment silently, so photos/documents sent to the bot
+    reached the model as empty text. Telegram photos arrive as an array
+    of progressively larger sizes — the largest variant wins.
+    """
+    media: list[MediaAttachment] = []
+
+    photos = message.get("photo")
+    if isinstance(photos, list) and photos:
+        best: Mapping[str, Any] | None = None
+        best_key: tuple[int, int] = (-1, -1)
+        for candidate in photos:
+            if not isinstance(candidate, Mapping) or not candidate.get("file_id"):
+                continue
+            width = int(candidate.get("width") or 0)
+            height = int(candidate.get("height") or 0)
+            size = int(candidate.get("file_size") or 0)
+            key = (width * height, size)
+            if key > best_key:
+                best_key, best = key, candidate
+        if best is not None:
+            media.append(
+                MediaAttachment(
+                    kind="photo",
+                    file_id=str(best["file_id"]),
+                    mime_type=str(best.get("mime_type") or "image/jpeg"),
+                    file_size=(int(best["file_size"]) if best.get("file_size") else None),
+                )
+            )
+
+    document = message.get("document")
+    if isinstance(document, Mapping) and document.get("file_id"):
+        media.append(
+            MediaAttachment(
+                kind="document",
+                file_id=str(document["file_id"]),
+                file_name=(str(document["file_name"]) if document.get("file_name") else None),
+                mime_type=(str(document["mime_type"]) if document.get("mime_type") else None),
+                file_size=(int(document["file_size"]) if document.get("file_size") else None),
+            )
+        )
+
+    for kind in ("voice", "video", "audio", "sticker"):
+        item = message.get(kind)
+        if isinstance(item, Mapping) and item.get("file_id"):
+            media.append(
+                MediaAttachment(
+                    kind=kind,
+                    file_id=str(item["file_id"]),
+                    mime_type=(str(item["mime_type"]) if item.get("mime_type") else None),
+                    file_size=(int(item["file_size"]) if item.get("file_size") else None),
+                )
+            )
+    return media
 
 
 class TelegramConflictError(AdapterError):
@@ -147,6 +207,8 @@ class TelegramAdapter(BaseMessagingAdapter):
             content = ""
         content = str(content)
         kind = "command" if content.startswith("/") else "message"
+        media = _extract_media(message)
+        reply_anchor = message.get("reply_to_message")
         return NormalizedEvent(
             platform="telegram",
             external_event_id=str(update_id),
@@ -159,6 +221,18 @@ class TelegramAdapter(BaseMessagingAdapter):
             ),
             event_kind=kind,  # type: ignore[arg-type]
             content=content,
+            media=tuple(media),
+            message_id=(
+                str(message["message_id"])
+                if message.get("message_id") is not None
+                else None
+            ),
+            reply_to_message_id=(
+                str(reply_anchor["message_id"])
+                if isinstance(reply_anchor, Mapping)
+                and reply_anchor.get("message_id") is not None
+                else None
+            ),
         )
 
     parse_update = normalize_update
@@ -228,17 +302,101 @@ class TelegramAdapter(BaseMessagingAdapter):
         text: str,
         topic_id: str | None = None,
         reply_markup: dict[str, Any] | None = None,
+        reply_to_message_id: str | None = None,
     ) -> HttpResponse:
-        payload: dict[str, Any] = {
-            "chat_id": str(chat_id),
-            "text": safe_render_text(text, platform="telegram", limit=4096),
-            "parse_mode": "HTML",
-        }
+        """Render, chunk, and deliver one outbound message.
+
+        Hermes parity (round 5 gaps 1+2):
+        - markdown is rendered to Telegram-safe HTML (escape-first),
+          instead of HTML-escaping raw markdown into literal ``**``;
+        - long text is split into UTF-16-bounded chunks with code-fence
+          preservation, instead of being silently truncated at 4096;
+        - chunk indicators ``(i/n)`` are appended when the reply spans
+          multiple messages; a single-chunk reply stays clean;
+        - the reply anchor rides the FIRST chunk only (Hermes
+          ``_should_thread_reply`` default "first") and inline buttons
+          ride the LAST chunk so the card stays actionable;
+        - a dead reply anchor (Telegram 400 "message to be replied not
+          found", observed live when replying to webhook-synthesized
+          ids) is dropped and the chunk re-sent — the content and the
+          buttons must survive a stale anchor.
+        """
+        chunks = chunk_telegram_text(str(text or ""), with_indicators=True)
+        if not chunks:
+            raise ValueError("cannot send an empty Telegram message")
+        total = len(chunks)
+        response: HttpResponse | None = None
+        for index, chunk in enumerate(chunks):
+            payload: dict[str, Any] = {
+                "chat_id": str(chat_id),
+                "text": render_telegram_html(chunk),
+                "parse_mode": "HTML",
+            }
+            if topic_id is not None:
+                payload["message_thread_id"] = str(topic_id)
+            if reply_markup is not None and index == total - 1:
+                payload["reply_markup"] = reply_markup
+            anchor = reply_to_message_id if index == 0 else None
+            if anchor is not None:
+                payload["reply_to_message_id"] = str(anchor)
+            try:
+                response = self._call_api("sendMessage", payload)
+            except PermanentTransportError as exc:
+                if anchor is None or "status 400" not in str(exc):
+                    raise
+                logger.warning(
+                    "Telegram rejected the reply anchor (400) — re-sending "
+                    "the chunk without it (thread-not-found fallback)"
+                )
+                # A fresh dict: the payload already handed to the
+                # transport must stay immutable from the caller's view.
+                fallback_payload = {
+                    key: value for key, value in payload.items()
+                    if key != "reply_to_message_id"
+                }
+                response = self._call_api("sendMessage", fallback_payload)
+        assert response is not None
+        return response
+
+    def get_file(self, *, file_id: str) -> dict[str, Any]:
+        """Resolve a Telegram file reference via ``getFile``."""
+        response = self._call_api("getFile", {"file_id": str(file_id)})
+        data = self._response_json(response)
+        result = data.get("result") if isinstance(data, Mapping) else None
+        if not isinstance(result, Mapping):
+            raise AdapterError("Telegram getFile returned an unexpected payload")
+        return dict(result)
+
+    def download_file_bytes(self, *, file_path: str) -> bytes:
+        """Download file bytes from the Bot API file endpoint.
+
+        The caller supplies ``file_path`` from :meth:`get_file`. Content
+        is returned raw (not JSON) and never logged.
+        """
+        if not self._bot_token:
+            raise WebhookAuthError("Telegram bot credential is not configured")
+        clean_path = str(file_path).lstrip("/")
+        if not clean_path or "/bot" in clean_path:
+            raise AdapterError("Telegram file_path is malformed")
+        url = f"{self._api_base_url}/file/bot{self._bot_token}/{clean_path}"
+        response = self._request("GET", url)
+        content = getattr(response, "content", None)
+        if content is None:
+            raise PermanentTransportError("file download returned no content")
+        return bytes(content)
+
+    def send_chat_action(
+        self,
+        *,
+        chat_id: str,
+        action: str = "typing",
+        topic_id: str | None = None,
+    ) -> HttpResponse:
+        """Send a chat action (the typing indicator)."""
+        payload: dict[str, Any] = {"chat_id": str(chat_id), "action": str(action)}
         if topic_id is not None:
             payload["message_thread_id"] = str(topic_id)
-        if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        return self._call_api("sendMessage", payload)
+        return self._call_api("sendChatAction", payload)
 
     def edit_message(
         self,

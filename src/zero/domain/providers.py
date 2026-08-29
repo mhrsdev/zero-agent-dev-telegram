@@ -135,12 +135,21 @@ class CanonicalMessage:
         tool_call_id: for tool messages, the ID of the tool call.
         tool_calls: for assistant messages with tool calls, a tuple of
             (tool_name, tool_call_id, arguments) tuples.
+        content_parts: optional OpenAI-compatible multimodal parts
+            (``{"type": "text", ...}`` / ``{"type": "image_url", ...}``)
+            rendered instead of the plain text content when present.
+            Hermes parity (round 5): photos travel to the model as
+            ``image_url`` data-URL parts. Adapters that cannot express
+            parts (the Anthropic wire protocol needs base64 source
+            blocks) must reject them loudly instead of silently
+            dropping the media.
     """
 
     role: str
     content: str
     tool_call_id: str | None = None
     tool_calls: tuple[tuple[str, str, str], ...] = ()
+    content_parts: tuple[dict[str, Any], ...] | None = None
 
 
 @dataclass(frozen=True)

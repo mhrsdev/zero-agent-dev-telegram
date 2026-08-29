@@ -107,12 +107,24 @@ class ChatService:
         provider: str,
         model_name: str,
         source: AuditSource = "web",
+        history: tuple[CanonicalMessage, ...] = (),
+        image_data_urls: tuple[str, ...] = (),
     ) -> ChatTurnResult:
         """Run one user message through the provider chain.
 
         Identical repeat messages deduplicate through the standard
         request-hash path (the stored response is returned without a new
         provider call) — the same contract as every other request.
+
+        ``history`` rides the request as sanitized prior turns (Hermes
+        session parity, round 5): only ``user``/``assistant`` rows
+        survive — tool/system rows injected by any upstream caller are
+        dropped, so a caller can never smuggle a tool result or a system
+        instruction through the conversation transcript.
+
+        ``image_data_urls`` attach to the new user message as
+        OpenAI-compatible ``image_url`` content parts after the text
+        part.
         """
         if not message.strip():
             raise ValueError("message must not be empty")
@@ -128,9 +140,20 @@ class ChatService:
             raise ChatRateLimitError("chat rate limit exceeded")
 
         granted_tools = self._granted_tool_names(project_id, agent_scope)
-        messages: list[CanonicalMessage] = [
-            CanonicalMessage(role="user", content=message),
-        ]
+        # Sanitize prior turns: the transcript is presentation-layer
+        # state, not a tool-result channel. Anything that is not a plain
+        # user/assistant turn is dropped before it can reach the wire.
+        sanitized_history = tuple(
+            CanonicalMessage(role=turn.role, content=turn.content)
+            for turn in history
+            if turn.role in ("user", "assistant") and turn.content
+        )
+        last_message = CanonicalMessage(
+            role="user",
+            content=message,
+            content_parts=self._render_user_parts(message, image_data_urls),
+        )
+        messages: list[CanonicalMessage] = [*sanitized_history, last_message]
         executed: list[dict[str, Any]] = []
 
         response = None
@@ -211,6 +234,26 @@ class ChatService:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _render_user_parts(
+        message: str,
+        image_data_urls: tuple[str, ...],
+    ) -> tuple[dict[str, Any], ...] | None:
+        """Build OpenAI-compatible content parts for one user turn.
+
+        The text part always leads; each data URL becomes an
+        ``image_url`` part. With no images this returns ``None`` so
+        text-only requests keep their historical wire shape (and their
+        historical dedup hash).
+        """
+        images = [url for url in image_data_urls if url]
+        if not images:
+            return None
+        parts: list[dict[str, Any]] = [{"type": "text", "text": message}]
+        for url in images:
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+        return tuple(parts)
 
     def _granted_tool_names(
         self, project_id: ProjectId, agent_scope: AgentScope

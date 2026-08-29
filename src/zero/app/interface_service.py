@@ -35,6 +35,7 @@ Per PLAN.md M13 validation:
 from __future__ import annotations
 
 import contextvars
+import html
 import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -70,6 +71,7 @@ from zero.domain.plans import (
     DuplicateConversationEventError,
     PlanError,
     PlanId,
+    PlanRevision,
     StaleRevisionError,
 )
 from zero.domain.providers import ProviderError
@@ -147,6 +149,13 @@ class InterfaceAdapterService:
         # owner_only``; production deployments with multiple users keep
         # the historical strict behavior.
         self.auto_link_owner_project_id = None
+        # Conversational fallback (Hermes session parity, round 5):
+        # ``build_services``/``config_sync`` attach a TelegramChatBridge
+        # here. When the planner classifies a plain message as NOT
+        # actionable, the bridge runs one bounded conversational turn so
+        # everyday chat no longer meets silence. None keeps the
+        # historical plan-pipeline-only behavior byte-for-byte.
+        self.chat_bridge = None
         self._claim_token = contextvars.ContextVar[str | None](
             "zero_interface_claim_token", default=None
         )
@@ -868,8 +877,19 @@ class InterfaceAdapterService:
                 )
                 if revision is not None:
                     detail += f"; proposed revision {revision.id.value}"
+                    # The card with REAL approve/reject buttons goes out
+                    # the moment a revision exists (round 5 gap 7: the
+                    # callback pipeline existed but no card was ever
+                    # sent, so approval required the web UI).
+                    card_detail = self._try_send_plan_card(
+                        binding=binding, event=event, user_id=user_id, revision=revision
+                    )
+                    detail += f"; {card_detail}"
                 else:
                     detail += "; no actionable plan proposed"
+                    detail += self._try_conversational_fallback(
+                        binding=binding, event=event, user_id=user_id
+                    )
             except PlannerOutputError:
                 # A malformed model response is a planner failure, not a
                 # reason to lose the durable human conversation event.
@@ -958,6 +978,144 @@ class InterfaceAdapterService:
                 first_token,
                 type(exc).__name__,
             )
+
+    # ------------------------------------------------------------------
+    # Plan card + conversational fallback (Hermes parity, round 5)
+    # ------------------------------------------------------------------
+
+    def _send_plan_card(
+        self,
+        *,
+        binding: InterfaceBinding,
+        event: NormalizedEvent,
+        user_id: UserId,
+        revision: PlanRevision,
+    ) -> str:
+        """Send the plan proposal with REAL approve/reject buttons.
+
+        Round 5 gap 7: the callback pipeline existed since M13, but the
+        Telegram surface never sent a card, so the only way to approve a
+        plan was the web UI. This method creates one fresh approve/reject
+        token pair for the revision and delivers the card through the
+        direct reply transport with an inline keyboard whose
+        ``callback_data`` values are the opaque token ids — the buttons
+        work in the SAME chat, under the SAME durable pipeline.
+
+        Content escaping: objective/scope/criteria come from the model;
+        they are HTML-escaped HERE (the direct transport may be a test
+        double or a real adapter — the card never relies on the adapter
+        to escape model text on its behalf).
+
+        Idempotency: unused tokens for the SAME revision short-circuit
+        the resend, so a duplicate webhook delivery cannot mint a second
+        pair of buttons for one proposal.
+        """
+        transport = getattr(self, "direct_reply_transport", None)
+        if transport is None:
+            return "plan card skipped (no outbound transport)"
+        plan_id = revision.plan_id
+        existing = self._repo.list_callback_tokens_for_plan(
+            binding.project_id, plan_id
+        )
+        live = [
+            token
+            for token in existing
+            if token.revision_number == revision.revision_number and not token.is_used
+        ]
+        if live:
+            return "plan card buttons already exist; not re-sent"
+        approve_token = self.create_callback_token(
+            project_id=binding.project_id,
+            plan_id=plan_id,
+            revision_number=revision.revision_number,
+            action="approve",
+            created_by=user_id,
+        )
+        reject_token = self.create_callback_token(
+            project_id=binding.project_id,
+            plan_id=plan_id,
+            revision_number=revision.revision_number,
+            action="reject",
+            created_by=user_id,
+        )
+        content = revision.content
+        lines = [
+            f"Plan proposal #{revision.revision_number} — review needed",
+            "",
+            f"Objective: {html.escape(content.objective or '(unspecified)')}",
+        ]
+        scope_items = [html.escape(item) for item in (content.scope or ()) if item]
+        if scope_items:
+            lines.append("Scope:")
+            lines.extend(f"  • {item}" for item in scope_items)
+        criteria = [html.escape(item) for item in (content.acceptance_criteria or ()) if item]
+        if criteria:
+            lines.append("Acceptance criteria:")
+            lines.extend(f"  • {item}" for item in criteria)
+        lines.append("")
+        lines.append("Approve or reject with the buttons below.")
+        markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Approve", "callback_data": approve_token.id.value},
+                    {"text": "✖️ Reject", "callback_data": reject_token.id.value},
+                ]
+            ]
+        }
+        transport.send_message(
+            project_id=binding.project_id,
+            binding_id=binding.id,
+            actor_id=user_id,
+            text="\n".join(lines),
+            chat_id=str(event.chat_id),
+            topic_id=str(event.topic_id) if event.topic_id else None,
+            reply_to_message_id=event.message_id,
+            reply_markup=markup,
+        )
+        return "plan card sent with approval buttons"
+
+    def _try_send_plan_card(
+        self,
+        *,
+        binding: InterfaceBinding,
+        event: NormalizedEvent,
+        user_id: UserId,
+        revision: PlanRevision,
+    ) -> str:
+        """Card delivery must never fail durable intake; failures log."""
+        try:
+            return self._send_plan_card(
+                binding=binding, event=event, user_id=user_id, revision=revision
+            )
+        except Exception as exc:  # noqa: BLE001 - presentation best-effort
+            logger.info(
+                "plan card delivery failed: %s", type(exc).__name__
+            )
+            return f"plan card delivery failed ({type(exc).__name__})"
+
+    def _try_conversational_fallback(
+        self,
+        *,
+        binding: InterfaceBinding,
+        event: NormalizedEvent,
+        user_id: UserId,
+    ) -> str:
+        """Run the conversational bridge for non-actionable messages.
+
+        Commands are answered by ``_maybe_send_command_reply`` and never
+        reach the bridge. Any bridge failure degrades to a detail note —
+        the durable conversation event is already safe.
+        """
+        if self.chat_bridge is None or event.event_kind != "message":
+            return ""
+        try:
+            bridge_detail = self.chat_bridge.handle_message(
+                binding=binding, event=event, user_id=user_id
+            )
+            return f"; {bridge_detail}"
+        except Exception as exc:  # noqa: BLE001 - fallback must not crash intake
+            logger.info("conversational fallback failed: %s", type(exc).__name__)
+            return f"; conversational fallback failed ({type(exc).__name__})"
 
     def _process_callback(
         self,

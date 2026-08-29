@@ -203,6 +203,22 @@ def compute_request_hash(
     # byte-identical across the introduction of this field.
     if req.tool_choice is not None:
         request_payload["tool_choice"] = _hashable_tool_choice(req)
+    # Multimodal parts change the wire payload, so they must change the
+    # dedup hash too — but only when present, keeping every legacy
+    # text-only hash byte-stable across this field's introduction.
+    if any(m.content_parts for m in req.messages):
+        request_payload["messages"] = [
+            {
+                "role": m.role,
+                "content": m.content,
+                "tool_call_id": m.tool_call_id,
+                "tool_calls": list(m.tool_calls),
+                "content_parts": (
+                    [dict(part) for part in m.content_parts] if m.content_parts else None
+                ),
+            }
+            for m in req.messages
+        ]
     payload = json.dumps(
         request_payload,
         sort_keys=True,
@@ -234,6 +250,14 @@ def _message_to_dict(
             "content": message.content,
             "tool_call_id": message.tool_call_id,
             "tool_calls": tool_calls,
+            # Multimodal parts ride along untouched; only the
+            # OpenAI-compatible renderer consumes them (Hermes parity:
+            # images reach the model as image_url data-URL parts).
+            "content_parts": (
+                tuple(dict(part) for part in message.content_parts)
+                if message.content_parts
+                else None
+            ),
         }
 
     normalized = dict(message)
@@ -508,6 +532,31 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
             # adapter's generic message made a bad/expired primary API key
             # look like a request defect, silently skipping fallback.
             if response.status_code in (401, 403):
+                # Live-run fix (round 5): the operator's gateway sits
+                # behind Cloudflare, which intermittently answers 403
+                # with an EMPTY body and CF edge headers (server:
+                # cloudflare, cf-ray) — identical payloads succeed
+                # before and after the blip. That is an edge block, not
+                # a key failure: raise the dedicated edge-protection
+                # message (classified TRANSIENT with bounded same-
+                # provider retry) instead of the auth message.
+                if not str(getattr(response, "text", "") or "").strip():
+                    server = ""
+                    try:
+                        server = str(response.headers.get("server") or "")
+                    except AttributeError:
+                        server = ""
+                    cf_ray = ""
+                    try:
+                        cf_ray = str(response.headers.get("cf-ray") or "")
+                    except AttributeError:
+                        cf_ray = ""
+                    if "cloudflare" in server.lower() or cf_ray:
+                        raise ProviderError(
+                            "provider gateway edge protection blocked the request "
+                            "(transient CDN edge 403 with an empty body; identical "
+                            "requests succeed on retry)"
+                        )
                 raise ProviderError(
                     f"provider auth failed with status {response.status_code}"
                 )
@@ -519,6 +568,27 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
         try:
             data = response.json()
         except ValueError as exc:
+            # SSE-only gateway tolerance (live fix, round 5 — Hermes
+            # anthropic_adapter documents the same gateway class):
+            # api.justwoker.icu answers every chat/completions request
+            # that declares `tools` with text/event-stream chunks EVEN
+            # WHEN the request did not ask for streaming. The planner
+            # (toolless) gets JSON; chat turns with granted tools got
+            # SSE and died with "provider returned invalid JSON" on
+            # every conversational reply. Aggregate the chunks instead
+            # of failing.
+            body_text = ""
+            try:
+                body_text = response.text or ""
+            except Exception:  # noqa: BLE001
+                body_text = ""
+            content_type = ""
+            try:
+                content_type = str(response.headers.get("content-type") or "").lower()
+            except AttributeError:
+                content_type = ""
+            if "text/event-stream" in content_type or body_text.lstrip().startswith("data:"):
+                return self._aggregate_sse_body(body_text)
             raise ProviderError("provider returned invalid JSON") from exc
         if not isinstance(data, dict):
             raise ProviderError("provider returned an invalid response object")
@@ -744,6 +814,14 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
                 "role": message.get("role"),
                 "content": message.get("content", ""),
             }
+            # Multimodal parts (Hermes parity, round 5 gap 5): when a
+            # message carries OpenAI-compatible content parts (text +
+            # image_url data URLs), they REPLACE the plain string content
+            # on the wire — verified live against the operator's gateway
+            # (claude-opus-5 answered a color probe about a real PNG).
+            parts = message.get("content_parts")
+            if parts:
+                item["content"] = [dict(part) for part in parts]
             if message.get("role") == "tool":
                 item["tool_call_id"] = message.get("tool_call_id")
             if message.get("role") == "assistant" and message.get("tool_calls"):
@@ -760,6 +838,100 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
                 ]
             rendered.append(item)
         return rendered
+
+    @staticmethod
+    def _aggregate_sse_body(body_text: str) -> CanonicalResponse:
+        """Aggregate a forced-SSE chat/completions body into one response.
+
+        Live fix (round 5): the operator's gateway streams SSE chunks for
+        every tool-declaring request, even non-streaming ones. Hermes
+        parity (``create_anthropic_message`` docstring): some compatible
+        gateways are effectively SSE-only; the caller must aggregate
+        instead of crashing on the content type.
+
+        Chunk grammar (OpenAI-compatible deltas):
+        - ``data: {chunk}`` lines; ``data: [DONE]`` terminates;
+        - ``choices[0].delta.content`` appends to the text;
+        - ``choices[0].delta.tool_calls`` merge by index (id, name,
+          argument fragments concatenate in arrival order);
+        - the last non-null ``usage`` wins; ``finish_reason`` comes from
+          the last chunk that carries one.
+        """
+        content_parts: list[str] = []
+        finish_reason = "stop"
+        usage: TokenUsage | None = None
+        provider_message_id: str | None = None
+        tool_calls_by_index: dict[int, dict[str, str]] = {}
+
+        for line in body_text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(payload)
+            except ValueError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("id") and provider_message_id is None:
+                provider_message_id = str(chunk["id"])
+            raw_chunk_usage = chunk.get("usage")
+            if isinstance(raw_chunk_usage, Mapping) and raw_chunk_usage:
+                usage = OpenAICompatibleProviderAdapter._normalize_usage(raw_chunk_usage)
+            choices = chunk.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                delta = {}
+            delta_content = delta.get("content")
+            if isinstance(delta_content, str) and delta_content:
+                content_parts.append(delta_content)
+            for raw_call in delta.get("tool_calls") or []:
+                if not isinstance(raw_call, Mapping):
+                    continue
+                try:
+                    index = int(raw_call.get("index") or 0)
+                except (TypeError, ValueError):
+                    index = 0
+                entry = tool_calls_by_index.setdefault(
+                    index, {"id": "", "name": "", "arguments": ""}
+                )
+                call_id = raw_call.get("id")
+                if isinstance(call_id, str) and call_id and not entry["id"]:
+                    entry["id"] = call_id
+                function = raw_call.get("function")
+                if isinstance(function, Mapping):
+                    name = function.get("name")
+                    if isinstance(name, str) and name and not entry["name"]:
+                        entry["name"] = name
+                    arguments = function.get("arguments")
+                    if isinstance(arguments, str):
+                        entry["arguments"] += arguments
+            if choice.get("finish_reason"):
+                finish_reason = str(choice["finish_reason"])
+
+        tool_calls = tuple(
+            ToolCallResult(
+                tool_name=entry["name"],
+                tool_call_id=entry["id"] or f"stream_{index}",
+                arguments=entry["arguments"] or "{}",
+                result="",
+            )
+            for index, entry in sorted(tool_calls_by_index.items())
+            if entry["name"]
+        )
+        return CanonicalResponse(
+            content="".join(content_parts),
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            usage=usage if usage is not None else TokenUsage(),
+            provider_message_id=provider_message_id,
+        )
 
     @staticmethod
     def _normalize_usage(raw_usage: Any) -> TokenUsage:
@@ -1100,6 +1272,20 @@ class AnthropicMessagesProviderAdapter(ProviderAdapter):
         if max_tokens <= 0:
             raise InvalidProviderRequestError("max_tokens must be positive")
         clean_messages, _stripped = validate_tool_messages(request.messages)
+        # Loud multimodal rejection (Hermes parity, round 5 gap 5): the
+        # Anthropic wire protocol expresses images as base64 ``source``
+        # blocks, NOT OpenAI-style ``image_url`` parts. Silently dropping
+        # the parts would send the model a text-only transcript while the
+        # user believes the photo was seen — fail loudly instead.
+        for message in clean_messages:
+            for part in message.get("content_parts") or ():
+                part_type = str(part.get("type") or "") if isinstance(part, Mapping) else ""
+                if part_type and part_type != "text":
+                    raise InvalidProviderRequestError(
+                        "anthropic protocol rejects OpenAI-style "
+                        f"'{part_type}' content parts; convert media to "
+                        "base64 source image blocks before dispatch"
+                    )
         body: dict[str, Any] = {
             "model": request.model_name,
             "max_tokens": max_tokens,

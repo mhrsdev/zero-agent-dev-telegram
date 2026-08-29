@@ -13,6 +13,42 @@ real-run failure.
 
 ### Fixed
 
+- **SSE-only provider gateway killed every conversational reply with
+  granted tools** (live round-5 finding): `api.justwoker.icu` answers
+  every `chat/completions` request that declares `tools` with
+  `text/event-stream` chunks EVEN WHEN the request did not ask for
+  streaming. The toolless planner received clean JSON, but chat turns
+  with granted tools (web_search/MCP) died with "provider returned
+  invalid JSON" on every message. The OpenAI-compatible adapter now
+  detects a forced-SSE body (content-type or `data:` prefix) and
+  aggregates the delta stream into one canonical response — text
+  concatenated in arrival order, tool-call fragments merged by index
+  (ids kept, argument fragments concatenated), last `usage` and
+  `finish_reason` win, `[DONE]` terminates; non-SSE garbage bodies
+  still fail loudly. Hermes parity: `anthropic_adapter` documents the
+  same effectively-SSE-only gateway class. Pinned by
+  `test_openai_adapter_aggregates_forced_sse_body` /
+  `test_openai_adapter_still_rejects_garbage_body` and proven live
+  against the real gateway (`verify_sse_fix_live.py`: real SSE body →
+  aggregated content + usage 87/814, finish_reason=stop).
+- **MCP tool registration crashed engine restarts on a reused
+  database** (live round-5 finding): every boot re-discovers the
+  configured MCP servers and re-registers their tools; on an existing
+  database the second registration hit `ToolAlreadyExistsError` and
+  spammed warnings. Registration is now idempotent — an existing tool
+  row with the same name has its description/input schema refreshed
+  in place (schemas may legitimately change between restarts).
+- **Round-5 E2E driver hardening** (real-run infrastructure): the
+  driver resolves the live project/binding scope from the engine
+  database instead of hardcoding ids minted by a previous setup run,
+  and the setup deterministically pre-links the operator's Telegram
+  identity through the real identity pipeline — on a live bot the real
+  group delivers real messages around the clock and a real member's
+  message could race the driver for the one-shot auto-link-owner
+  bootstrap. `scripts/run_round5_e2e.py` boots the real engine as a
+  detached subprocess, waits for health, drives all 16 phases, and
+  tears the engine down — the whole real-credentials e2e is now a
+  single reproducible command.
 - **Polling `TransportError` wall on flaky/filtered networks** (reported
   session: `zero logs` showed `worker error: polling:ib_…: TransportError`
   every ~4 seconds for 8+ minutes, then sudden 200 OKs — the operator's

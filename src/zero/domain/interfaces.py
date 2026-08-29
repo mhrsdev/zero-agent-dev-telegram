@@ -207,6 +207,35 @@ class InterfaceBinding:
 
 
 # ----------------------------------------------------------------------
+# Media attachment (canonical envelope)
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MediaAttachment:
+    """One media item attached to an inbound message (Hermes parity).
+
+    Only transport facts travel on the envelope: the platform's file
+    reference plus self-declared metadata. Downloading, size policy, and
+    content handling stay in the application layer — the envelope never
+    carries media bytes.
+
+    Attributes:
+        kind: photo, document, voice, video, audio, or sticker.
+        file_id: the platform's opaque file reference (Telegram file_id).
+        file_name: original filename when the platform provides one.
+        mime_type: declared MIME type when available.
+        file_size: declared size in bytes when available.
+    """
+
+    kind: str
+    file_id: str
+    file_name: str | None = None
+    mime_type: str | None = None
+    file_size: int | None = None
+
+
+# ----------------------------------------------------------------------
 # Normalized event (canonical envelope)
 # ----------------------------------------------------------------------
 
@@ -229,6 +258,14 @@ class NormalizedEvent:
         event_kind: message, callback_query, command, other.
         content: the event's text content (redacted for storage).
         callback_token: for callback_query events, the opaque token.
+        media: attached media items (photos, documents, voice, ...).
+            Transport references only — download happens at the
+            application boundary, never on the envelope.
+        message_id: the platform's message ID (as text) when the event
+            is a chat message; used to thread replies under the source
+            message (Hermes reply-anchoring parity).
+        reply_to_message_id: the platform message ID this event replies
+            to, when the sender threaded it.
     """
 
     platform: Platform
@@ -241,6 +278,9 @@ class NormalizedEvent:
     callback_token: str | None = None
     transport_interaction_id: str | None = None
     transport_interaction_token: str | None = None
+    media: tuple[MediaAttachment, ...] = ()
+    message_id: str | None = None
+    reply_to_message_id: str | None = None
 
 
 # ----------------------------------------------------------------------

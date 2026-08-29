@@ -123,6 +123,7 @@ def sync_management_config(settings: Settings, services: Services) -> None:
     _sync_providers(settings, services, project, owner_id, cfg, cfgsvc)
     _sync_telegram_bindings(services, project, owner_id, cfg, cfgsvc)
     _sync_planner(services, cfg)
+    _ensure_web_search_tool(services, project, owner_id)
 
     # Bootstrap helper: in owner_only mode, the first sender to message
     # the bot is auto-linked as the project owner. This closes the
@@ -596,6 +597,84 @@ def _sync_planner(services: Services, cfg) -> None:
         services.interfaces._planner_provider,
         primary,
     )
+
+    # Align the conversational chat bridge with the primary model
+    # (round-5 live fix): the bridge was wired at build_services time
+    # with ``settings.openai_model`` (the gpt-4o-mini default) while the
+    # operator's gateway only serves the configured claude-opus-5 —
+    # every non-actionable chat turn then died with a 403
+    # auth_failure before the user saw any reply. The bridge must call
+    # exactly what the planner calls.
+    chat_bridge = getattr(services.interfaces, "chat_bridge", None)
+    if chat_bridge is not None:
+        chat_bridge.update_model(primary)
+        logger.info(
+            "config sync: conversational chat bridge aligned with "
+            "routing.primary_model=%s",
+            primary,
+        )
+
+
+def _ensure_web_search_tool(services: Services, project, owner_id) -> None:
+    """Make the keyless ``web_search`` tool real and granted (round 5).
+
+    ``WebSearchCfg`` was a stub referenced by the wizard and the doctor
+    while no runtime tool existed. The tool is registered once (by
+    name), granted to the management project's ``main_worker`` scope,
+    and backed by the inline DuckDuckGo-Lite handler so it runs under
+    the standard grant/redaction/audit pipeline like every other tool.
+    Idempotent across restarts: an existing tool row and an existing
+    grant short-circuit the registration.
+    """
+    try:
+        tool = services.tools._tool_repo.get_tool_by_name("web_search")
+    except Exception:  # noqa: BLE001 - not registered yet
+        tool = None
+    if tool is None:
+        from zero.app.tools_websearch import (
+            WEB_SEARCH_INPUT_SCHEMA,
+            WEB_SEARCH_OUTPUT_SCHEMA,
+            make_web_search_handler,
+        )
+
+        tool = services.tools.register_tool(
+            name="web_search",
+            description=(
+                "Search the public web (keyless DuckDuckGo backend) and "
+                "return up to 5 results with title, URL, and snippet."
+            ),
+            input_schema=WEB_SEARCH_INPUT_SCHEMA,
+            output_schema=WEB_SEARCH_OUTPUT_SCHEMA,
+            handler_key="web_search",
+            handler=make_web_search_handler(),
+            inline=True,
+        )
+        logger.info("config sync: web_search tool registered (id=%s)", tool.id.value)
+    try:
+        existing_grants = [
+            grant
+            for grant in services.tools._tool_repo.list_grants_for_project(project.id)
+            if grant.tool_id == tool.id and grant.agent_scope == "main_worker"
+        ]
+        if existing_grants:
+            return
+        services.tools.grant_tool(
+            project_id=project.id,
+            actor_id=owner_id,
+            tool_id=tool.id,
+            agent_scope="main_worker",
+            source="system",
+        )
+        logger.info(
+            "config sync: web_search granted to main_worker (project %s)",
+            project.id.value,
+        )
+    except Exception as exc:  # noqa: BLE001 - grant must not crash boot
+        logger.warning(
+            "config sync: web_search grant failed: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
 
 __all__ = ["sync_management_config"]

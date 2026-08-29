@@ -263,6 +263,27 @@ class MCPManager:
                     return handler
 
                 try:
+                    # Idempotent across engine restarts (live-run fix):
+                    # every reboot re-discovers the same MCP servers and
+                    # used to spam ToolAlreadyExistsError warnings on a
+                    # reused database. An existing tool row with the
+                    # same name is refreshed (schema/description may
+                    # have changed) instead of failing.
+                    try:
+                        existing = tool_service._tool_repo.get_tool_by_name(
+                            registered_name
+                        )
+                    except Exception:  # noqa: BLE001 - not registered yet
+                        existing = None
+                    if existing is not None:
+                        tool_service._tool_repo.update_tool_declaration(
+                            existing.id,
+                            description=str(tool.get("description") or ""),
+                            input_schema=schema,
+                            output_schema={"type": "object"},
+                        )
+                        names.append(registered_name)
+                        continue
                     tool_service.register_tool(
                         name=registered_name,
                         description=str(tool.get("description") or ""),

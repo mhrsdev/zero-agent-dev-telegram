@@ -23,6 +23,7 @@ from zero.app.artifact_service import ArtifactService
 from zero.app.audit_service import AuditService
 from zero.app.auth_service import AuthService
 from zero.app.authorization_service import AuthorizationService
+from zero.app.chat_service import ChatService
 from zero.app.compaction_service import CompactionService
 from zero.app.decomposition_analytics import DecompositionAnalytics
 from zero.app.identity_service import IdentityService
@@ -531,6 +532,36 @@ def build_services(
     # Late-bound outbound hook for the /start and /help command replies
     # (dead-bot session fix: a healthy bot used to stay silent on /start).
     interface_service.direct_reply_transport = interface_transport_service
+    # Conversational fallback (Hermes session parity, round 5): plain
+    # chat used to produce NOTHING on the Telegram surface — a message
+    # either became a plan proposal (invisible until someone opened the
+    # web UI) or silence. The bridge runs one bounded conversational
+    # turn (tools included, grants apply) with a durable per-scope
+    # transcript so restarts no longer amputate the conversation. The
+    # model below is the settings default; ``config_sync`` aligns it
+    # with ``routing.primary_model`` when a management config exists.
+    from zero.app.chat_history_repository import ChatHistoryRepository
+    from zero.app.telegram_chat import TelegramChatBridge
+
+    chat_service = ChatService(
+        providers=provider_service,
+        authorization=authorization_service,
+        tools=tool_service,
+    )
+    chat_history_repo = ChatHistoryRepository(database)
+    chat_bridge = TelegramChatBridge(
+        chat_service=chat_service,
+        transport_service=interface_transport_service,
+        history=chat_history_repo,
+        provider="openai-compatible",
+        model_name=settings.openai_model,
+    )
+    interface_service.chat_bridge = chat_bridge
+    logger.info(
+        "conversational chat bridge wired (provider=openai-compatible, "
+        "model=%s) — non-actionable chat now answers in the chat",
+        settings.openai_model,
+    )
     result_delivery_service = ResultDeliveryService(
         interface_repo,
         execution_repo,

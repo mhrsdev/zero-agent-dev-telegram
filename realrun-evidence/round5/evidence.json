@@ -1,0 +1,82 @@
+[
+  {
+    "phase": "P0 health",
+    "ok": true,
+    "detail": "{\"status\":\"ok\",\"version\":\"0.1.0\",\"environment\":\"development\",\"database\":\"ok\",\"migration_count\":34}"
+  },
+  {
+    "phase": "P1 capabilities",
+    "ok": true,
+    "detail": "{\"environment\":\"development\",\"capabilities\":{\"database_backend\":{\"status\":\"available\",\"detail\":\"sqlite (file)\"},\"worktree_execution\":{\"status\":\"unavailable\",\"de"
+  },
+  {
+    "phase": "P2a /start intake",
+    "ok": true,
+    "detail": "{\"id\":\"iev_0wffn2hi0536x1ocvbj0rqse\",\"project_id\":\"p_p5nqn4al08651z4skgzzyrsb\",\"platform\":\"telegram\",\"external_event_id\""
+  },
+  {
+    "phase": "P2b /start welcome reply delivered",
+    "ok": true,
+    "detail": "rows=1 sendMessage_logged=True"
+  },
+  {
+    "phase": "P3a actionable intake",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "phase": "P3b planner proposed + plan card with buttons sent",
+    "ok": true,
+    "detail": "revisions=1 tokens=2 card_sends_logged=3"
+  },
+  {
+    "phase": "P4a callback approve accepted",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "phase": "P4b plan approved via callback token",
+    "ok": true,
+    "detail": "approved_plans=1"
+  },
+  {
+    "phase": "P4c execution ran (real agent loop) + result delivered to REAL group",
+    "ok": true,
+    "detail": "delivery sent to Telegram THIS run (message_id=389)"
+  },
+  {
+    "phase": "P5a chat intake",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "phase": "P5b conversational reply (real claude-opus-5) + durable history",
+    "ok": true,
+    "detail": "last turns=[{'role': 'assistant', 'content': 'I\\'ll search for \"\u0628\u0648\u062f\u061f\".Here are the search results for \"\u0628\u0648\u062f\u061f\":\\n\\n1. **\u0628\u0648\u062f**\\n   \u0645\u0635\u0637\u0644\u062d \u0627\u0644\u0628\u0648\u062f (/\u02c8b\u0254\u02d0d/\u060c \u0631\u0645\u0632 \u0627\u0644\u0648\u062d\u062f\u0629 \"Bd\") \u0625\u0644\u0649 \u0627\u0644\u0631\u0645\u0648\u0632 \u0641\u064a \u0627\u0644\u062b\u0627\u0646\u064a\u0629 \u0627\u0644\u0648\u0627\u062d\u062f\u0629 \u0623\u0648 \u0645\u0639\u062f\u0644 \u0627\u0644\u0646\u0628\u0636\u0627\u062a \u0641\u064a \u0627\u0644\u062b\u0627\u0646\u064a\u0629 \u0627\u0644\u0648\u0627\u062d\u062f\u0629.\\n   Source: https://ar.wikipedia.org/wiki/%D8%A8%D9%88%D8%AF\\n\\n2. **\u0642\u0627\u0646\u0648\u0646 \u0628\u0648\u062f**\\n   \u0628\u062d\u064a\u062b \u0623\u0646 \u0643\u0644 \u0639\u062f\u062f \u0647\u0648 \u0636\u0639\u0641 \u0627\u0644\u0639\u062f\u062f \u0627\u0644\u0630\u064a \u0633\u0628\u0642\u0647.\\n   Source: https://ar.wikipedia.org/wiki/%D9%82%D8%A7%D9%86%D9%88%D9%86_%D8%A8%D9%88%D8%AF\\n\\n3. **\u30dc\u30fc\u30c9\u30fc\u3068\u306f\u4f55\uff1f \u308f\u304b\u308a\u3084\u3059\u304f\u89e3\u8aac Weblio\u8f9e\u66f8**\\n   \u51fa\u5178: \u30d5\u30ea\u30fc\u767e\u79d1\u4e8b\u5178\u300e\u30a6\u30a3\u30ad\u30da\u30c7\u30a3\u30a2\uff08Wikipedia\uff09\u300f (2025/11/07 21:21 UTC \u7248)\\n\u30dc\u30fc\u30c9\u30fc Bod\u00f8\\n----------------------------------------------|------------------------------------------------------------------------\\n\\n| \u5e02\u65d7 | \u5e02\u7ae0\\n\u4f4d\u7f6e...\\n   Source: https://www.weblio.jp/content/%E3%83%9C%E3%83%BC%E3%83%89%E3%83%BC\\n\\n4. **\u0627\u064a\u0631\u0628\u0644\u0627\u064a**\\n   1. \u2191 \"Apple Unveils AirPort Express for Mac & PC Users\".\\n   Source: https://ar.wikipedia.org/wiki/%D8%A7%D9%8A%D8%B1%D8%A8%D9%84%D8%A7%D9%8A\\n\\n5. **\u0632\u0648\u0644\u0627 \u0628\u0648\u062f**\\n   {{\u0627\u0633\u062a\u0634\u0647\u0627\u062f \u0628\u0648\u064a\u0628}}: |url= \u0628\u062d\u0627\u062c\u0629 \u0644\u0639\u0646\u0648\u0627\u0646 (\u0645\u0633\u0627\u0639\u062f\u0629) \u0648\u0627\u0644\u0648\u0633\u064a\u0637 |title= \u063a\u064a\u0631 \u0645\u0648\u062c\u0648\u062f \u0623\u0648 \u0641\u0627\u0631\u063a (\u0645\u0646 \u0648\u064a\u0643\u064a \u0628\u064a\u0627\u0646\u0627\u062a) (\u0645\u0633\u0627\u0639\u062f\u0629)\\n   Source: https://ar.wikipedia.org/wiki/%D8%B2%D9%88%D9%84%D8%A7_%D8%A8%D9%88%D8%AF\\n\\n6. **\u0628\u0648\u062f - Translation into English - examples Arabic**\\n   They play a double game, acting friendly in public but hostile in private.\\n   Source: https://context.reverso.net/translation/arabic-english/%D8%A8%D9%88%D8%AF\\n\\n7. **\u0628\u0648\u062f - Arabisch-Deutsch \u00dcbersetzung**\\n   Your activity on this service can be used to build or improve a profile about you for personalised advertising and content. Advertising and content performance can be measured. Reports can be generate...\\n   Source: https://de.pons.com/%C3%BCbersetzung/arabisch-deutsch/%D8%A8%D9%88%D8%AF\\n\\n8. **\u062c\u0633\u062f \u0627\u0644\u0623\u0628**\\n   \u0627\u0644\u0623\u0628 (\u0628\u0627\u0644\u0625\u0646\u062c\u0644\u064a\u0632\u064a\u0629: dad bod)\\n   Source: https://ar.wikipedia.org/wiki/%D8%AC%D8%B3%D8%AF_%D8%A7%D9%84%D8%A3%D8%A8\\n\\n9. **BODED Definition & Meaning**\\n   : to indicate (as a future event) by signs :\\n   Source: https://www.merriam-webster.com/dictionary/boded\\n\\n10. **\u0628\u0631\u0632\u0648\u0641\u0627 \u0628\u0648\u062f \u0628\u0631\u0627\u062f\u0644\u0648\u0645**\\n   \u0641\u0636\u0644\u064b\u0627 \u0633\u0627\u0639\u062f \u0641\u064a \u062a\u062d\u0633\u064a\u0646 \u0647\u0630\u0647 \u0627\u0644\u0645\u0642\u0627\u0644\u0629 \u0628\u0625\u0636\u0627\u0641\u0629 \u0648\u0635\u0644\u0627\u062a \u0625\u0644\u0649 \u0627\u0644\u0645\u0642\u0627\u0644\u0627\u062a \u0627\u0644\u0645\u062a\u0639\u0644\u0642\u0629 \u0628\u0647\u0627 \u0627\u0644\u0645\u0648\u062c\u0648\u062f\u0629 \u0641\u064a \u0627\u0644\u0646\u0635 \u0627\u0644\u062d\u0627\u0644\u064a. (\u0623\u0628\u0631\u064a\u0644 2026)\\n   Source: https://ar.wikipedia.org/wiki/%D8%A8%D8%B1%D8%B2%D9%88%D9%81%D8%A7_%D8%A8%D9%88%D8%AF_%D8%A8%D8%B1%D8%A7%D8%AF%D9%84%D9%88%D9%85\\n\\n\\nPlease note that these are web search results and may not be fully accurate or up-to-date.'}, {'role': 'user', 'content': 'Hello Zero! What can you do for me?'}]"
+  },
+  {
+    "phase": "P6a document intake",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "phase": "P6b document message handled without media crash",
+    "ok": true,
+    "detail": "assistant row present"
+  },
+  {
+    "phase": "P7 web_search granted (real keyless backend verified separately)",
+    "ok": true,
+    "detail": "grants=1"
+  },
+  {
+    "phase": "P8 MCP stdio server tool registered",
+    "ok": true,
+    "detail": "tools=['mcp_e2e_echo_add']"
+  },
+  {
+    "phase": "P9 real Telegram polling identity",
+    "ok": true,
+    "detail": "@SandboxEnvironmentBot"
+  }
+]

@@ -8,6 +8,8 @@ application interface service.
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -32,6 +34,8 @@ from zero.domain.secrets import SecretReferenceId
 from zero.persistence.repositories.interface_repository import InterfaceRepository
 
 from .interface_service import InterfaceAdapterService
+
+logger = logging.getLogger(__name__)
 
 
 class InterfaceTransportError(RuntimeError):
@@ -131,6 +135,8 @@ class InterfaceTransportService:
         text: str,
         chat_id: str | None = None,
         topic_id: str | None = None,
+        reply_to_message_id: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
     ) -> str:
         """Send one bounded result through a project-scoped binding.
 
@@ -144,6 +150,12 @@ class InterfaceTransportService:
         the event actually came from, not the synthetic scope (bug fix,
         dead-bot session 2026-08-29 — the /start welcome reply used to be
         sent to chat "0" and rejected by Telegram with HTTP 400).
+
+        ``reply_to_message_id`` threads the reply under the source
+        message (Hermes reply-anchoring parity, round 5); the adapter
+        drops a dead anchor on Telegram 400 and still delivers.
+        ``reply_markup`` carries inline keyboards (the plan card's
+        approve/reject buttons).
         """
         if self._secret_service is None or self._transport is None:
             raise InterfaceTransportNotConfigured("outbound messaging is not configured")
@@ -199,6 +211,8 @@ class InterfaceTransportService:
                     chat_id=chat_id if chat_id is not None else binding.chat_id,
                     topic_id=topic_id if topic_id is not None else binding.topic_id,
                     text=text,
+                    reply_to_message_id=reply_to_message_id,
+                    reply_markup=reply_markup,
                 )
             elif binding.platform == "discord":
                 adapter = DiscordAdapter(
@@ -251,6 +265,93 @@ class InterfaceTransportService:
             raise InterfaceTransportError(
                 f"outbound messaging request failed: {type(exc).__name__}"
             ) from exc
+
+    def build_telegram_adapter(
+        self,
+        *,
+        project_id: ProjectId,
+        binding_id: InterfaceBindingId,
+        actor_id: UserId,
+    ) -> TelegramAdapter:
+        """Build a short-lived Telegram adapter for a binding's credential.
+
+        Used by the conversational bridge for media downloads (getFile +
+        file bytes) and typing actions outside the sendMessage path.
+        The resolved token lives only inside the returned adapter and is
+        never returned to the caller (same contract as send_message).
+        """
+        if self._secret_service is None or self._transport is None:
+            raise InterfaceTransportNotConfigured("outbound messaging is not configured")
+        try:
+            binding = self._interface_repo.get_binding_by_id(project_id, binding_id)
+        except (InterfaceBindingNotFoundError, ValueError) as exc:
+            raise InterfaceScopeError("interface binding is not available") from exc
+        if not binding.is_enabled:
+            raise InterfaceScopeError("interface binding is not enabled")
+        if binding.platform != "telegram":
+            raise InterfaceScopeError("binding is not a Telegram scope")
+        if binding.bot_token_ref is None:
+            raise InterfaceTransportNotConfigured(
+                "interface binding has no bot credential reference"
+            )
+        try:
+            secret_id = SecretReferenceId(binding.bot_token_ref)
+            token = self._secret_service.resolve_value(
+                project_id=project_id,
+                secret_id=secret_id,
+                actor_id=actor_id,
+                source="system",
+            )
+        except Exception as exc:
+            raise InterfaceTransportError("interface credential could not be resolved") from exc
+        return TelegramAdapter(
+            event_handler=lambda _event: None,
+            transport=self._transport,
+            bot_token=token,
+            api_base_url=os.environ.get(
+                "ZERO_TELEGRAM_API_BASE", "https://api.telegram.org"
+            ).rstrip("/"),
+            retry_policy=RetryPolicy(attempts=1, backoff_seconds=0.5, timeout_seconds=30.0),
+        )
+
+    def send_typing(
+        self,
+        *,
+        project_id: ProjectId,
+        binding_id: InterfaceBindingId,
+        actor_id: UserId,
+        chat_id: str | None = None,
+        topic_id: str | None = None,
+    ) -> None:
+        """Best-effort typing indicator; NEVER raises.
+
+        A chat answer that takes ten seconds feels dead without the
+        typing bubble (Hermes ``_keep_typing`` parity, round 5). But the
+        indicator is pure cosmetics: any failure — missing credential,
+        disabled binding, provider hiccup — is swallowed at this
+        boundary so the real reply is never jeopardized.
+        """
+        try:
+            if self._secret_service is None or self._transport is None:
+                return
+            try:
+                binding = self._interface_repo.get_binding_by_id(project_id, binding_id)
+            except (InterfaceBindingNotFoundError, ValueError):
+                return
+            if not binding.is_enabled or binding.platform != "telegram":
+                return
+            if binding.bot_token_ref is None:
+                return
+            adapter = self.build_telegram_adapter(
+                project_id=project_id, binding_id=binding_id, actor_id=actor_id
+            )
+            adapter.send_chat_action(
+                chat_id=chat_id if chat_id is not None else binding.chat_id,
+                topic_id=topic_id if topic_id is not None else binding.topic_id,
+                action="typing",
+            )
+        except Exception as exc:  # noqa: BLE001 - typing must never break a turn
+            logger.debug("typing indicator skipped: %s", type(exc).__name__)
 
     def close(self) -> None:
         """Close the owned HTTP client during application shutdown."""
