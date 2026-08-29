@@ -1,0 +1,122 @@
+ZERO DEV TELEGRAM — TELEGRAM BOT DEAD: ROOT CAUSE + REPAIR GUIDE
+=================================================================
+Session date: 2026-08-29 · Commit 24903ff (on top of 30c18e8, 3e83358)
+
+WHAT WAS WRONG (the full chain)
+-------------------------------
+1. Your log showed the smoking gun:
+     SecretNotFoundError: Secret sec_uy3tukz5zk1mkbuwfzh7uejl not found
+     SecretNotFoundError: Secret sec_r3ty2jrepu2ky61puwp4lemv not found
+     (in project p_9kc33n0w3kkarb7a0phnyxi7)
+
+2. ROOT CAUSE — the engine's database moved with your working directory:
+   - `zero setup` stored your Telegram bot token + provider API key in an
+     encrypted SQLite database at  ./zero_develop.db  — RELATIVE TO THE
+     DIRECTORY YOU RAN SETUP FROM.
+   - `zero start` later resolved the SAME relative path from a DIFFERENT
+     directory (e.g. C:\Users\ysnrfd), silently created a FRESH, EMPTY
+     database there, created a new ghost project — and found none of your
+     secrets in it.
+   - With no token the engine never created a Telegram binding → the
+     polling worker had nothing to poll → the bot received NOTHING.
+     The web UI kept working because it needs no bot token.
+   - The engine also never read C:\Users\ysnrfd\.zero\.env — the file the
+     wizard writes keys into — so nothing could anchor the location.
+
+3. Two follow-on bugs were found while fixing this:
+   - After a repair, config.yaml carried a GHOST owner_project_id (from
+     the wrong database) which made the owner_only policy deny every
+     message. Now auto-repaired at boot.
+   - With two instances running (zero start + zero-develop serve), both
+     would poll the same bot token → Telegram 409 Conflict fights. Now
+     prevented by a cross-process lock + typed conflict backoff.
+   - Bonus: a healthy bot STILL said nothing to /start (there was no
+     /start handler at all). /start and /help now answer immediately.
+
+WHAT WAS FIXED (all verified end-to-end with real processes)
+------------------------------------------------------------
+- The engine now ALWAYS loads C:\Users\ysnrfd\.zero\.env (whatever your
+  $ZERO_HOME is) — the anchor file is never ignored again.
+- `zero setup` pins the ABSOLUTE database path into that .env file, so
+  every later start — from any directory — opens the same database.
+- New: `zero doctor` — diagnoses the installation; with --fix it finds
+  the database that actually holds your secrets (scans $ZERO_HOME, its
+  state/parent dirs, the current directory and its subfolders, plus a
+  usage history the CLI now records), backs up your .env, pins it, and
+  re-verifies every secret resolves.
+- config sync self-heals: if you export ZERO_TELEGRAM_BOT_TOKEN or
+  ZERO_OPENAI_API_KEY, they are stored into the encrypted store and
+  config.yaml is repointed automatically — the fix survives restarts.
+- Missing credentials now fail LOUDLY with the exact repair command
+  instead of quiet warnings.
+- Dual-instance 409 conflicts: the second instance skips Telegram
+  polling with a clear log message instead of fighting the first.
+- /start and /help now get a real reply; plan approval still works via
+  the inline buttons as before.
+
+HOW TO REPAIR YOUR MACHINE (Windows, in order)
+----------------------------------------------
+1. Extract the new code over your existing folder (or clone fresh):
+     zero-agent-dev-telegram-fixed-20260829-v2.zip
+   then, in that folder (PowerShell):
+     pip install -e .[dev]
+
+2. In the directory you USUALLY run zero from, run:
+     zero doctor
+   Read the report. Then apply the automatic repair:
+     zero doctor --fix
+   Expected output includes:
+     [FIX ] pinned engine database to <path> in $ZERO_HOME/.env
+     [RECHK] ok: telegram bot token=ok, provider ... api key=ok
+     verified: every secret reference now resolves — run 'zero restart'
+
+   NOTE: if `zero doctor` was run before, run it again AFTER installing
+   this version — the scan is much smarter now.
+
+3. Restart the service and verify:
+     zero restart
+     zero doctor
+   "telegram ... bot @<yourbot>" and "secret-references ... all N
+   reference(s) resolve" should be [ OK ] now.
+
+4. Test in Telegram: send /start to your bot in your group.
+   You should get: "Zero is online and this chat is linked. ..."
+   (If the group was never added, run:
+     zero telegram groups add --chat-id <your group id> )
+
+5. If doctor cannot find a database that holds your secrets (you may
+   have deleted the old one), either:
+     a) re-run `zero setup` and enter your credentials again, OR
+     b) set them once from the environment and let the engine store them:
+          $env:ZERO_TELEGRAM_BOT_TOKEN="<your token>"
+          $env:ZERO_OPENAI_API_KEY="<your key>"
+          zero restart
+        (they are stored encrypted; the env vars can be removed after)
+
+RUNNING TWO INSTANCES (zero start + zero-develop serve --port 8001)
+-------------------------------------------------------------------
+That is fine now. The FIRST instance owns Telegram polling; the second
+logs "another Zero process (pid N) is already long-polling this bot
+token — this instance skips Telegram polling" and simply serves its
+HTTP port. Only ONE instance may poll one bot token — this is a
+Telegram platform rule, not a Zero limitation.
+
+FILES CHANGED (key ones)
+------------------------
+src/zero/config.py                                  (env anchor)
+src/zero/manage/core/env_file.py                    (NEW: .env + pinning + history)
+src/zero/manage/cli.py                              (setup pin, doctor --fix, systemd guard)
+src/zero/manage/services/doctor.py                  (secret/drift checks + repair)
+src/zero/app/config_sync.py                         (self-heal + loud errors + stale repair)
+src/zero/app/poll_lock.py                           (NEW: cross-process poll lock)
+src/zero/app/background_workers.py                  (lock + 409 backoff + gateway base)
+src/zero/app/interface_service.py                   (/start //help replies)
+src/zero/app/interface_transport_service.py         (chat override + gateway base)
+src/zero/adapters/telegram.py                       (typed 409 conflict error)
+src/zero/cli.py                                     (honest dev banner)
+tests/test_dead_bot_regressions.py                  (NEW: 18 regression tests)
+scripts/verify_dead_bot_fixes.py                    (in-process verification)
+scripts/verify_real_processes.py                    (real-process e2e, 18 checks)
+
+Test status: 1043 passed, 10 skipped (env-gated), 1 pre-existing optional
+'textual' failure identical to the baseline.

@@ -27,6 +27,7 @@ safe to call on every boot — and silently returns when no
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from zero.app.services import Services
@@ -85,14 +86,33 @@ def sync_management_config(settings: Settings, services: Services) -> None:
     # resolve the owner's linked telegram identity. The wizard never
     # set this field — without it, ``owner_only`` mode denied every
     # message because ``owner_external_id`` stayed None forever.
-    if cfg.owner_project_id is None:
+    #
+    # Repair (2026-08-29, dead-bot session): a database-drift repair
+    # (``zero doctor --fix``) repoints the engine at the database that
+    # holds the real secrets — but config.yaml may still carry the
+    # owner_project_id of a GHOST "Zero Management" project the drifted
+    # engine created in the wrong database. The policy gate then failed
+    # closed on every message (project lookup misses → owner_external_id
+    # None). Realign the field with the project that actually exists in
+    # the engine database on every boot.
+    if cfg.owner_project_id != project.id.value:
+        stale = cfg.owner_project_id
         cfg.owner_project_id = project.id.value
         try:
             cfgsvc.save(cfg)
-            logger.info(
-                "config sync: persisted owner_project_id=%s into config.yaml",
-                project.id.value,
-            )
+            if stale is None:
+                logger.info(
+                    "config sync: persisted owner_project_id=%s into config.yaml",
+                    project.id.value,
+                )
+            else:
+                logger.warning(
+                    "config sync: repaired stale owner_project_id %s -> %s "
+                    "(the previous project does not exist in the engine "
+                    "database; a database drift was repaired)",
+                    stale,
+                    project.id.value,
+                )
         except Exception as exc:  # noqa: BLE001 - must not crash boot
             logger.warning(
                 "config sync: could not persist owner_project_id: %s: %s",
@@ -100,8 +120,8 @@ def sync_management_config(settings: Settings, services: Services) -> None:
                 exc,
             )
 
-    _sync_providers(settings, services, project, owner_id, cfg)
-    _sync_telegram_bindings(services, project, owner_id, cfg)
+    _sync_providers(settings, services, project, owner_id, cfg, cfgsvc)
+    _sync_telegram_bindings(services, project, owner_id, cfg, cfgsvc)
     _sync_planner(services, cfg)
 
     # Bootstrap helper: in owner_only mode, the first sender to message
@@ -121,6 +141,81 @@ def sync_management_config(settings: Settings, services: Services) -> None:
 # ----------------------------------------------------------------------
 # Internals
 # ----------------------------------------------------------------------
+
+
+def _recover_secret_from_env(
+    services: Services,
+    project,
+    owner_id,
+    *,
+    name: str,
+    secret_type: str,
+    env_value: str,
+    label: str,
+) -> str | None:
+    """Self-heal: store an env-provided credential as a fresh secret ref.
+
+    Bug fix (2026-08-29, dead-bot session): when a configured ``sec_...``
+    reference cannot be resolved (stale CWD-relative database), the
+    operator's documented escape hatch is to export the credential via
+    environment variables. Until this helper existed, config sync only
+    LOGGED the failure and disabled the feature anyway — the env var was
+    silently ignored. Now the value is persisted into the encrypted
+    store and the config reference is repointed, so the fix survives
+    restarts without the env var.
+
+    Idempotent: when a secret under ``name`` already resolves, it is
+    reused instead of duplicating rows.
+    """
+    import zero.domain.secrets as secrets_domain
+
+    # Reuse a previous recovery row when it still resolves.
+    try:
+        existing = services.secrets.get_reference_by_name(
+            project_id=project.id,
+            name=name,
+            actor_id=owner_id,
+            source="system",
+        )
+        if not existing.is_revoked:
+            services.secrets.resolve_value(
+                project_id=project.id,
+                secret_id=existing.id,
+                actor_id=owner_id,
+                source="system",
+            )
+            logger.info(
+                "config sync: reused existing secret %s for %s",
+                existing.id.value,
+                label,
+            )
+            return existing.id.value
+    except secrets_domain.SecretError:
+        pass
+    except Exception:  # noqa: BLE001 - fall through to a fresh store
+        pass
+    try:
+        ref = services.secrets.store(
+            project_id=project.id,
+            name=name,
+            secret_type=secret_type,  # type: ignore[arg-type]
+            value=env_value,
+            actor_id=owner_id,
+        )
+        logger.info(
+            "config sync: recovered %s from environment into secret %s",
+            label,
+            ref.id.value,
+        )
+        return ref.id.value
+    except Exception as exc:  # noqa: BLE001 - recovery is best-effort
+        logger.error(
+            "config sync: could not store recovered %s: %s: %s",
+            label,
+            type(exc).__name__,
+            exc,
+        )
+        return None
 
 
 def _ensure_management_project(services: Services):
@@ -143,6 +238,7 @@ def _sync_providers(
     project,
     owner_id,
     cfg,
+    cfgsvc=None,
 ) -> None:
     """Register provider adapters from config.yaml secret references."""
     from zero.app.provider_adapter import (
@@ -167,13 +263,67 @@ def _sync_providers(
                 source="system",
             )
         except Exception as exc:  # noqa: BLE001 - one bad provider must not block others
-            logger.warning(
-                "config sync: provider %s api_key resolve failed: %s: %s",
-                prov.id,
-                type(exc).__name__,
-                exc,
+            env_names = (
+                ("ZERO_ANTHROPIC_API_KEY",)
+                if prov.protocol == "anthropic"
+                else ("ZERO_OPENAI_API_KEY",)
             )
-            continue
+            env_value = next(
+                (os.environ[n].strip() for n in env_names if os.environ.get(n, "").strip()),
+                "",
+            )
+            recovered_key: str | None = None
+            if env_value and cfgsvc is not None:
+                new_ref = _recover_secret_from_env(
+                    services,
+                    project,
+                    owner_id,
+                    name=f"{prov.id}-api-key",
+                    secret_type="api_key",
+                    env_value=env_value,
+                    label=f"provider {prov.id} api key",
+                )
+                if new_ref:
+                    cfg.providers = [
+                        p if p.id != prov.id else p.model_copy(update={"api_key_ref": new_ref})
+                        for p in cfg.providers
+                    ]
+                    try:
+                        cfgsvc.save(cfg)
+                    except Exception as exc2:  # noqa: BLE001 - boot must survive
+                        logger.warning(
+                            "config sync: could not persist recovered provider ref: %s: %s",
+                            type(exc2).__name__,
+                            exc2,
+                        )
+                    else:
+                        logger.error(
+                            "config sync: provider %s api_key_ref %s failed to resolve "
+                            "(%s: %s) — RECOVERED from %s and repointed config.yaml to a "
+                            "fresh secret; restart once more without the env var to "
+                            "confirm persistence",
+                            prov.id,
+                            prov.api_key_ref,
+                            type(exc).__name__,
+                            exc,
+                            env_names[0],
+                        )
+                        prov = next(p for p in cfg.providers if p.api_key_ref == new_ref)
+                        recovered_key = env_value
+            if recovered_key is None:
+                logger.error(
+                    "config sync: provider %s api_key_ref %s failed to resolve (%s: %s) "
+                    "— the engine database does not contain the secret 'zero setup' "
+                    "stored; LLM calls will fail. Fix with ONE of: 'zero doctor --fix' "
+                    "(auto-repair), re-run 'zero setup', or export %s and restart.",
+                    prov.id,
+                    prov.api_key_ref,
+                    type(exc).__name__,
+                    exc,
+                    env_names[0],
+                )
+                continue
+            api_key = recovered_key  # proceed to adapter registration
 
         if prov.protocol == "anthropic":
             timeout = settings.anthropic_timeout_seconds
@@ -222,6 +372,7 @@ def _sync_telegram_bindings(
     project,
     owner_id,
     cfg,
+    cfgsvc=None,
 ) -> None:
     """Create/refresh enabled Telegram bindings from config.yaml.
 
@@ -248,20 +399,71 @@ def _sync_telegram_bindings(
         return
 
     # Verify the secret actually resolves before creating bindings.
+    token: str | None
     try:
-        services.secrets.resolve_value(
+        token = services.secrets.resolve_value(
             project_id=project.id,
             secret_id=SecretReferenceId(token_ref),
             actor_id=owner_id,
             source="system",
         )
-    except Exception as exc:  # noqa: BLE001 - boot must survive a bad secret
-        logger.warning(
-            "config sync: telegram bot token resolve failed: %s: %s",
-            type(exc).__name__,
-            exc,
+        logger.debug(
+            "config sync: telegram bot token resolved (value withheld, "
+            "length=%d)",
+            len(token),
         )
-        return
+    except Exception as exc:  # noqa: BLE001 - boot must survive a bad secret
+        env_token = os.environ.get("ZERO_TELEGRAM_BOT_TOKEN", "").strip()
+        if env_token and cfgsvc is not None:
+            new_ref = _recover_secret_from_env(
+                services,
+                project,
+                owner_id,
+                name="telegram-bot-token",
+                secret_type="token",
+                env_value=env_token,
+                label="telegram bot token",
+            )
+            if new_ref:
+                cfg.telegram.bot_token_ref = new_ref
+                try:
+                    cfgsvc.save(cfg)
+                except Exception as exc2:  # noqa: BLE001 - boot must survive
+                    logger.warning(
+                        "config sync: could not persist recovered bot token ref: %s: %s",
+                        type(exc2).__name__,
+                        exc2,
+                    )
+                else:
+                    logger.error(
+                        "config sync: telegram bot_token_ref %s failed to resolve "
+                        "(%s: %s) — RECOVERED from ZERO_TELEGRAM_BOT_TOKEN and "
+                        "repointed config.yaml; restart once more without the env "
+                        "var to confirm persistence",
+                        token_ref,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    token_ref = new_ref
+                    token = env_token
+                # Fall through to binding creation with the recovered ref.
+            else:
+                return
+        else:
+            logger.error(
+                "config sync: TELEGRAM POLLING IS DISABLED — bot_token_ref %s "
+                "failed to resolve (%s: %s). The engine database does not "
+                "contain the secret 'zero setup' stored (the database location "
+                "drifted between runs). The bot will not respond to /start or "
+                "any message until this is fixed. Fix with ONE of: "
+                "'zero doctor --fix' (locates and pins the right database "
+                "automatically), re-run 'zero setup' in the directory you run "
+                "the service from, or export ZERO_TELEGRAM_BOT_TOKEN and restart.",
+                token_ref,
+                type(exc).__name__,
+                exc,
+            )
+            return
 
     existing = {
         (b.platform, b.chat_id): b
@@ -366,6 +568,14 @@ def _sync_planner(services: Services, cfg) -> None:
 
     # Create the planner on demand if it was not constructed at
     # build_services time (i.e. settings.openai_api_key was None).
+    registered = services.providers.registered_provider_names
+    if not registered:
+        logger.error(
+            "config sync: planner wired to model %s but NO provider adapter is "
+            "registered (see the provider errors above) — LLM replies will "
+            "fail until the provider api key resolves or is recovered",
+            primary,
+        )
     if services.interfaces._planner is None:
         from zero.app.planner_service import PlannerService
 

@@ -13,6 +13,84 @@ real-run failure.
 
 ### Fixed
 
+- **Telegram bot completely dead (engine database drift)** (reported
+  session: bot did not respond even to `/start`; only the local web UI
+  worked; engine log showed `SecretNotFoundError` for every configured
+  `sec_...` reference). Root cause: the engine resolved its development
+  database as `sqlite:///./zero_develop.db` — RELATIVE TO THE PROCESS
+  CWD. `zero setup` stored the operator's secrets into the database it
+  saw from its own directory; `zero start` later booted the engine from
+  a different directory, silently created a fresh, secret-less database
+  with a ghost "Zero Management" project, and every secret reference in
+  config.yaml failed to resolve — so no provider was registered, no
+  Telegram binding was ever created, and the bot could neither receive
+  nor reply to a single message. Multi-layer fix, each layer verified
+  with real processes:
+  - `Settings.load()` now defaults its `.env` path to
+    `$ZERO_HOME/.env` (previously the engine NEVER read the file the
+    wizard and the key bootstraps persist values into); process
+    environment variables still win.
+  - `zero setup` pins the ABSOLUTE database URL it stored secrets into
+    into `$ZERO_HOME/.env`, making the secret store location stable
+    regardless of the directory later commands run from.
+  - New `zero doctor --fix` capability: when configured references do
+    not resolve, the doctor scans the known candidate databases
+    (CLI-recorded usage history, `$ZERO_HOME`, its state dir and parent,
+    the CWD and its one-level subdirectories) for the one that holds
+    ALL of them, backs up `$ZERO_HOME/.env`, pins that database, and
+    re-verifies through a fresh engine. The reference checks
+    (`secret-references`, `database-drift`, `secret-key`) are new.
+  - config sync self-heal: when a secret reference fails to resolve and
+    `ZERO_TELEGRAM_BOT_TOKEN` / `ZERO_OPENAI_API_KEY` /
+    `ZERO_ANTHROPIC_API_KEY` is set, the credential is stored into the
+    encrypted store and config.yaml is repointed (survives restarts
+    without the env var). Without a recovery path the failure is now a
+    LOUD error naming `zero doctor --fix` instead of a scattered
+    warning.
+  - config sync repairs a STALE `owner_project_id` in config.yaml (a
+    ghost project id persisted by the drifted engine made the
+    owner_only policy gate deny every message even after the database
+    repair).
+- **Duplicate Telegram polling (HTTP 409 conflicts)**: with the drift
+  repaired, `zero start` and `zero-develop serve` running side by side
+  would both long-poll the same bot token — Telegram answers the loser
+  with 409 forever and updates get split between two engines. A
+  cross-process, per-token advisory lock (`$ZERO_HOME/poll-locks/`,
+  Windows-safe, stale-lock stealing by pid liveness) makes the second
+  engine SKIP polling with a clear one-time log; a genuine 409 from a
+  foreign poller is now the typed `TelegramConflictError` and the
+  polling worker backs off exponentially (5s doubling to 60s) instead
+  of hot-looping.
+- **Bot silent on /start and /help**: a healthy bot still produced no
+  outbound artifact for commands — `/start` is the universal
+  "is this bot alive" probe, so operators reasonably concluded the bot
+  was still broken. `/start` and `/help` now get an immediate,
+  best-effort welcome/help reply through the transport boundary,
+  targeted at the chat the event actually came from (the polling-only
+  binding's synthetic `chat_id="0"` must never receive a message).
+- **Delivery path bypassed a configured Bot API gateway**: the
+  result-delivery and command-reply transport built its Telegram
+  adapter without `ZERO_TELEGRAM_API_BASE`, silently hitting
+  api.telegram.org even when the setup/doctor probes and the polling
+  worker honored the gateway. All outbound paths now share the escape
+  hatch; the polling adapter honors it too.
+- **`zero start`/`stop`/`status` broke on hosts where the `systemctl`
+  binary exists but PID 1 is not systemd** (WSL, containers): the gate
+  was the mere presence of the binary, so every systemctl call failed
+  with "System has not been booted with systemd" and `zero start`
+  started NOTHING. Systemd is now used only when it manages the machine
+  AND the unit exists; the plain-process fallback runs otherwise.
+- **`zero doctor` provider reachability probe hardcoded port 443**,
+  failing every self-hosted gateway on a custom port or plain http; the
+  probe now honors the base URL's scheme and port.
+- **Dev banner lied about the database**: `zero-develop serve` printed
+  "local SQLite at ./zero_develop.db" even when `$ZERO_HOME/.env` pinned
+  an absolute database path; the banner is now printed from the RESOLVED
+  settings and `_env_file_declares_zero_env` consults `$ZERO_HOME/.env`
+  when no explicit `--env-file` is given.
+
+### Fixed (earlier in this release)
+
 - **Port-blind bugs in the serve/start pre-checks** (reported session:
   managed service running on 8000, operator ran ``zero-develop serve
   --port 8001`` and was refused with the false claim that "a foreground

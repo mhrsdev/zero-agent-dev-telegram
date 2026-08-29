@@ -492,6 +492,9 @@ def build_services(
         secret_service=secret_service,
         transport=interface_transport,
     )
+    # Late-bound outbound hook for the /start and /help command replies
+    # (dead-bot session fix: a healthy bot used to stay silent on /start).
+    interface_service.direct_reply_transport = interface_transport_service
     result_delivery_service = ResultDeliveryService(
         interface_repo,
         execution_repo,

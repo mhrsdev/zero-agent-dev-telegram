@@ -132,6 +132,12 @@ class InterfaceAdapterService:
         self._planner = planner
         self._planner_provider = planner_provider
         self._planner_model = planner_model
+        # Late-bound outbound hook (set by the composition root after the
+        # InterfaceTransportService exists): any object exposing
+        # ``send_message(project_id=..., binding_id=..., actor_id=...,
+        # text=...)``. Used ONLY for the /start and /help command replies —
+        # plan results keep flowing through the durable delivery queue.
+        self.direct_reply_transport = None
         # Bootstrap helper: when the management project's owner has no
         # linked Telegram identity yet, the first sender to message the
         # bot is auto-linked as that owner. This closes the onboarding
@@ -769,7 +775,8 @@ class InterfaceAdapterService:
                 user_id=resolved_user_id,
             )
         else:
-            # Other event kinds: log and ignore.
+            # Other event kinds: log and ignore. Commands (/start, /help)
+            # land here — send their best-effort immediate reply.
             entry = InterfaceEventLogEntry(
                 id=InterfaceEventId(generate_interface_event_id()),
                 project_id=binding.project_id,
@@ -786,6 +793,9 @@ class InterfaceAdapterService:
                 created_at=_now_utc_iso(),
             )
             self._record_event(entry)
+            self._maybe_send_command_reply(
+                binding=binding, event=event, user_id=resolved_user_id
+            )
             return entry
 
     def _process_message(
@@ -883,7 +893,71 @@ class InterfaceAdapterService:
             created_at=_now_utc_iso(),
         )
         self._record_event(entry)
+        self._maybe_send_command_reply(binding=binding, event=event, user_id=user_id)
         return entry
+
+    _COMMAND_REPLIES: dict[str, str] = {
+        "/start": (
+            "Zero is online and this chat is linked. \n\n"
+            "Send engineering work as a plain message and I will draft a "
+            "plan for your approval. Plans are approved or rejected right "
+            "here via the buttons under the proposal. Use /help anytime."
+        ),
+        "/help": (
+            "Zero commands:\n"
+            "\u2022 /start \u2014 check that the bot is alive and linked\n"
+            "\u2022 /help \u2014 this help\n\n"
+            "Anything else you send is treated as engineering work: I draft "
+            "an actionable plan, you review it, and approve/reject it via "
+            "the inline buttons. Casual chat and questions are acknowledged "
+            "but never executed."
+        ),
+    }
+
+    def _maybe_send_command_reply(
+        self,
+        *,
+        binding: InterfaceBinding,
+        event: NormalizedEvent,
+        user_id: UserId,
+    ) -> None:
+        """Best-effort immediate reply for /start and /help commands.
+
+        Bug fix (2026-08-29, dead-bot session): a healthy bot still stayed
+        SILENT on ``/start`` \u2014 the universal "is this bot alive" probe \u2014
+        because commands produced no outbound artifact at all. Operators
+        reasonably concluded the bot was still broken. The reply is sent
+        directly through the transport boundary (NOT the execution-result
+        delivery queue, whose schema is execution-bound), is idempotent
+        per update through the transport's own semantics, and any failure
+        is logged without ever failing the durable intake.
+        """
+        transport = getattr(self, "direct_reply_transport", None)
+        if transport is None:
+            return
+        first_token = (event.content or "").strip().split(" ", 1)[0]
+        first_token = first_token.split("@", 1)[0].lower()
+        reply = self._COMMAND_REPLIES.get(first_token)
+        if reply is None:
+            return
+        try:
+            transport.send_message(
+                project_id=binding.project_id,
+                binding_id=binding.id,
+                actor_id=user_id,
+                text=reply,
+                # Reply to the chat the event actually came from — the
+                # polling-only binding (chat_id="0") must never receive
+                # the message itself.
+                chat_id=str(event.chat_id),
+                topic_id=str(event.topic_id) if event.topic_id else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - replies must never fail intake
+            logger.info(
+                "command reply for %s could not be sent: %s",
+                first_token,
+                type(exc).__name__,
+            )
 
     def _process_callback(
         self,

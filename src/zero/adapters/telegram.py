@@ -14,6 +14,7 @@ from .messaging import (
     BaseMessagingAdapter,
     HttpResponse,
     HttpTransport,
+    PermanentTransportError,
     RetryPolicy,
     UnsupportedUpdateError,
     WebhookAuthError,
@@ -24,6 +25,18 @@ from .messaging import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class TelegramConflictError(AdapterError):
+    """Another getUpdates consumer is polling this bot token (HTTP 409).
+
+    Bug fix (2026-08-29, dead-bot session): two live engines (`zero start`
+    + `zero-develop serve`) long-polled the SAME bot token. Telegram
+    rejects the loser with 409, which used to surface as an anonymous
+    PermanentTransportError and hot-looped at full polling speed. The
+    polling worker now recognizes this typed error and backs off with a
+    clear, one-time explanation instead of error-spamming.
+    """
 
 
 class TelegramAdapter(BaseMessagingAdapter):
@@ -181,7 +194,20 @@ class TelegramAdapter(BaseMessagingAdapter):
         return f"{self._api_base_url}/bot{self._bot_token}/{method}"
 
     def _call_api(self, method: str, payload: dict[str, Any]) -> HttpResponse:
-        response = self._request("POST", self._api_url(method), payload=payload)
+        try:
+            response = self._request("POST", self._api_url(method), payload=payload)
+        except PermanentTransportError as exc:
+            # Translate "HTTP status 409" into a typed conflict error so
+            # the polling worker can back off instead of hot-looping.
+            message = str(exc)
+            if "status 409" in message:
+                raise TelegramConflictError(
+                    "another getUpdates consumer (a second Zero instance, or "
+                    "another process using this bot token) is already "
+                    "long-polling Telegram — only ONE poller per bot token "
+                    "is allowed"
+                ) from exc
+            raise
         data = self._response_json(response)
         if not isinstance(data, Mapping) or data.get("ok") is False:
             raise RuntimeError("Telegram API returned an unsuccessful response")

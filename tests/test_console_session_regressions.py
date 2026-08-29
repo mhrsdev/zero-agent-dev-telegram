@@ -111,7 +111,7 @@ def test_serve_refuses_when_managed_service_running(tmp_path, monkeypatch, capsy
     assert "--port 8001" in err
 
 
-def test_serve_on_free_port_runs_alongside_managed_service(tmp_path, monkeypatch, capsys):
+def test_serve_on_free_port_runs_alongside_managed_service(env_snapshot, tmp_path, monkeypatch, capsys):
     """THE reported bug: managed service on 8000, operator asked for
     --port 8001 (free) and was refused with "a foreground server cannot
     bind the same port". A free port must start, with an honest note.
@@ -233,7 +233,7 @@ def test_port_available_detects_real_listener():
         listener.close()
 
 
-def test_dev_key_banner_reuses_existing_key(tmp_path, monkeypatch, capsys):
+def test_dev_key_banner_reuses_existing_key(env_snapshot, tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("ZERO_HOME", str(tmp_path))
     monkeypatch.setenv("ZERO_DATABASE_URL", f"sqlite:///{tmp_path / 'e.db'}")
     monkeypatch.delenv("ZERO_ENV", raising=False)
@@ -258,7 +258,7 @@ def test_dev_key_banner_reuses_existing_key(tmp_path, monkeypatch, capsys):
     assert key_lines == [f"ZERO_SECRET_KEY={existing}"]
 
 
-def test_dev_key_banner_reports_generation_on_fresh_host(tmp_path, monkeypatch, capsys):
+def test_dev_key_banner_reports_generation_on_fresh_host(env_snapshot, tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("ZERO_HOME", str(tmp_path))
     monkeypatch.setenv("ZERO_DATABASE_URL", f"sqlite:///{tmp_path / 'e.db'}")
     monkeypatch.delenv("ZERO_ENV", raising=False)

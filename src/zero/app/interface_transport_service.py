@@ -128,12 +128,21 @@ class InterfaceTransportService:
         binding_id: InterfaceBindingId,
         actor_id: UserId,
         text: str,
+        chat_id: str | None = None,
+        topic_id: str | None = None,
     ) -> str:
         """Send one bounded result through a project-scoped binding.
 
         The binding stores only a secret reference. The raw token is resolved
         immediately before adapter I/O and is never returned or included in
         an exception raised by this composition boundary.
+
+        ``chat_id``/``topic_id`` override the binding's own chat scope.
+        This is required for replies to events consumed through the
+        polling-only binding (chat_id="0"): the reply must go to the chat
+        the event actually came from, not the synthetic scope (bug fix,
+        dead-bot session 2026-08-29 — the /start welcome reply used to be
+        sent to chat "0" and rejected by Telegram with HTTP 400).
         """
         if self._secret_service is None or self._transport is None:
             raise InterfaceTransportNotConfigured("outbound messaging is not configured")
@@ -160,14 +169,23 @@ class InterfaceTransportService:
 
         try:
             if binding.platform == "telegram":
+                import os as _os
+
                 adapter = TelegramAdapter(
                     event_handler=lambda _event: None,
                     transport=self._transport,
                     bot_token=token,
+                    # Honor the same gateway escape hatch the setup/doctor
+                    # probes and the polling worker use — without this the
+                    # delivery path silently bypassed a configured Bot API
+                    # gateway (found via the real-process e2e, 2026-08-29).
+                    api_base_url=_os.environ.get(
+                        "ZERO_TELEGRAM_API_BASE", "https://api.telegram.org"
+                    ).rstrip("/"),
                 )
                 response = adapter.send_message(
-                    chat_id=binding.chat_id,
-                    topic_id=binding.topic_id,
+                    chat_id=chat_id if chat_id is not None else binding.chat_id,
+                    topic_id=topic_id if topic_id is not None else binding.topic_id,
                     text=text,
                 )
             elif binding.platform == "discord":

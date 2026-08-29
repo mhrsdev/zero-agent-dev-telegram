@@ -51,6 +51,14 @@ def _engine_services(env_file: str | None = None):
     database = open_database(settings)
     apply_migrations(database)
     services = build_services(settings, database)
+    # Bookkeeping for `zero doctor`: remember which database THIS command
+    # resolved in THIS directory, so a later drift can be auto-repaired.
+    try:
+        from zero.manage.core.env_file import record_database_usage
+
+        record_database_usage()
+    except Exception:  # noqa: BLE001 - bookkeeping must never break a command
+        pass
     return settings, services
 
 
@@ -208,7 +216,10 @@ def cmd_setup(ns) -> int:
         print("imported environment into draft")
 
     if not ns.non_interactive:
-        return _interactive_setup(setup)
+        rc = _interactive_setup(setup)
+        if rc == 0:
+            _pin_database_after_setup()
+        return rc
 
     if not ns.step:
         _fail(
@@ -267,7 +278,39 @@ def cmd_setup(ns) -> int:
         print(f"error: configuration invalid: {type(exc).__name__}: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     print("configuration written:", cfgsvc.path)
+    _pin_database_after_setup()
     return 0
+
+
+def _pin_database_after_setup() -> None:
+    """Pin the wizard's database into $ZERO_HOME/.env after a commit.
+
+    Bug fix (2026-08-29, "bot completely dead" session): the wizard
+    stores secrets into the database resolved IN ITS CWD (development
+    fallback ``sqlite:///./zero_develop.db``), while ``zero start`` later
+    resolved the same RELATIVE URL from a different directory and booted
+    a fresh, secret-less database — every ``sec_...`` reference in
+    config.yaml then failed with SecretNotFoundError and the bot could
+    not respond even to /start. Pinning the ABSOLUTE database URL into
+    ``$ZERO_HOME/.env`` (which every engine start now loads by default)
+    makes the storage location stable regardless of CWD.
+    """
+    try:
+        from zero.manage.core.env_file import pin_database_url
+
+        report = pin_database_url()
+    except Exception as exc:  # noqa: BLE001 - never fail setup over the pin
+        print(
+            f"note: could not pin the database into {_home() / '.env'} "
+            f"({type(exc).__name__}: {exc}) — if the Telegram bot stays "
+            "silent after 'zero start', run 'zero doctor'."
+        )
+        return
+    if report.get("pinned"):
+        print(
+            f"pinned engine database into {_home() / '.env'} "
+            f"({', '.join(report['pinned'])}): {report['database_url']}"
+        )
 
 
 def _interactive_setup(setup) -> int:
@@ -661,8 +704,36 @@ def _pid_alive(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+
+def _systemd_active() -> bool:
+    """True only when systemd MANAGES this machine AND the unit exists.
+
+    Bug fix (2026-08-29, e2e session): `cmd_start`/`cmd_stop`/status
+    gated on the mere PRESENCE of the systemctl binary. On hosts where
+    the binary is installed but PID 1 is NOT systemd (WSL, containers,
+    chroots), every `systemctl` call failed with "System has not been
+    booted with systemd" and `zero start` silently started NOTHING
+    while still printing status output. The plain-process fallback now
+    runs on such hosts.
+    """
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return False
+    if not Path("/run/systemd/system").exists():
+        return False
+    try:
+        return (
+            subprocess.run(
+                [systemctl, "cat", SERVICE_NAME], capture_output=True, check=False
+            ).returncode
+            == 0
+        )
+    except OSError:
+        return False
+
+
 def _service_status() -> dict[str, str]:
-    if shutil.which("systemctl"):
+    if _systemd_active():
         rc = subprocess.run(
             ["systemctl", "is-active", SERVICE_NAME],
             capture_output=True,
@@ -745,7 +816,7 @@ def _probe_host(host: str) -> str:
 
 
 def cmd_start(ns) -> int:
-    if shutil.which("systemctl"):
+    if _systemd_active():
         subprocess.run(["systemctl", "start", SERVICE_NAME], check=False)
         return cmd_status(ns)
     # Bug fix: a second `zero start` used to spawn a doomed duplicate that
@@ -786,6 +857,15 @@ def cmd_start(ns) -> int:
     # Bug fix: the log file was opened before $ZERO_HOME existed, so a
     # fresh `zero start` crashed with FileNotFoundError. Create it first.
     _home().mkdir(parents=True, exist_ok=True)
+    # Bookkeeping for `zero doctor`: record which database THIS spawn
+    # (resolved in THIS directory) will open, so a later CWD drift is
+    # diagnosable and auto-repairable via `zero doctor --fix`.
+    try:
+        from zero.manage.core.env_file import record_database_usage
+
+        record_database_usage()
+    except Exception:  # noqa: BLE001 - bookkeeping must never break start
+        pass
     log = open(_home() / "zero.log", "ab")  # noqa: SIM115
     spawn: dict = {}
     if os.name == "nt":
@@ -854,7 +934,7 @@ def cmd_start(ns) -> int:
 
 
 def cmd_stop(ns) -> int:
-    if shutil.which("systemctl"):
+    if _systemd_active():
         subprocess.run(["systemctl", "stop", SERVICE_NAME], check=False)
         return 0
     pid_file = _home() / "zero.pid"
@@ -923,7 +1003,16 @@ def cmd_logs(ns) -> int:
 def cmd_doctor(ns) -> int:
     from zero.manage.services.doctor import DoctorService
 
-    report = DoctorService(_cfgsvc(), _engine_services).run()
+    doctor = DoctorService(_cfgsvc(), _engine_services)
+    if getattr(ns, "fix", False):
+        fix_report = doctor.fix()
+        for line in fix_report["fixed"]:
+            print(f"[FIX ] {line}")
+        recheck = fix_report.get("recheck")
+        if recheck is not None:
+            sym = "ok" if recheck["ok"] else "FAIL"
+            print(f"[RECHK] {sym}: " + ", ".join(f"{l}={s}" for l, s in recheck["details"]))
+    report = doctor.run()
     failed = [c for c in report["checks"] if c["status"] == "fail"]
     warn = [c for c in report["checks"] if c["status"] == "warn"]
     if ns.json:
@@ -933,13 +1022,10 @@ def cmd_doctor(ns) -> int:
         for c in report["checks"]:
             print(f"{sym[c['status']]} {c['name']}: {c['detail']}")
         print(f"\n{len(report['checks'])} checks · {len(failed)} fail · {len(warn)} warn")
-    if ns.fix:
-        # Audit S7: the previous message claimed fixes were applied when
-        # DoctorService implements none. Be honest until real automated
-        # remediation exists.
-        print(
-            "no automated fixes are available in this release; apply the suggested actions manually"
-        )
+    if getattr(ns, "fix", False) and not failed:
+        return 0
+    if getattr(ns, "fix", False):
+        print("issues remain — see the [FAIL] lines above for the manual next action")
     return 4 if failed else 0
 
 
@@ -1259,7 +1345,7 @@ def cmd_uninstall(ns) -> int:
             " is KEPT unless --purge-data.\nRe-run with --yes to proceed."
         )
         return 3
-    if shutil.which("systemctl"):
+    if _systemd_active():
         subprocess.run(["systemctl", "stop", SERVICE_NAME], check=False)
         subprocess.run(["systemctl", "disable", SERVICE_NAME], check=False)
         unit = Path("/etc/systemd/system/zero.service")

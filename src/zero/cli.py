@@ -81,10 +81,16 @@ def _load(env_file: str | None) -> Settings:
 
 
 def _env_file_declares_zero_env(env_file: str | None) -> bool:
-    """True when the provided .env file sets ZERO_ENV itself."""
-    if not env_file:
-        return False
-    path = Path(env_file)
+    """True when the effective .env sets ZERO_ENV itself.
+
+    With ``env_file=None`` the effective file is ``$ZERO_HOME/.env``
+    (Settings.load now defaults to it), so it must be consulted too —
+    otherwise the dev banner claimed development defaults while the
+    engine was actually loading a pinned configuration.
+    """
+    path = Path(env_file) if env_file else (
+        Path(os.environ.get("ZERO_HOME", str(Path.home() / ".zero"))) / ".env"
+    )
     if not path.is_file():
         return False
     return any(key == "ZERO_ENV" for key, _ in _parse_dotenv(path))
@@ -241,14 +247,17 @@ def _port_available(host: str, port: int) -> bool:
 
 
 def _dev_serve_banner(home: Path) -> list[str]:
-    """The two guidance lines printed when ZERO_ENV is not set.
+    """The two guidance lines printed when ZERO_ENV is not explicit.
 
     Bug fix: the second line always said "run 'zero setup'" even when a
     configured installation already existed — precisely the operator
     state in the reported session (setup done, then confused about why
-    `zero-develop serve` still assumed development).
+    `zero-develop serve` still assumed development). The first line no
+    longer hardcodes ``./zero_develop.db``: with ``$ZERO_HOME/.env`` now
+    loaded by default the resolved database may be a pinned absolute
+    path (the real path is printed separately from loaded settings).
     """
-    first = "[zero] ZERO_ENV is not set; assuming 'development' (local SQLite at ./zero_develop.db)."
+    first = "[zero] ZERO_ENV is not explicitly set; assuming 'development'."
     if (home / "config.yaml").is_file():
         second = (
             f"[zero] A configured installation exists at {home / 'config.yaml'} — "
@@ -330,13 +339,24 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     # safe development defaults may be assumed automatically.
     dev_default = not ("ZERO_ENV" in os.environ or _env_file_declares_zero_env(args.env_file))
     if dev_default:
-        for line in _dev_serve_banner(Path(os.environ.get("ZERO_HOME", str(Path.home() / ".zero")))):
-            print(line, file=sys.stderr)
         settings = Settings.load(
             env_file=args.env_file,
             zero_env_fallback="development",
         )
         settings = _ensure_development_secret_key(settings, args.env_file)
+        # Honest banner (bug fix): printed from the RESOLVED settings —
+        # the old banner hardcoded "local SQLite at ./zero_develop.db"
+        # even when $ZERO_HOME/.env pinned a different, absolute path.
+        home = Path(os.environ.get("ZERO_HOME", str(Path.home() / ".zero")))
+        for line in _dev_serve_banner(home):
+            print(line, file=sys.stderr)
+        try:
+            from zero.manage.core.env_file import absolutize_sqlite_url
+
+            db_display = absolutize_sqlite_url(settings.database_url, Path.cwd())
+        except Exception:  # noqa: BLE001 - banner must never crash serve
+            db_display = str(settings.database_url)
+        print(f"[zero] database: {db_display}", file=sys.stderr)
     else:
         settings = _load(args.env_file)
     configure_logging(settings.log_level)

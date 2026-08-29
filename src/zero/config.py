@@ -224,7 +224,14 @@ class Settings(BaseModel):
 
         Args:
             env_file: Optional path to a ``.env`` file for local
-                development. Ignored if the file does not exist.
+                development. Ignored if the file does not exist. When
+                ``None``, ``$ZERO_HOME/.env`` is used automatically —
+                bug fix (2026-08-29): the engine entry points
+                (``zero.main``, spawned by ``zero start``) never passed
+                a path, so the file ``zero setup``/``_ensure_*_key``
+                persist values into was silently NEVER read. Process
+                environment variables still take precedence over file
+                values.
             zero_env_fallback: Optional environment to assume when
                 ``ZERO_ENV`` is not set anywhere (process env or env
                 file). Only ``"development"`` is accepted — production
@@ -237,6 +244,21 @@ class Settings(BaseModel):
         Raises:
             ConfigError: if any fail-closed rule is violated.
         """
+        # Bug fix (2026-08-29): when the caller passes no explicit .env
+        # path, default to $ZERO_HOME/.env — the one file the setup
+        # wizard and the key bootstraps persist engine-critical values
+        # (ZERO_SECRET_KEY, pinned ZERO_DATABASE_URL) into. Without this
+        # default those values were invisible to `zero start`/uvicorn,
+        # which let the database drift per-CWD until every secret
+        # reference in config.yaml failed to resolve.
+        if env_file is None:
+            import os
+            from pathlib import Path as _Path
+
+            _home = _Path(os.environ.get("ZERO_HOME", str(_Path.home() / ".zero")))
+            _default_env = _home / ".env"
+            if _default_env.is_file():
+                env_file = _default_env
         raw = _read_env(env_file)
         zero_env = raw.get("ZERO_ENV")
         if zero_env is None:

@@ -44,6 +44,8 @@ class WorkerHostStatus:
     scheduler_ticks: int = 0
     delivery_drains: int = 0
     polling_iterations: int = 0
+    polling_conflicts: int = 0
+    polling_locked_out: int = 0
     last_errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
@@ -52,6 +54,8 @@ class WorkerHostStatus:
             "scheduler_ticks": self.scheduler_ticks,
             "delivery_drains": self.delivery_drains,
             "polling_iterations": self.polling_iterations,
+            "polling_conflicts": self.polling_conflicts,
+            "polling_locked_out": self.polling_locked_out,
             "recent_error_count": len(self.last_errors),
         }
 
@@ -152,30 +156,100 @@ class BackgroundWorkerHost:
         complete gateway. Each enabled Telegram binding is polled with
         its own resolved bot credential and its own durable offset so
         one malformed or unconfigured binding cannot stall the others.
+
+        Bug fixes (2026-08-29, dead-bot session):
+        - a cross-process lock (``TokenPollLock``) makes a second engine
+          (``zero start`` + ``zero-develop serve`` running side by side)
+          SKIP polling the same bot token instead of fighting the first
+          engine with HTTP 409 conflicts and splitting its updates;
+        - a genuine 409 (foreign poller) is recognized as the typed
+          ``TelegramConflictError`` and answered with an exponential
+          backoff per binding (5s doubling to 60s) plus a one-time,
+          actionable log line — instead of a full-speed error loop.
         """
+        from zero.adapters.telegram import TelegramConflictError
+        from zero.app.poll_lock import TokenPollLock
+
         interval = max(0.1, float(self._settings.polling_interval_seconds))
         cursor_store = _InMemoryCursorStore()
-        while not self._stop.is_set():
-            polled_any = False
-            for binding_poll in self._telegram_poll_targets():
-                if self._stop.is_set():
-                    break
-                _project, binding, token = binding_poll
-                try:
-                    adapter = _build_binding_adapter(
-                        services=self._services,
-                        chat_token=token,
-                        cursor_store=cursor_store,
-                    )
-                    updates = await asyncio.to_thread(adapter.poll_once, scope_key=binding.id.value)
-                    polled_any = polled_any or bool(updates)
-                    self.status.polling_iterations += 1
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - per-binding isolation
-                    self._record_error(f"polling:{binding.id.value}: {type(exc).__name__}")
-            if not polled_any:
-                await self._wait(interval)
+        poll_lock = TokenPollLock()
+        backoff_until: dict[str, float] = {}
+        backoff_step: dict[str, int] = {}
+        conflict_reported: set[str] = set()
+        lock_reported: set[str] = set()
+        lock_state: dict[str, bool] = {}  # token -> acquired?
+        try:
+            while not self._stop.is_set():
+                polled_any = False
+                now = _loop_monotonic()
+                for binding_poll in self._telegram_poll_targets():
+                    if self._stop.is_set():
+                        break
+                    _project, binding, token = binding_poll
+                    bid = binding.id.value
+                    if now < backoff_until.get(bid, 0.0):
+                        continue
+                    # Acquire ONCE per token and hold it for the loop's
+                    # lifetime — re-acquiring every iteration would race
+                    # against our own lock file.
+                    if token not in lock_state:
+                        acquired, holder = poll_lock.try_acquire(token)
+                        lock_state[token] = acquired
+                        if not acquired:
+                            self.status.polling_locked_out += 1
+                            if bid not in lock_reported:
+                                lock_reported.add(bid)
+                                logger.warning(
+                                    "polling:%s: another Zero process (pid %s) is "
+                                    "already long-polling this bot token — this "
+                                    "instance skips Telegram polling to avoid 409 "
+                                    "conflicts; stop the other instance if this one "
+                                    "should own the bot",
+                                    bid,
+                                    holder,
+                                )
+                    if not lock_state[token]:
+                        continue
+                    try:
+                        adapter = _build_binding_adapter(
+                            services=self._services,
+                            chat_token=token,
+                            cursor_store=cursor_store,
+                        )
+                        updates = await asyncio.to_thread(
+                            adapter.poll_once, scope_key=binding.id.value
+                        )
+                        polled_any = polled_any or bool(updates)
+                        self.status.polling_iterations += 1
+                        backoff_step.pop(bid, None)
+                        conflict_reported.discard(bid)
+                    except asyncio.CancelledError:
+                        raise
+                    except TelegramConflictError as exc:
+                        self.status.polling_conflicts += 1
+                        step = min(6, backoff_step.get(bid, 0) + 1)
+                        backoff_step[bid] = step
+                        delay = min(60.0, 5.0 * (2 ** (step - 1)))
+                        backoff_until[bid] = _loop_monotonic() + delay
+                        if bid not in conflict_reported:
+                            conflict_reported.add(bid)
+                            logger.warning(
+                                "polling:%s: Telegram reports ANOTHER getUpdates "
+                                "consumer for this bot token (409) — backing off "
+                                "%.0fs before retrying; if another Zero instance "
+                                "is running, stop it or let it own the bot",
+                                bid,
+                                delay,
+                            )
+                        else:
+                            logger.debug("polling:%s: conflict backoff %.0fs", bid, delay)
+                        self._record_error(f"polling:{bid}: {type(exc).__name__}")
+                    except Exception as exc:  # noqa: BLE001 - per-binding isolation
+                        self._record_error(f"polling:{bid}: {type(exc).__name__}")
+                if not polled_any:
+                    await self._wait(interval)
+        finally:
+            poll_lock.release_all()
 
     # ------------------------------------------------------------------
     # Tick bodies (run in worker threads; synchronous service boundary)
@@ -252,6 +326,13 @@ class BackgroundWorkerHost:
         return targets
 
 
+def _loop_monotonic() -> float:
+    """Monotonic seconds for polling backoff timing (test-seamable)."""
+    import time
+
+    return time.monotonic()
+
+
 class _InMemoryCursorStore:
     """Process-local polling offsets.
 
@@ -291,18 +372,28 @@ def _build_binding_adapter(*, services, chat_token: str, cursor_store):
     The per-request budget now always exceeds the long-poll hold
     (+10s margin), and attempts=1 because a completed long poll IS the
     wait — the outer polling loop is the retry.
+
+    2026-08-29: the API base now honors ``ZERO_TELEGRAM_API_BASE``
+    (same escape hatch the setup/doctor probes always had), so a
+    self-hosted Bot API gateway or a test server works uniformly.
     """
+    import os as _os
+
     from zero.adapters.messaging import RetryPolicy
     from zero.adapters.telegram import TelegramAdapter
 
     poll_timeout = 25
     transports = services.interface_transports
     transport = transports.http_transport if transports is not None else None
+    api_base = _os.environ.get(
+        "ZERO_TELEGRAM_API_BASE", "https://api.telegram.org"
+    ).rstrip("/")
     return TelegramAdapter(
         event_handler=services.interfaces.process_inbound_event,
         transport=transport,
         bot_token=chat_token,
         cursor_store=cursor_store,
+        api_base_url=api_base,
         poll_timeout_seconds=poll_timeout,
         retry_policy=RetryPolicy(
             attempts=1,
