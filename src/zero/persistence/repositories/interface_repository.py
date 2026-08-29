@@ -224,6 +224,39 @@ class InterfaceRepository:
         if commit:
             conn.commit()
 
+    def update_binding_token_ref(
+        self,
+        binding_id: InterfaceBindingId,
+        bot_token_ref: str,
+        *,
+        project_id: ProjectId | None = None,
+        commit: bool = True,
+    ) -> None:
+        """Set ``bot_token_ref`` on an existing binding.
+
+        Used by ``config_sync`` to backfill a bot credential onto a
+        binding created without one (e.g. the wizard created the
+        binding before the bot token was stored).
+        """
+        conn = self._database.connect()
+        sql = (
+            "UPDATE interface_bindings SET bot_token_ref = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE id = ?"
+        )
+        params: tuple[object, ...] = (bot_token_ref, binding_id.value)
+        if project_id is not None:
+            sql += " AND project_id = ?"
+            params += (project_id.value,)
+        cursor = conn.execute(sql, params)
+        if cursor.rowcount == 0:
+            raise InterfaceBindingNotFoundError(
+                f"Binding {binding_id} not found"
+                + (f" in project {project_id}" if project_id else "")
+            )
+        if commit:
+            conn.commit()
+
     # ------------------------------------------------------------------
     # Durable result delivery queue
     # ------------------------------------------------------------------

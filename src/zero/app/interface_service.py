@@ -35,8 +35,11 @@ Per PLAN.md M13 validation:
 from __future__ import annotations
 
 import contextvars
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 from zero.app.authorization_service import AuthorizationService
 from zero.app.plan_service import PlanService
@@ -129,6 +132,15 @@ class InterfaceAdapterService:
         self._planner = planner
         self._planner_provider = planner_provider
         self._planner_model = planner_model
+        # Bootstrap helper: when the management project's owner has no
+        # linked Telegram identity yet, the first sender to message the
+        # bot is auto-linked as that owner. This closes the onboarding
+        # loop so ``zero setup`` → ``zero start`` → message-the-bot
+        # actually works without a manual identity-linking step. The
+        # flag is set by ``config_sync`` only when ``access.mode ==
+        # owner_only``; production deployments with multiple users keep
+        # the historical strict behavior.
+        self.auto_link_owner_project_id = None
         self._claim_token = contextvars.ContextVar[str | None](
             "zero_interface_claim_token", default=None
         )
@@ -201,6 +213,147 @@ class InterfaceAdapterService:
             processing_detail=detail,
             created_at=_now_utc_iso(),
         )
+
+    def _try_auto_link_owner(
+        self,
+        *,
+        binding: InterfaceBinding,
+        platform: str,
+        external_id: str,
+    ) -> bool:
+        """One-shot bootstrap: link the first sender as the project owner.
+
+        Returns True when the sender was linked (or was already linked).
+
+        Pre-conditions (all checked here, not at the call site):
+          - ``auto_link_owner_project_id`` matches the binding's project
+            (set by ``config_sync`` for the management project only).
+          - The project owner has no verified Telegram identity yet.
+          - The sender is not already linked to any user.
+
+        This closes the ``zero setup`` → ``zero start`` → message-the-bot
+        loop without forcing the operator through a manual identity-linking
+        CLI step. After the first link, subsequent senders follow the
+        standard strict path (linked + project member).
+        """
+        if self.auto_link_owner_project_id is None:
+            return False
+        if binding.project_id.value != self.auto_link_owner_project_id:
+            return False
+        if not external_id or not external_id.strip():
+            return False
+        try:
+            project = self._identity_repo.get_project(binding.project_id)
+        except Exception:  # noqa: BLE001 - bootstrap must never crash intake
+            return False
+        owner_id = project.owner_user_id
+        # Already linked? (idempotent — the sender may have been linked
+        # by a previous bootstrap call in this same process.)
+        existing = None
+        getter = getattr(self._identity_repo, "get_external_identity", None)
+        if callable(getter):
+            existing = getter(platform, external_id)
+        if existing is not None:
+            # Already linked to someone — verify if needed.
+            if existing.verified_at is None and self._identity_service is not None:
+                try:
+                    self._identity_service.verify_external_identity(
+                        platform=platform,
+                        external_id=external_id,
+                        source="telegram",
+                    )
+                except Exception:  # noqa: BLE001
+                    return False
+            return True
+        # Refuse if the owner already has ANY verified telegram identity
+        # — bootstrap is one-shot per owner, so a second person messaging
+        # before the operator explicitly links them is NOT auto-linked.
+        try:
+            links = self._identity_repo.list_external_identities_for_user(owner_id)
+        except Exception:  # noqa: BLE001
+            return False
+        for link in links:
+            if link.platform == "telegram" and link.verified_at is not None:
+                return False
+        # Link the sender to the owner, verified.
+        try:
+            self._identity_service.link_external_identity(
+                user_id=owner_id,
+                platform=platform,  # type: ignore[arg-type]
+                external_id=external_id,
+                verified=True,
+                source="system",
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        logger.info(
+            "auto-linked first Telegram sender %s as owner of project %s "
+            "(bootstrap; subsequent senders require explicit linking)",
+            external_id,
+            binding.project_id.value,
+        )
+        return True
+
+    def _try_auto_create_binding(self, event: NormalizedEvent) -> bool:
+        """Bootstrap: auto-create a binding for an unknown chat.
+
+        Pre-conditions (all checked here):
+          - ``auto_link_owner_project_id`` is set (owner_only mode).
+          - The project owner has no verified Telegram identity yet
+            (one-shot bootstrap — after the owner is linked, unknown
+            chats follow the strict ``ignored_disabled`` path).
+          - A "polling-only" binding (chat_id="0") exists to source the
+            bot_token_ref. config_sync creates this when no groups are
+            configured.
+
+        Returns True when a binding was created (or already exists) for
+        the event's chat. The caller re-fetches the binding after this
+        returns True.
+        """
+        if self.auto_link_owner_project_id is None:
+            return False
+        try:
+            from zero.domain.identity import ProjectId as _ProjectId
+
+            project = self._identity_repo.get_project(
+                _ProjectId(self.auto_link_owner_project_id)
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        owner_id = project.owner_user_id
+        # One-shot: if the owner already has a verified Telegram
+        # identity, bootstrap is over — unknown chats are not auto-bound.
+        try:
+            links = self._identity_repo.list_external_identities_for_user(owner_id)
+        except Exception:  # noqa: BLE001
+            return False
+        for link in links:
+            if link.platform == "telegram" and link.verified_at is not None:
+                return False
+        # Source the bot_token_ref from the polling-only binding.
+        poll_binding = self._repo.get_binding(event.platform, "0", None)
+        if poll_binding is None or not poll_binding.bot_token_ref:
+            return False
+        try:
+            self.create_binding(
+                project_id=project.id,
+                actor_id=owner_id,
+                platform=event.platform,
+                chat_id=event.chat_id,
+                topic_id=event.topic_id,
+                bot_token_ref=poll_binding.bot_token_ref,
+                is_enabled=True,
+                source="system",
+            )
+            logger.info(
+                "auto-created telegram binding for chat %s (bootstrap; "
+                "project %s)",
+                event.chat_id,
+                project.id.value,
+            )
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------------------------------------------------------------
     # Scope management
@@ -435,33 +588,25 @@ class InterfaceAdapterService:
         # 2. Resolve the interface binding (scope check).
         binding = self._repo.get_binding(event.platform, event.chat_id, event.topic_id)
         if binding is None or not binding.is_enabled:
-            # Disabled or unbound scope: no side effects.
-            entry = InterfaceEventLogEntry(
-                id=InterfaceEventId(generate_interface_event_id()),
-                project_id=binding.project_id if binding else None,
-                platform=event.platform,
-                external_event_id=event.external_event_id,
-                external_actor_id=event.external_actor_id,
-                resolved_user_id=None,
-                chat_id=event.chat_id,
-                topic_id=event.topic_id,
-                event_kind=event.event_kind,
-                event_content=_event_content(event.content),
-                processing_result="ignored_disabled",
-                processing_detail="scope not enabled",
-                created_at=_now_utc_iso(),
-            )
-            self._record_event(entry)
-            return entry
-
-        # 2.5 Access-policy gate (management layer; default off).
-        gate = getattr(self, "policy_gate", None)
-        if gate is not None:
-            decision = gate(event.platform, event.external_actor_id, event.chat_id)
-            if decision is not None and not decision.allowed:
+            # Bootstrap path: when auto-link-owner is enabled (owner_only
+            # mode, management project) and the owner has no linked
+            # Telegram identity yet, auto-create a binding for this chat
+            # so the first message can be processed. This makes the
+            # ``zero setup`` → ``zero start`` → message-the-bot flow
+            # work even when the operator skipped the ``groups`` step
+            # in the wizard. The new binding inherits the bot token from
+            # the polling-only binding (chat_id="0") that config_sync
+            # created. After the owner is linked, subsequent unknown
+            # chats follow the strict ``ignored_disabled`` path.
+            if binding is None and self._try_auto_create_binding(event):
+                binding = self._repo.get_binding(
+                    event.platform, event.chat_id, event.topic_id
+                )
+            if binding is None or not binding.is_enabled:
+                # Disabled or unbound scope: no side effects.
                 entry = InterfaceEventLogEntry(
                     id=InterfaceEventId(generate_interface_event_id()),
-                    project_id=binding.project_id,
+                    project_id=binding.project_id if binding else None,
                     platform=event.platform,
                     external_event_id=event.external_event_id,
                     external_actor_id=event.external_actor_id,
@@ -469,13 +614,25 @@ class InterfaceAdapterService:
                     chat_id=event.chat_id,
                     topic_id=event.topic_id,
                     event_kind=event.event_kind,
-                    event_content="[policy denied]",
-                    processing_result="denied",
-                    processing_detail=f"policy: {decision.reason}",
+                    event_content=_event_content(event.content),
+                    processing_result="ignored_disabled",
+                    processing_detail="scope not enabled",
                     created_at=_now_utc_iso(),
                 )
                 self._record_event(entry)
                 return entry
+
+        # 2.5 Access-policy gate (management layer; default off).
+        #
+        # Bug fix (real server run, 2026-08-29): the gate used to run
+        # BEFORE identity resolution. In owner_only mode with no linked
+        # owner yet, the gate denied EVERY message (owner_external_id
+        # was None) — so the auto-link-owner bootstrap could never fire
+        # and the bot was permanently stuck. The gate now runs AFTER
+        # identity resolution: the auto-link-owner logic links the first
+        # sender as the owner, and THEN the gate sees a real
+        # owner_external_id and allows the message.
+        gate = getattr(self, "policy_gate", None)
 
         # 3. Resolve the external identity to a Zero User.
         try:
@@ -505,6 +662,26 @@ class InterfaceAdapterService:
                     )
                     resolved_user_id = identity.user_id
                     auto_verified = True
+            # Bootstrap path: when the management project owner has no
+            # linked Telegram identity yet, auto-link the first sender
+            # as that owner. This makes ``zero setup`` → ``zero start``
+            # → message-the-bot work without a manual CLI step.
+            if (
+                not auto_verified
+                and self.auto_link_owner_project_id is not None
+                and self._identity_service is not None
+                and self._try_auto_link_owner(
+                    binding=binding,
+                    platform=event.platform,
+                    external_id=event.external_actor_id,
+                )
+            ):
+                identity = self._identity_repo.require_verified_external_identity(
+                    event.platform,
+                    event.external_actor_id,
+                )
+                resolved_user_id = identity.user_id
+                auto_verified = True
             if not auto_verified:
                 entry = InterfaceEventLogEntry(
                     id=InterfaceEventId(generate_interface_event_id()),
@@ -519,6 +696,30 @@ class InterfaceAdapterService:
                     event_content=_event_content(event.content),
                     processing_result="ignored_unlinked",
                     processing_detail="external identity not linked or not verified",
+                    created_at=_now_utc_iso(),
+                )
+                self._record_event(entry)
+                return entry
+
+        # 2.6 Access-policy gate (runs AFTER identity resolution so the
+        # auto-link-owner bootstrap can link the first sender before the
+        # owner_only gate checks owner_external_id).
+        if gate is not None:
+            decision = gate(event.platform, event.external_actor_id, event.chat_id)
+            if decision is not None and not decision.allowed:
+                entry = InterfaceEventLogEntry(
+                    id=InterfaceEventId(generate_interface_event_id()),
+                    project_id=binding.project_id,
+                    platform=event.platform,
+                    external_event_id=event.external_event_id,
+                    external_actor_id=event.external_actor_id,
+                    resolved_user_id=resolved_user_id,
+                    chat_id=event.chat_id,
+                    topic_id=event.topic_id,
+                    event_kind=event.event_kind,
+                    event_content="[policy denied]",
+                    processing_result="denied",
+                    processing_detail=f"policy: {decision.reason}",
                     created_at=_now_utc_iso(),
                 )
                 self._record_event(entry)

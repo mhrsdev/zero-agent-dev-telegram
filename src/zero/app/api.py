@@ -89,6 +89,17 @@ def build_application_services(
         # outcomes remain explicitly unreplayed; active execution/worktree
         # recovery is fenced by the worker's project/actor checks.
         services.recovery.run_all_recovery()
+        # Bug fix (real server run, 2026-08-29): the engine's Settings
+        # load only reads env vars, but the setup wizard writes provider
+        # API keys and the Telegram bot token as secret references in
+        # config.yaml. Without this sync, ``zero start`` booted a
+        # server with no provider adapters and no polling targets —
+        # the bot could never receive or reply to a single message.
+        # sync_management_config is idempotent and no-ops when no
+        # config.yaml exists (developer ``zero-develop serve`` path).
+        from zero.app.config_sync import sync_management_config
+
+        sync_management_config(settings, services)
     return database, services
 
 
