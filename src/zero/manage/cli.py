@@ -720,6 +720,30 @@ def _port_busy(host: str, port: int) -> bool:
     return False
 
 
+def _managed_bind() -> tuple[str, int]:
+    """The (host, port) ``zero start`` spawns the service on.
+
+    Bug fix (ignored server config): the bind used to be hardcoded to
+    127.0.0.1:8000 in four places while config.yaml exposes
+    ``server.host``/``server.port`` (ServerCfg) — a configured port was
+    silently ignored and `zero-develop serve`'s pre-checks disagreed
+    with where the managed service actually lived. Both CLIs now resolve
+    the managed bind through this single helper. A missing or invalid
+    configuration falls back to the loopback defaults so a fresh host
+    stays startable (``zero-develop serve`` mirrors this fallback).
+    """
+    try:
+        server = _cfgsvc().load().server
+        return server.host, int(server.port)
+    except Exception:  # noqa: BLE001 - config problems must not brick start
+        return "127.0.0.1", 8000
+
+
+def _probe_host(host: str) -> str:
+    """A host usable as an HTTP connect target (wildcards → loopback)."""
+    return "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host
+
+
 def cmd_start(ns) -> int:
     if shutil.which("systemctl"):
         subprocess.run(["systemctl", "start", SERVICE_NAME], check=False)
@@ -744,15 +768,20 @@ def cmd_start(ns) -> int:
     # never mistake ANOTHER healthy service on the port for the one we
     # just spawned (its /healthz would answer for the child that is
     # about to die). Refuse up front with an actionable message.
-    if _port_busy("127.0.0.1", 8000):
-        if _healthz_ok("http://127.0.0.1:8000/healthz"):
+    # Bug fix (ignored server config): the bind now honors
+    # server.host/server.port from config.yaml instead of a hardcoded
+    # 127.0.0.1:8000 (see _managed_bind).
+    bind_host, bind_port = _managed_bind()
+    probe_host = _probe_host(bind_host)
+    if _port_busy(bind_host, bind_port):
+        if _healthz_ok(f"http://{probe_host}:{bind_port}/healthz"):
             print(
-                "port 8000 already serves a healthy Zero service that this "
+                f"port {bind_port} already serves a healthy Zero service that this "
                 "pid file does NOT manage — stop that process first, or use "
                 "'zero status' to inspect it"
             )
         else:
-            print("port 8000 is already in use by another process — stop it first")
+            print(f"port {bind_port} is already in use by another process — stop it first")
         return 1
     # Bug fix: the log file was opened before $ZERO_HOME existed, so a
     # fresh `zero start` crashed with FileNotFoundError. Create it first.
@@ -768,7 +797,16 @@ def cmd_start(ns) -> int:
     else:
         spawn["start_new_session"] = True
     proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "zero.main:app", "--host", "127.0.0.1", "--port", "8000"],
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "zero.main:app",
+            "--host",
+            bind_host,
+            "--port",
+            str(bind_port),
+        ],
         stdout=log,
         stderr=log,
         **spawn,
@@ -795,7 +833,7 @@ def cmd_start(ns) -> int:
             for line in _last_log_lines(5):
                 print(f"  {line}", file=sys.stderr)
             return 1
-        if _healthz_ok("http://127.0.0.1:8000/healthz"):
+        if _healthz_ok(f"http://{probe_host}:{bind_port}/healthz"):
             # Guard the health answer against the spawn/bind race: a child
             # that lost the port to a foreign process dies right after
             # startup — never credit a foreign service for ours.
@@ -805,7 +843,7 @@ def cmd_start(ns) -> int:
                 for line in _last_log_lines(5):
                     print(f"  {line}", file=sys.stderr)
                 return 1
-            print(f"service healthy at http://127.0.0.1:8000 (pid={proc.pid})")
+            print(f"service healthy at http://{bind_host}:{bind_port} (pid={proc.pid})")
             return 0
         time.sleep(0.25)
     print(

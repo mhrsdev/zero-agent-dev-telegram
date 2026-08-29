@@ -27,6 +27,18 @@ Covers every defect visible in the pasted ``zero setup`` / ``zero start`` /
    and report completion.
 8. ``model_assign`` silently accepted a fallback identical to the primary
    (no resilience) — now a non-blocking warning.
+9. Port-blind bugs (reported session: managed service on 8000, operator
+   asked for ``--port 8001`` and was refused with the false claim that a
+   foreground server "cannot bind the same port"):
+   a. ``zero-develop serve`` refused whenever the managed service ran,
+      regardless of the requested port — the pre-check is now port-aware
+      (a genuinely free port runs alongside, with an honest note).
+   b. Both serve refusals suggested a hardcoded ``--port 8001`` — the
+      exact command the operator had just run (circular); suggestions
+      are now verified bindable at print time.
+   c. ``zero start`` ignored ``server.host``/``server.port`` from
+      config.yaml (hardcoded 127.0.0.1:8000); both CLIs now resolve the
+      managed bind through one shared helper.
 """
 
 from __future__ import annotations
@@ -84,6 +96,8 @@ def test_serve_refuses_when_managed_service_running(tmp_path, monkeypatch, capsy
     monkeypatch.setenv("ZERO_HOME", str(tmp_path))
     (tmp_path / "zero.pid").write_text("424242", encoding="utf-8")
     monkeypatch.setattr("zero.manage.cli._pid_alive", lambda pid: True)
+    # Deterministic suggestion (no real port probing in tests).
+    monkeypatch.setattr("zero.cli._suggest_free_port", lambda host, port: 8001)
 
     from zero.cli import main as dev_main
 
@@ -91,8 +105,97 @@ def test_serve_refuses_when_managed_service_running(tmp_path, monkeypatch, capsy
     err = capsys.readouterr().err
     assert rc == 1
     assert "already running (pid 424242" in err
+    # The refusal names the ACTUAL managed bind, not an assumed port.
+    assert "on 127.0.0.1:8000" in err
     assert "zero stop" in err
     assert "--port 8001" in err
+
+
+def test_serve_on_free_port_runs_alongside_managed_service(tmp_path, monkeypatch, capsys):
+    """THE reported bug: managed service on 8000, operator asked for
+    --port 8001 (free) and was refused with "a foreground server cannot
+    bind the same port". A free port must start, with an honest note.
+    """
+    monkeypatch.setenv("ZERO_HOME", str(tmp_path))
+    monkeypatch.setenv("ZERO_DATABASE_URL", f"sqlite:///{tmp_path / 'e.db'}")
+    monkeypatch.delenv("ZERO_ENV", raising=False)
+    monkeypatch.setattr("zero.cli._managed_service_pid", lambda: 4242)
+    monkeypatch.setattr("zero.cli._managed_service_bind", lambda: ("127.0.0.1", 8000))
+    monkeypatch.setattr("zero.cli._port_available", lambda host, port: True)
+    monkeypatch.setattr("zero.app.api.create_app", lambda settings: object())
+    uvicorn_calls: dict = {}
+    monkeypatch.setattr("uvicorn.run", lambda app, **k: uvicorn_calls.update(k))
+
+    from zero.cli import main as dev_main
+
+    rc = dev_main(["serve", "--port", "8001"])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert uvicorn_calls["port"] == 8001 and uvicorn_calls["host"] == "127.0.0.1"
+    assert "pid 4242" in err and "127.0.0.1:8000" in err
+    assert "alongside" in err
+    assert "already running" not in err
+
+
+def test_serve_same_port_refusal_is_port_aware(tmp_path, monkeypatch, capsys):
+    """Managed service running + explicit --port 8000 → still refused,
+    now naming the actual managed bind and a verified-free alternative."""
+    monkeypatch.setenv("ZERO_HOME", str(tmp_path))
+    (tmp_path / "zero.pid").write_text("424242", encoding="utf-8")
+    monkeypatch.setattr("zero.manage.cli._pid_alive", lambda pid: True)
+    monkeypatch.setattr("zero.cli._suggest_free_port", lambda host, port: 8001)
+
+    from zero.cli import main as dev_main
+
+    rc = dev_main(["serve", "--port", "8000"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "already running (pid 424242" in err
+    assert "on 127.0.0.1:8000" in err
+    assert "zero stop" in err
+    assert "--port 8001" in err
+
+
+def test_serve_busy_foreign_port_suggests_verified_free_port(tmp_path, monkeypatch, capsys):
+    """The old hint suggested the very port that failed (circular); it
+    must name a port that is actually bindable and never the failing one."""
+    monkeypatch.setenv("ZERO_HOME", str(tmp_path))
+    busy = {8001}
+    monkeypatch.setattr("zero.cli._port_available", lambda host, port: port not in busy)
+
+    from zero.cli import main as dev_main
+
+    rc = dev_main(["serve", "--port", "8001"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "127.0.0.1:8001 is already in use" in err
+    assert "--port 8002" in err
+
+
+def test_suggest_free_port_finds_bindable_port():
+    from zero.cli import _port_available, _suggest_free_port
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        busy_port = listener.getsockname()[1]
+        # The suggestion never proposes a port that is currently listening.
+        suggestion = _suggest_free_port("127.0.0.1", busy_port)
+        assert suggestion != busy_port
+        assert _port_available("127.0.0.1", suggestion) is True
+    finally:
+        listener.close()
+
+
+def test_binds_overlap_unit():
+    from zero.cli import _binds_overlap
+
+    assert _binds_overlap("127.0.0.1", 8000, "127.0.0.1", 8000)
+    assert _binds_overlap("0.0.0.0", 8000, "127.0.0.1", 8000)  # wildcard covers loopback
+    assert _binds_overlap("localhost", 8000, "127.0.0.1", 8000)  # same interface
+    assert not _binds_overlap("127.0.0.1", 8000, "127.0.0.1", 8001)  # port differs
+    assert not _binds_overlap("192.168.1.5", 8000, "127.0.0.1", 8000)  # other interface
 
 
 def test_serve_refuses_when_port_busy(tmp_path, monkeypatch, capsys):
@@ -258,6 +361,54 @@ def test_start_refuses_when_port_occupied_by_foreign_service(tmp_path, monkeypat
     out = capsys.readouterr().out
     assert "already serves a healthy Zero service" in out
     assert not spawned, "a doomed child must never be spawned on a busy port"
+
+
+def test_start_honors_server_bind_from_config(tmp_path, monkeypatch, capsys):
+    """``server.port`` from config.yaml used to be silently ignored (the
+    bind was hardcoded to 8000); ``zero start`` must busy-check, spawn,
+    health-probe, and report the CONFIGURED bind."""
+    _no_systemctl(monkeypatch)
+    monkeypatch.setenv("ZERO_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "schema_version: 1\nserver:\n  host: 127.0.0.1\n  port: 8055\n",
+        encoding="utf-8",
+    )
+    busy_probe: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "zero.manage.cli._port_busy",
+        lambda host, port: busy_probe.append((host, port)) or False,
+    )
+    health_urls: list[str] = []
+    monkeypatch.setattr(
+        "zero.manage.cli._healthz_ok",
+        lambda url, timeout=1.0: health_urls.append(url) or True,
+    )
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        "zero.manage.cli.subprocess.Popen",
+        lambda argv, **k: spawned.append(argv) or _FakeProc(999, poll_result=None),
+    )
+
+    from zero.manage.cli import cmd_start
+
+    assert cmd_start(_ns()) == 0
+    out = capsys.readouterr().out
+    assert busy_probe == [("127.0.0.1", 8055)]
+    assert spawned and spawned[0][spawned[0].index("--port") + 1] == "8055"
+    assert spawned[0][spawned[0].index("--host") + 1] == "127.0.0.1"
+    assert health_urls and health_urls[0].endswith("127.0.0.1:8055/healthz")
+    assert "service healthy at http://127.0.0.1:8055 (pid=999)" in out
+
+
+def test_managed_bind_falls_back_on_invalid_config(tmp_path, monkeypatch):
+    """An unreadable config must not brick start/serve: fall back to the
+    loopback defaults (fresh-host contract)."""
+    monkeypatch.setenv("ZERO_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(": not: valid: yaml: [\n", encoding="utf-8")
+
+    from zero.manage.cli import _managed_bind
+
+    assert _managed_bind() == ("127.0.0.1", 8000)
 
 
 def test_stop_without_pid_file_is_honest(tmp_path, monkeypatch, capsys):

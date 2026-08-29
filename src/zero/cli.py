@@ -171,6 +171,55 @@ def _managed_service_pid() -> int | None:
     return pid if _pid_alive(pid) else None
 
 
+def _managed_service_bind() -> tuple[str, int]:
+    """The (host, port) the managed service ('zero start') listens on.
+
+    Bug fix (port mismatch): the serve pre-check hard-assumed port 8000
+    while ``zero start`` honors ``server.host``/``server.port`` from
+    config.yaml. Both sides now resolve the managed bind through ONE
+    helper (``zero.manage.cli._managed_bind``), so the two CLIs can never
+    disagree about where the managed service lives. Defaults:
+    127.0.0.1:8000 — an unreadable/missing configuration falls back so a
+    fresh host stays startable.
+    """
+    try:
+        from zero.manage.cli import _managed_bind
+
+        return _managed_bind()
+    except Exception:  # noqa: BLE001 - never brick serve over config metadata
+        return "127.0.0.1", 8000
+
+
+def _binds_overlap(host_a: str, port_a: int, host_b: str, port_b: int) -> bool:
+    """True when two (host, port) binds would fight for the same socket.
+
+    A wildcard host ("", "0.0.0.0", "::") covers every interface —
+    including the other side's loopback bind; ``localhost`` is treated as
+    ``127.0.0.1``. Different ports never overlap.
+    """
+    if port_a != port_b:
+        return False
+    wildcards = {"", "0.0.0.0", "::"}
+    if host_a in wildcards or host_b in wildcards:
+        return True
+    return host_a == host_b or {host_a, host_b} == {"localhost", "127.0.0.1"}
+
+
+def _suggest_free_port(host: str, port: int, tries: int = 50) -> int:
+    """The first bindable port above ``port`` (``port + 1`` as fallback).
+
+    Bug fix (circular hint): the refusal messages used to suggest a
+    hardcoded ``--port 8001`` — the exact command the operator had just
+    run (and, in the busy-port branch, possibly the port that just
+    failed). The suggestion is now verified bindable at the moment it is
+    printed.
+    """
+    for candidate in range(port + 1, port + 1 + tries):
+        if _port_available(host, candidate):
+            return candidate
+    return port + 1
+
+
 def _port_available(host: str, port: int) -> bool:
     """True when a server could bind (host, port) right now."""
     import socket
@@ -224,30 +273,55 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     # uvicorn and die on an ugly bind traceback whenever the managed
     # service (or anything else) already held the port — and the process
     # still exited 0. Detect both cases first and fail with guidance.
+    #
+    # Bug fix (port-blind refusal): the managed-service check used to fire
+    # BEFORE looking at the requested port, so `zero-develop serve --port
+    # 8001` was refused while the managed service ran on 8000 — with the
+    # false claim that the foreground server "cannot bind the same port".
+    # The pre-checks are now port-aware: only a genuine bind conflict is
+    # refused; a free port runs alongside the managed service (with an
+    # honest note), and both refusals suggest a port verified free NOW.
     managed_pid = _managed_service_pid()
     if managed_pid is not None:
-        print(
-            f"[zero] the Zero service is already running (pid {managed_pid}, "
-            "from 'zero start') — a foreground server cannot bind the same port.",
-            file=sys.stderr,
-        )
-        print(
-            "[zero] stop it first ('zero stop') or choose another port: "
-            "zero-develop serve --port 8001",
-            file=sys.stderr,
-        )
-        return 1
+        managed_host, managed_port = _managed_service_bind()
+        if _binds_overlap(args.host, args.port, managed_host, managed_port):
+            print(
+                f"[zero] the Zero service is already running (pid {managed_pid}, "
+                f"from 'zero start') on {managed_host}:{managed_port} — "
+                "the port you asked for.",
+                file=sys.stderr,
+            )
+            free_port = _suggest_free_port(args.host, args.port)
+            print(
+                f"[zero] stop it first ('zero stop') or pick a free port, e.g.: "
+                f"zero-develop serve --port {free_port}",
+                file=sys.stderr,
+            )
+            return 1
     if not _port_available(args.host, args.port):
         print(
             f"[zero] {args.host}:{args.port} is already in use by another process.",
             file=sys.stderr,
         )
+        free_port = _suggest_free_port(args.host, args.port)
         print(
-            "[zero] stop that process or choose another port: "
-            "zero-develop serve --port 8001",
+            f"[zero] stop that process or pick a free port, e.g.: "
+            f"zero-develop serve --port {free_port}",
             file=sys.stderr,
         )
         return 1
+    if managed_pid is not None:
+        # A different, free port: running alongside is the operator's
+        # explicit choice (e.g. a dev server next to the managed service).
+        # Say so honestly instead of refusing — note the shared $ZERO_HOME
+        # (same database, same Telegram poller) so the tradeoff is visible.
+        managed_host, managed_port = _managed_service_bind()
+        print(
+            f"[zero] note: the managed service (pid {managed_pid}) keeps running "
+            f"on {managed_host}:{managed_port}; this foreground server runs "
+            f"alongside it on {args.host}:{args.port} (shared ZERO_HOME state).",
+            file=sys.stderr,
+        )
 
     # Bare-start usability (installation audit R2): `zero-develop serve`
     # with no configuration starts a local development server instead of

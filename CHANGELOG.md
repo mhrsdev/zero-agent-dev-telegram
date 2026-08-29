@@ -13,6 +13,32 @@ real-run failure.
 
 ### Fixed
 
+- **Port-blind bugs in the serve/start pre-checks** (reported session:
+  managed service running on 8000, operator ran ``zero-develop serve
+  --port 8001`` and was refused with the false claim that "a foreground
+  server cannot bind the same port"):
+  - ``zero-develop serve`` refused whenever the managed service was
+    running, regardless of the requested port. The pre-checks are now
+    port-aware: a genuinely free port starts alongside the managed
+    service (with an honest note that ``$ZERO_HOME`` state — database and
+    Telegram poller — is shared), and only a real bind conflict is
+    refused.
+  - Both serve refusals suggested a hardcoded ``zero-develop serve
+    --port 8001`` — the exact command the operator had just run, and in
+    the busy-port branch possibly the port that just failed. The
+    suggestion is now a port verified bindable at print time
+    (``_suggest_free_port``), never the failing one.
+  - The same-port refusal now names the managed service's ACTUAL bind
+    (``on 127.0.0.1:8000``) instead of an assumed port.
+  - ``zero start`` silently ignored ``server.host``/``server.port`` from
+    config.yaml (the bind was hardcoded to 127.0.0.1:8000 in the
+    busy-check, the spawn argv, and the /healthz probe). Both CLIs now
+    resolve the managed bind through one shared helper
+    (``zero.manage.cli._managed_bind``), so a configured port is honored
+    end to end and the two CLIs can no longer disagree about where the
+    managed service lives; a missing/invalid config still falls back to
+    the loopback defaults so a fresh host stays startable.
+
 - **The setup wizard's final "Send test message" step never sent anything**
   (reported console session, Windows): it collected a chat id, stored it in
   the draft, and moved on — nothing was delivered, yet the step read as
