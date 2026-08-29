@@ -1,0 +1,66 @@
+ZERO-AGENT-DEV-TELEGRAM — FIX NOTES v3 (network resilience)
+============================================================
+
+What was wrong
+--------------
+Your log showed this line over and over:
+
+    worker error: polling:ib_hb8wp94qfl2qmskssmypktsg: TransportError
+
+That was the polling worker failing to reach https://api.telegram.org
+over and over, every ~4 seconds, with NO detail about WHY, NO pause
+between attempts, and NO way to route Telegram traffic through a proxy.
+On a filtered network (where api.telegram.org drops in and out), this
+produced an unreadable error wall and you could not tell whether the
+bot, the token, or the network was broken.
+
+What is fixed (commit 294a6f7)
+------------------------------
+1. REAL ERROR MESSAGES. The first failure now logs the actual cause,
+   e.g.:
+      polling:ib_...: provider transport failed after retries —
+      ConnectError: [Errno 111] Connection refused (retrying in 2s)
+   Repeats are quiet one-liners. Your bot token is always redacted.
+2. BACKOFF. After a failure the worker waits 2s -> 4s -> 8s -> ... up
+   to 60s, instead of hammering every 1-4s. When the network recovers
+   you see:  "polling:...: recovered — Telegram is reachable again"
+3. BOT IDENTITY. After the first successful poll you see:
+      polling:...: Telegram bot online: @YourBot (id=8753924431)
+   so you always know the bot is truly alive in `zero logs`.
+4. PROXY SUPPORT (the important one for filtered networks). You can now
+   route ONLY the Telegram traffic through a local proxy:
+      - open (or create) %ZERO_HOME%\.env    (usually C:\Users\ysnrfd\.zero\.env)
+      - add ONE line (pick whichever matches your local proxy tool):
+          ZERO_TELEGRAM_PROXY_URL=socks5://127.0.0.1:1080
+          ZERO_TELEGRAM_PROXY_URL=http://127.0.0.1:8080
+      - restart the engine (zero restart, or stop + start).
+   socks5h:// also works (DNS resolves THROUGH the proxy — best when
+   local DNS is poisoned). The LLM API is NOT affected by this setting.
+   Standard HTTPS_PROXY / ALL_PROXY environment variables keep working
+   too. Proxy credentials (user:pass@) are masked in all logs.
+5. OUTBOUND SENDS no longer stall the delivery queue ~30s per message
+   on a bad network; failures are recorded with the real cause and
+   retried by the durable queue with exponential backoff.
+
+How to update your Windows machine
+----------------------------------
+1. Replace your local repo folder with this package (v3).
+2. In the repo folder run:
+      pip install -e .
+   (this pulls in the new httpx[socks] dependency; needed only if you
+   use a socks5:// proxy — an http:// proxy works without reinstalling)
+3. If your network blocks Telegram, add the ZERO_TELEGRAM_PROXY_URL
+   line from step 4 above, then restart.
+4. Watch `zero logs`. A healthy gateway now prints the bot identity
+   line within the first minute; a blocked network now prints ONE
+   clear cause + ONE hint about ZERO_TELEGRAM_PROXY_URL instead of an
+   endless error wall.
+
+Verified before packaging
+-------------------------
+- Full test suite: 1063 passed, 16 skipped (1 pre-existing optional-TUI
+  env failure, identical on the unmodified baseline).
+- Real-process end-to-end (10/10): live getMe, live getUpdates poll
+  (consumed nothing), a real message delivered to your group, dead-
+  proxy failure detail + token redaction, and the real polling loop
+  surviving a dead endpoint with backoff + one-time hint.

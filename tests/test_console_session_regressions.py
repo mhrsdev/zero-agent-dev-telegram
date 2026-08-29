@@ -711,7 +711,20 @@ def test_telegram_send_message_surfaces_telegram_error_description(monkeypatch):
         def json():
             return {"ok": False, "description": "chat not found"}
 
-    monkeypatch.setattr(probes.httpx, "post", lambda *a, **k: _Resp())
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, *a, **k):
+            return _Resp()
+
+    monkeypatch.setattr(probes, "_http_client", _FakeClient)
     res = probes.telegram_send_message("123:abc", "-100", "hi")
     assert res["ok"] is False
     assert "chat not found" in str(res["error"])
@@ -725,6 +738,19 @@ def test_telegram_send_message_returns_message_id(monkeypatch):
         def json():
             return {"ok": True, "result": {"message_id": 42}}
 
-    monkeypatch.setattr(probes.httpx, "post", lambda *a, **k: _Resp())
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, *a, **k):
+            return _Resp()
+
+    monkeypatch.setattr(probes, "_http_client", _FakeClient)
     res = probes.telegram_send_message("123:abc", "-100", "hi")
     assert res == {"ok": True, "message_id": 42}

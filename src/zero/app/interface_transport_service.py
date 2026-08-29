@@ -15,6 +15,7 @@ from zero.adapters.discord import DiscordAdapter
 from zero.adapters.messaging import (
     HttpTransport,
     PermanentTransportError,
+    RetryPolicy,
     TransportError,
 )
 from zero.adapters.telegram import TelegramAdapter
@@ -182,6 +183,17 @@ class InterfaceTransportService:
                     api_base_url=_os.environ.get(
                         "ZERO_TELEGRAM_API_BASE", "https://api.telegram.org"
                     ).rstrip("/"),
+                    # Flaky-network fix (2026-08-29): the historical default
+                    # policy (3 attempts x 10s) could block the delivery
+                    # drain for ~30s per message on a slow/broken network.
+                    # One clean attempt with a real budget; durable retry
+                    # (ResultDeliveryService exponential retry_after) owns
+                    # the second chance.
+                    retry_policy=RetryPolicy(
+                        attempts=1,
+                        backoff_seconds=0.5,
+                        timeout_seconds=30.0,
+                    ),
                 )
                 response = adapter.send_message(
                     chat_id=chat_id if chat_id is not None else binding.chat_id,
@@ -193,6 +205,11 @@ class InterfaceTransportService:
                     event_handler=lambda _event: None,
                     transport=self._transport,
                     bot_token=token,
+                    retry_policy=RetryPolicy(
+                        attempts=1,
+                        backoff_seconds=0.5,
+                        timeout_seconds=30.0,
+                    ),
                 )
                 response = adapter.send_message(
                     channel_id=binding.chat_id,
@@ -219,15 +236,21 @@ class InterfaceTransportService:
         except InterfaceTransportUnknownOutcome:
             raise
         except PermanentTransportError as exc:
-            raise InterfaceTransportError("provider rejected outbound message") from exc
+            # exc text is provider status only; safe to carry through.
+            raise InterfaceTransportError(f"provider rejected outbound message: {exc}") from exc
         except TransportError as exc:
+            # TransportError text is already token-redacted at the adapter
+            # boundary; carrying the cause summary makes the durable
+            # delivery record diagnosable instead of "ambiguous".
             raise InterfaceTransportUnknownOutcome(
-                "provider response outcome is ambiguous"
+                f"provider response outcome is ambiguous: {exc}"
             ) from exc
         except InterfaceTransportError:
             raise
         except Exception as exc:
-            raise InterfaceTransportError("outbound messaging request failed") from exc
+            raise InterfaceTransportError(
+                f"outbound messaging request failed: {type(exc).__name__}"
+            ) from exc
 
     def close(self) -> None:
         """Close the owned HTTP client during application shutdown."""

@@ -166,6 +166,22 @@ class BackgroundWorkerHost:
           ``TelegramConflictError`` and answered with an exponential
           backoff per binding (5s doubling to 60s) plus a one-time,
           actionable log line — instead of a full-speed error loop.
+
+        Bug fixes (2026-08-29, flaky-network session — the operator saw
+        ``polling:ib_…: TransportError`` every ~4s for 8+ minutes while
+        api.telegram.org was unreachable through a filtered network):
+        - EVERY polling error now earns an exponential per-binding
+          backoff (2s doubling to 60s, reset on success) — transport
+          failures used to hot-loop at the 1s polling interval;
+        - the first error of a streak is logged WITH its sanitized
+          underlying cause (``TransportError: provider transport failed
+          after retries — ConnectError: ...``) instead of the bare class
+          name; repeats are compact DEBUG lines;
+        - after 3 consecutive failures a one-time actionable hint points
+          at ZERO_TELEGRAM_PROXY_URL / HTTPS_PROXY for filtered networks;
+        - the first successful poll verifies the bot identity via getMe
+          once per token and logs ``@username (id=...)`` so an operator
+          can tell a healthy gateway from a dead one at a glance.
         """
         from zero.adapters.telegram import TelegramConflictError
         from zero.app.poll_lock import TokenPollLock
@@ -178,6 +194,11 @@ class BackgroundWorkerHost:
         conflict_reported: set[str] = set()
         lock_reported: set[str] = set()
         lock_state: dict[str, bool] = {}  # token -> acquired?
+        error_until: dict[str, float] = {}
+        error_step: dict[str, int] = {}
+        error_reported: set[str] = set()
+        hint_reported: set[str] = set()
+        identity_verified: set[str] = set()
         try:
             while not self._stop.is_set():
                 polled_any = False
@@ -187,7 +208,7 @@ class BackgroundWorkerHost:
                         break
                     _project, binding, token = binding_poll
                     bid = binding.id.value
-                    if now < backoff_until.get(bid, 0.0):
+                    if now < backoff_until.get(bid, 0.0) or now < error_until.get(bid, 0.0):
                         continue
                     # Acquire ONCE per token and hold it for the loop's
                     # lifetime — re-acquiring every iteration would race
@@ -223,6 +244,37 @@ class BackgroundWorkerHost:
                         self.status.polling_iterations += 1
                         backoff_step.pop(bid, None)
                         conflict_reported.discard(bid)
+                        had_error_streak = bid in error_reported or bid in hint_reported
+                        error_step.pop(bid, None)
+                        error_until.pop(bid, None)
+                        error_reported.discard(bid)
+                        hint_reported.discard(bid)
+                        if had_error_streak:
+                            logger.info(
+                                "polling:%s: recovered — Telegram is reachable again",
+                                bid,
+                            )
+                        if token not in identity_verified:
+                            # One-time identity check (best-effort, short):
+                            # proves the token works and names the bot in the
+                            # log, so "is my bot actually online?" has a
+                            # definitive answer in `zero logs`.
+                            try:
+                                me = await asyncio.to_thread(adapter.get_me)
+                            except Exception:  # noqa: BLE001 - cosmetic probe
+                                logger.debug(
+                                    "polling:%s: getMe identity probe failed "
+                                    "(will retry after the next successful poll)",
+                                    bid,
+                                )
+                            else:
+                                identity_verified.add(token)
+                                logger.info(
+                                    "polling:%s: Telegram bot online: @%s (id=%s)",
+                                    bid,
+                                    me.get("username"),
+                                    me.get("id"),
+                                )
                     except asyncio.CancelledError:
                         raise
                     except TelegramConflictError as exc:
@@ -245,7 +297,40 @@ class BackgroundWorkerHost:
                             logger.debug("polling:%s: conflict backoff %.0fs", bid, delay)
                         self._record_error(f"polling:{bid}: {type(exc).__name__}")
                     except Exception as exc:  # noqa: BLE001 - per-binding isolation
-                        self._record_error(f"polling:{bid}: {type(exc).__name__}")
+                        step = min(6, error_step.get(bid, 0) + 1)
+                        error_step[bid] = step
+                        delay = min(60.0, 2.0 * (2 ** (step - 1)))
+                        error_until[bid] = _loop_monotonic() + delay
+                        if bid not in error_reported:
+                            error_reported.add(bid)
+                            # First failure of the streak: full sanitized
+                            # detail (cause type + message, bot token
+                            # redacted) so the operator can act on facts.
+                            logger.warning(
+                                "polling:%s: %s (retrying in %.0fs)", bid, exc, delay
+                            )
+                            self._record_error(f"polling:{bid}: {exc}")
+                        else:
+                            logger.debug(
+                                "polling:%s: still failing (%s) — backoff %.0fs",
+                                bid,
+                                type(exc).__name__,
+                                delay,
+                            )
+                            self._record_error(f"polling:{bid}: {type(exc).__name__}")
+                        if step >= 3 and bid not in hint_reported:
+                            hint_reported.add(bid)
+                            logger.warning(
+                                "polling:%s: Telegram has failed %s times in a row — "
+                                "if your network blocks or throttles api.telegram.org "
+                                "(common on filtered networks), set "
+                                "ZERO_TELEGRAM_PROXY_URL (e.g. socks5://127.0.0.1:1080 "
+                                "or http://127.0.0.1:8080) in your environment or "
+                                "ZERO_HOME/.env and restart; standard HTTPS_PROXY / "
+                                "ALL_PROXY variables are honored too",
+                                bid,
+                                step,
+                            )
                 if not polled_any:
                     await self._wait(interval)
         finally:

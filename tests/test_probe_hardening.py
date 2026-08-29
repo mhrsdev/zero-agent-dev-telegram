@@ -84,7 +84,20 @@ def test_telegram_get_me_survives_non_json_200_body(monkeypatch):
         def json():
             raise ValueError("not json")
 
-    monkeypatch.setattr(probes.httpx, "get", lambda *a, **k: _Resp())
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, *a, **k):
+            return _Resp()
+
+    monkeypatch.setattr(probes, "_http_client", _FakeClient)
     res = probes.telegram_get_me("123:real-token")
     assert res["ok"] is False
     assert res["error"] == "non-JSON response body"

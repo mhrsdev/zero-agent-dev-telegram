@@ -66,6 +66,66 @@ class ConfigError(RuntimeError):
     """
 
 
+#: Proxy URL schemes accepted for ZERO_TELEGRAM_PROXY_URL. socks5h
+#: (hostname resolved by the proxy) matters on filtered networks where
+#: local DNS itself poisons api.telegram.org.
+_TELEGRAM_PROXY_SCHEMES: Final[tuple[str, ...]] = ("http", "https", "socks5", "socks5h")
+
+
+def mask_proxy_credentials(proxy_url: str | None) -> str | None:
+    """Mask userinfo credentials in a proxy URL for log-safe rendering.
+
+    ``http://user:secret@host:port`` renders as ``http://user:***@host:port``
+    (and the username as well when absent). ``None`` passes through.
+    """
+    if not proxy_url:
+        return proxy_url
+    try:
+        parts = urlsplit(proxy_url)
+    except ValueError:
+        return "[UNPARSEABLE_PROXY]"
+    if not parts.netloc or "@" not in parts.netloc:
+        return proxy_url
+    userinfo, _, hostport = parts.netloc.rpartition("@")
+    user = userinfo.split(":", 1)[0]
+    return parts._replace(netloc=f"{user or 'user'}:***@{hostport}").geturl()
+
+
+def _validate_telegram_proxy(raw_value: str | None) -> str | None:
+    """Validate and normalize ZERO_TELEGRAM_PROXY_URL (fail-closed)."""
+    value = (raw_value or "").strip()
+    if not value:
+        return None
+    try:
+        parts = urlsplit(value)
+    except ValueError as exc:
+        raise ConfigError(
+            "ZERO_TELEGRAM_PROXY_URL is not a parseable URL — expected e.g. "
+            "socks5://127.0.0.1:1080 or http://127.0.0.1:8080."
+        ) from exc
+    scheme = (parts.scheme or "").lower()
+    if scheme not in _TELEGRAM_PROXY_SCHEMES:
+        raise ConfigError(
+            f"ZERO_TELEGRAM_PROXY_URL scheme must be one of "
+            f"{', '.join(_TELEGRAM_PROXY_SCHEMES)}; got {scheme!r}."
+        )
+    if not parts.hostname:
+        raise ConfigError(
+            "ZERO_TELEGRAM_PROXY_URL must include a host — expected e.g. "
+            "socks5://127.0.0.1:1080."
+        )
+    if scheme in ("socks5", "socks5h"):
+        try:
+            import socksio  # noqa: F401 - availability probe only
+        except ImportError as exc:
+            raise ConfigError(
+                "ZERO_TELEGRAM_PROXY_URL uses socks5 but the socks extra is "
+                "not installed. Next action: pip install \"httpx[socks]\" "
+                "(or use an http:// proxy)."
+            ) from exc
+    return value
+
+
 class Settings(BaseModel):
     """Validated runtime configuration.
 
@@ -121,6 +181,13 @@ class Settings(BaseModel):
     #: parity: Hermes defaults to retrying before failing over.
     provider_max_attempts: int = 2
     telegram_webhook_secret: SecretStr | None = None
+    #: Optional outbound proxy for Telegram Bot API traffic only
+    #: (polling + sendMessage). Accepts http://, https://, socks5:// and
+    #: socks5h:// URLs (socks requires the httpx[socks] extra). Standard
+    #: HTTPS_PROXY/ALL_PROXY environment variables are honored by httpx
+    #: independently of this setting. Credentials in the URL are masked
+    #: in every log/repr path.
+    telegram_proxy_url: str | None = None
     discord_application_public_key: SecretStr | None = None
     # Host-bounded execution is deliberately test/development-only. Production
     # remains disabled until a genuine sandbox backend is configured.
@@ -193,6 +260,7 @@ class Settings(BaseModel):
             f"openai_model={self.openai_model!r}, "
             f"openai_timeout_seconds={self.openai_timeout_seconds!r}, "
             f"telegram_webhook_secret={'[REDACTED]' if self.telegram_webhook_secret else 'None'}, "
+            f"telegram_proxy_url={mask_proxy_credentials(self.telegram_proxy_url)!r}, "
             f"discord_application_public_key={'[REDACTED]' if self.discord_application_public_key else 'None'}, "
             f"worktree_isolation_mode={self.worktree_isolation_mode!r}, "
             f"worktree_allowed_commands={self.worktree_allowed_commands!r}, "
@@ -434,6 +502,10 @@ class Settings(BaseModel):
         discord_application_public_key = (
             SecretStr(discord_public_key_raw) if discord_public_key_raw else None
         )
+        # Optional Telegram-only egress proxy (filtered networks). Validated
+        # here so a bad scheme/missing socks extra fails at boot with an
+        # actionable message instead of a mystery transport error later.
+        telegram_proxy_url = _validate_telegram_proxy(raw.get("ZERO_TELEGRAM_PROXY_URL"))
 
         workers_raw = raw.get("ZERO_WORKERS_ENABLED")
         if workers_raw is None or workers_raw.strip().lower() in {"1", "true", "yes", "on"}:
@@ -487,6 +559,7 @@ class Settings(BaseModel):
             tool_approval_mode=tool_approval_mode,
             tick_parallel_executions=tick_parallel_executions,
             telegram_webhook_secret=telegram_webhook_secret,
+            telegram_proxy_url=telegram_proxy_url,
             discord_application_public_key=discord_application_public_key,
             worktree_isolation_mode=isolation_mode,  # type: ignore[arg-type]
             sandbox_executor=sandbox_executor,  # type: ignore[arg-type]

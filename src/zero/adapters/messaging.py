@@ -42,6 +42,37 @@ class PermanentTransportError(TransportError):
     """The provider rejected the request without a retryable transport signal."""
 
 
+# Bot tokens ride inside URLs of the form .../bot<id>:<secret>/method —
+# httpx embeds the full URL in every RequestError message, so a naive
+# error log would publish the credential into `zero logs`.
+_BOT_TOKEN_RE = None
+
+
+def redact_bot_token(text: str) -> str:
+    """Redact Telegram bot tokens embedded in error text/URLs."""
+    global _BOT_TOKEN_RE
+    if _BOT_TOKEN_RE is None:
+        import re
+
+        _BOT_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]{8,}")
+    return _BOT_TOKEN_RE.sub("bot[REDACTED]", str(text or ""))
+
+
+def _cause_summary(exc: BaseException, *, limit: int = 200) -> str:
+    """Bounded, token-redacted one-line summary of an underlying error.
+
+    Bug fix (2026-08-29, flaky-network session): the polling worker logged
+    only ``type(exc).__name__`` — operators saw an anonymous
+    ``TransportError`` wall every few seconds and could not tell DNS
+    failure from TCP refusal from a read timeout from a proxy outage.
+    The chained cause is now carried (sanitized) in the error message.
+    """
+    text = " ".join(str(exc or "").split())
+    if not text:
+        text = "(no detail)"
+    return f"{type(exc).__name__}: {redact_bot_token(text)[:limit]}"
+
+
 class HttpResponse(Protocol):
     status_code: int
 
@@ -176,8 +207,12 @@ class BaseMessagingAdapter:
                 if attempt + 1 < self._retry_policy.attempts:
                     self._sleeper(self._retry_policy.backoff_seconds * (2**attempt))
                     continue
-                raise TransportError("provider transport failed after retries") from exc
-        raise TransportError("provider transport failed") from last_error
+                raise TransportError(
+                    f"provider transport failed after retries — {_cause_summary(exc)}"
+                ) from exc
+        raise TransportError(
+            f"provider transport failed — {_cause_summary(last_error)}"
+        ) from last_error
 
     @staticmethod
     def _response_json(response: HttpResponse) -> Any:
@@ -265,6 +300,7 @@ __all__ = [
     "WebhookAuthError",
     "_cursor_get",
     "_cursor_set",
+    "redact_bot_token",
     "safe_render_text",
     "verify_ed25519_signature",
     "verify_secret_header",

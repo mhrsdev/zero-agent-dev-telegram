@@ -13,6 +13,42 @@ real-run failure.
 
 ### Fixed
 
+- **Polling `TransportError` wall on flaky/filtered networks** (reported
+  session: `zero logs` showed `worker error: polling:ib_…: TransportError`
+  every ~4 seconds for 8+ minutes, then sudden 200 OKs — the operator's
+  egress path to api.telegram.org was dropping in and out). Four bugs
+  made the outage undiagnosable and the log unreadable; each is pinned
+  by `tests/test_transport_resilience.py` and was verified against the
+  live Bot API and a deliberately dead egress path:
+  - `TransportError` now carries a bounded, bot-token-redacted summary
+    of the underlying cause (`provider transport failed after retries —
+    ConnectError: [Errno 111] Connection refused`) instead of discarding
+    the chained httpx exception; the polling worker logs that detail on
+    the FIRST failure of a streak and compact type-only lines after.
+  - Generic transport failures now earn a per-binding exponential
+    backoff (2s doubling to 60s, reset on success) instead of
+    hot-looping at the 1s polling interval — the previous behavior
+    produced the observed warning every ~4 seconds.
+  - After 3 consecutive failures a ONE-TIME actionable hint names
+    `ZERO_TELEGRAM_PROXY_URL` / `HTTPS_PROXY` for filtered networks;
+    the first successful poll logs `Telegram bot online: @username
+    (id=…)` via getMe, and recovery after a failure streak is logged at
+    INFO.
+  - NEW: `ZERO_TELEGRAM_PROXY_URL` routes Telegram Bot API traffic
+    (polling + outbound messages) through an explicit proxy —
+    `http://`, `https://`, `socks5://`, `socks5h://` (the last resolves
+    DNS through the proxy, which matters when local DNS is poisoned).
+    Validated fail-closed at boot; credentials in the URL are masked in
+    every repr/log path; `httpx[socks]` is now a base dependency. The
+    shared messaging client also gets an explicit timeout budget
+    (35s / connect 15s) instead of httpx's silent 5s default, and the
+    doctor/wizard Telegram probes honor the same proxy so they exercise
+    the exact egress path the engine will use.
+- **Outbound sends could stall the delivery drain ~30s per message** on
+  a slow/broken network (default 3 attempts x 10s). Outbound adapters
+  now use one clean attempt with a real 30s budget; the durable
+  delivery queue's exponential `retry_after` owns the second chance,
+  and the recorded delivery error now carries the sanitized cause.
 - **Telegram bot completely dead (engine database drift)** (reported
   session: bot did not respond even to `/start`; only the local web UI
   worked; engine log showed `SecretNotFoundError` for every configured

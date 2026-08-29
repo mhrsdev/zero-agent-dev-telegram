@@ -72,6 +72,32 @@ def _telegram_base() -> str:
     return os.environ.get("ZERO_TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 
 
+def _telegram_proxy() -> str | None:
+    """Explicit Telegram proxy (ZERO_TELEGRAM_PROXY_URL), if configured.
+
+    Standard HTTPS_PROXY/ALL_PROXY variables keep working through httpx's
+    trust_env default; this covers only the Zero-specific escape hatch so
+    doctor/wizard probes exercise the same egress path the engine uses.
+    """
+    value = (os.environ.get("ZERO_TELEGRAM_PROXY_URL") or "").strip()
+    return value or None
+
+
+def _probe_http_error(exc: BaseException) -> str:
+    """Bounded, token-redacted transport-error summary for probe results."""
+    from zero.adapters.messaging import redact_bot_token
+
+    text = " ".join(str(exc or "").split())
+    if not text:
+        return type(exc).__name__
+    return f"{type(exc).__name__}: {redact_bot_token(text)[:160]}"
+
+
+def _http_client(*, proxy: str | None = None) -> httpx.Client:
+    """Client for one probe call; honors the Telegram proxy escape hatch."""
+    return httpx.Client(proxy=proxy) if proxy else httpx.Client()
+
+
 def telegram_get_me(bot_token: str, *, timeout: float = 10.0) -> dict[str, object]:
     """Validate a bot token via getMe; returns {ok, username?, id?, error?}."""
     token = _clean_secret(bot_token)
@@ -79,11 +105,12 @@ def telegram_get_me(bot_token: str, *, timeout: float = 10.0) -> dict[str, objec
         return _secret_error("bot token")
     url = f"{_telegram_base()}/bot{token}/getMe"
     try:
-        resp = httpx.get(url, timeout=timeout)
+        with _http_client(proxy=_telegram_proxy()) as client:
+            resp = client.get(url, timeout=timeout)
     except httpx.RequestError as exc:
-        return {"ok": False, "error": f"unreachable: {type(exc).__name__}"}
+        return {"ok": False, "error": f"unreachable: {_probe_http_error(exc)}"}
     except Exception as exc:  # noqa: BLE001 - never crash the wizard
-        return {"ok": False, "error": f"probe failed: {type(exc).__name__}"}
+        return {"ok": False, "error": f"probe failed: {_probe_http_error(exc)}"}
     if resp.status_code != 200:
         return {"ok": False, "error": f"http {resp.status_code}"}
     try:
@@ -192,11 +219,12 @@ def telegram_send_message(
         return _secret_error("bot token")
     url = f"{_telegram_base()}/bot{token}/sendMessage"
     try:
-        resp = httpx.post(url, json={"chat_id": chat_id, "text": text}, timeout=timeout)
+        with _http_client(proxy=_telegram_proxy()) as client:
+            resp = client.post(url, json={"chat_id": chat_id, "text": text}, timeout=timeout)
     except httpx.RequestError as exc:
-        return {"ok": False, "error": f"unreachable: {type(exc).__name__}"}
+        return {"ok": False, "error": f"unreachable: {_probe_http_error(exc)}"}
     except Exception as exc:  # noqa: BLE001 - never crash the wizard
-        return {"ok": False, "error": f"probe failed: {type(exc).__name__}"}
+        return {"ok": False, "error": f"probe failed: {_probe_http_error(exc)}"}
     if resp.status_code != 200:
         # Telegram reports bad chat ids as http 400 + a description; the
         # description is the actionable part ("chat not found", "bot is
@@ -230,11 +258,12 @@ def telegram_recent_chats(bot_token: str, *, timeout: float = 12.0) -> dict[str,
         return {**_secret_error("bot token"), "chats": []}
     url = f"{_telegram_base()}/bot{token}/getUpdates?timeout=0"
     try:
-        resp = httpx.get(url, timeout=timeout)
+        with _http_client(proxy=_telegram_proxy()) as client:
+            resp = client.get(url, timeout=timeout)
     except httpx.RequestError as exc:
-        return {"ok": False, "error": f"unreachable: {type(exc).__name__}", "chats": []}
+        return {"ok": False, "error": f"unreachable: {_probe_http_error(exc)}", "chats": []}
     except Exception as exc:  # noqa: BLE001 - never crash the wizard
-        return {"ok": False, "error": f"probe failed: {type(exc).__name__}", "chats": []}
+        return {"ok": False, "error": f"probe failed: {_probe_http_error(exc)}", "chats": []}
     if resp.status_code != 200:
         return {"ok": False, "error": f"http {resp.status_code}", "chats": []}
     try:

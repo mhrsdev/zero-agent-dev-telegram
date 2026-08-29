@@ -126,6 +126,42 @@ class Services:
     approval_gate: ToolApprovalGate | None = None
 
 
+def _build_messaging_http_client(settings: Settings) -> httpx.Client:
+    """Shared HTTP client for Telegram/Discord adapter I/O.
+
+    Bug fix (2026-08-29, flaky-network session): the client used to be a
+    bare ``httpx.Client()`` —
+
+    - the httpx default 5s all-category timeout silently bounded every
+      outbound ``sendMessage`` on slow networks (polling passed its own
+      per-request timeout, so only the delivery path suffered);
+    - there was no way to route Telegram traffic through a proxy, so an
+      operator on a filtered network (api.telegram.org intermittently
+      unreachable) had no option but a system-wide VPN.
+
+    The client now gets an explicit generous timeout budget and honors
+    ``settings.telegram_proxy_url`` (``ZERO_TELEGRAM_PROXY_URL``: http,
+    https, socks5, socks5h — the last resolves DNS through the proxy,
+    which matters when local DNS is poisoned). Proxy URLs are validated
+    fail-closed in ``Settings.load``; a construction failure here still
+    fails the boot loudly instead of degrading into mystery transport
+    errors at request time.
+    """
+    proxy = settings.telegram_proxy_url or None
+    # Long-poll requests override this per call; this budget governs the
+    # remaining adapter calls (sendMessage / editMessageText / getMe).
+    timeout = httpx.Timeout(35.0, connect=15.0)
+    try:
+        if proxy:
+            return httpx.Client(proxy=proxy, timeout=timeout)
+        return httpx.Client(timeout=timeout)
+    except Exception as exc:  # pragma: no cover - guarded by Settings validation
+        raise ConfigError(
+            f"Telegram HTTP transport could not be constructed "
+            f"(proxy={settings.telegram_proxy_url!r}): {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 def _build_policy_gate(identity_repo, settings):
     """Optional access-policy gate from the management config file.
 
@@ -483,7 +519,7 @@ def build_services(
     interface_transport = (
         messaging_transport
         if messaging_transport is not None
-        else (None if settings.is_test else httpx.Client())
+        else (None if settings.is_test else _build_messaging_http_client(settings))
     )
     interface_transport_service = InterfaceTransportService(
         interface_service,
