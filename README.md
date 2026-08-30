@@ -9,6 +9,7 @@ identity, context, memory, or working trees.
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-control_plane-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Version 0.8.5](https://img.shields.io/badge/version-0.8.5-blue)](CHANGELOG.md)
 [![Status: Phase 9 checkpoint](https://img.shields.io/badge/status-Phase_9_checkpoint-6f42c1)](docs/CURRENT_STATE_LEDGER.md)
 [![Scope: development only](https://img.shields.io/badge/scope-development_only-f0ad4e)](#current-status)
 
@@ -151,7 +152,17 @@ PYTHONDONTWRITEBYTECODE=1 python -m compileall -q src tests scripts
 ```
 
 The test suite uses isolated SQLite state and exercises the same application factory used by the
-runtime. A release build must also pass the clean-artifact gate. Build from a clean committed Git
+runtime. The current baseline is **1107 passed, 0 failed, 48 skipped**. Skips are honest
+environment gates, not silenced failures: platform-specific POSIX cases, optional extras
+(`tokenizer`, `pg`), credential-gated live tests, and suites that drive a real loopback HTTP
+server — those last ones probe for a working loopback round trip first and skip only where the
+environment cannot complete one, so a genuine adapter regression still fails.
+
+Tests never read your real `$ZERO_HOME`: a session fixture redirects it to a throwaway directory.
+Without that, a configured `owner_only` access policy in `~/.zero/config.yaml` denies every
+interface intake in the suite, and home-writing tests mutate your live configuration.
+
+A release build must also pass the clean-artifact gate. Build from a clean committed Git
 tree so untracked or dirty checkout files cannot enter the release:
 
 ```bash
@@ -164,7 +175,7 @@ python -m build --outdir dist "$release_source"
 python "$release_source/scripts/validate_release_artifacts.py" dist
 ```
 
-That gate checks the wheel and source distribution independently for all 30 migration files and
+That gate checks the wheel and source distribution independently for all 34 migration files and
 the runtime modules required by the application entry point.
 
 ## Configuration
@@ -200,6 +211,29 @@ Optional extras: `[tokenizer]` tiktoken counting, `[pg]` PostgreSQL,
 Production mode refuses missing secrets, in-memory persistence, and development database paths.
 See [ADR 0004](docs/decisions/0004-configuration-as-trust-boundary.md) for the full contract.
 
+### Never commit credentials
+
+A Telegram bot token is embedded in every Bot API request URL, so **a captured engine log is a
+credential**. `.gitignore` excludes `*.log` for exactly this reason, and
+`tests/test_hardening_wave8.py::test_no_live_credentials_in_tracked_files` scans every tracked
+text file for Telegram-token, OpenAI-key, AWS-key, GitHub-PAT, and Slack-token shapes so a commit
+cannot reintroduce one.
+
+The e2e and evidence drivers under `scripts/` and `realrun-evidence/` read their credentials from
+the environment and fail closed by variable name when one is absent:
+
+```bash
+export E2E_BOT_TOKEN=...        # scripts/e2e_round5_*.py|sh
+export E2E_PROVIDER_KEY=...
+export E2E_WEBHOOK_SECRET=...
+export REALRUN_BOT_TOKEN=...    # realrun-evidence/*
+export REALRUN_API_KEY=...
+```
+
+If a credential does reach a commit, rotating it is the only fix that matters — revoke a bot token
+through @BotFather and reissue provider keys. Scrubbing the working tree does not invalidate what
+is already in published history.
+
 ## Current status
 
 `VERIFIED` means deterministic local verification in the Phase 9 source tree. It does **not**
@@ -221,6 +255,27 @@ mean production readiness.
 Read the full [audited current-state ledger](docs/CURRENT_STATE_LEDGER.md) and
 [Phase 9 closeout report](docs/PHASE_9_CLOSEOUT.md) for claim-level evidence.
 
+### Recent hardening (round-8 audit)
+
+The latest pass found and fixed a set of real defects; each is pinned by a test in
+`tests/test_hardening_wave8.py`. Full detail is in the [changelog](CHANGELOG.md).
+
+- **Live credentials had been committed** — a Telegram bot token and a provider API key, both in
+  captured logs and as hard-coded script constants. Scrubbed, untracked, and now guarded by a
+  scanner test; see [Never commit credentials](#never-commit-credentials).
+- **The admin GUI's CSRF token was derivable from the session id** (`sha256("csrf:" + sid)`), so a
+  leaked session id yielded the matching token. Tokens are now random per session.
+- **`DockerExecutor` passed the whole host environment to the `docker` CLI.** The container
+  environment was already scrubbed; the wrapper process is now limited to `PATH`, locale, and the
+  Docker daemon locators.
+- **The auth middleware blocked the event loop** on two synchronous database reads per
+  authenticated request; both now run in the threadpool, as the routers already did.
+- **`Database` leaked its cached SQLite connections**, producing `ResourceWarning: unclosed
+  database` on CPython ≥ 3.13 and non-deterministic failures under the warnings-as-errors policy.
+- **The reported version was three release lines stale** — the package said `0.1.0` at v0.8.5, so
+  the wheel, `/healthz`, `--version`, and the MCP handshake all disagreed with the tree.
+  `zero.__version__` is now the single source of truth.
+
 ### Not production ready yet
 
 Production rollout is deliberately blocked until at least the following are complete:
@@ -241,20 +296,27 @@ The current `BackupService` produces an authenticated encrypted backup only when
 ```text
 zero-agent-dev-telegram/
 ├── docs/
-│   ├── decisions/             # architecture decision records
+│   ├── decisions/             # 26 architecture decision records
+│   ├── gap-designs/           # capability gap designs (GAP 01–12)
 │   ├── CURRENT_STATE_LEDGER.md
 │   ├── REQUIREMENT_LEDGER.md
 │   └── PHASE_*_CLOSEOUT.md
 ├── src/zero/
 │   ├── domain/                # canonical types, invariants, and state transitions
 │   ├── app/                   # application services and FastAPI boundary
-│   ├── persistence/           # SQLite repositories and ordered migrations
+│   │   ├── routers/           # per-domain HTTP routers (assembly stays in api.py)
+│   │   ├── executors/         # sandbox command backends (docker / firejail / host)
+│   │   └── clock.py           # the one canonical UTC timestamp format
+│   ├── persistence/           # repositories + 34 ordered migrations (SQLite and PostgreSQL)
 │   ├── web/                   # server-rendered control surface
+│   ├── manage/                # operator CLI, admin GUI, TUI, setup wizard
 │   ├── adapters/              # transport/provider adapter boundary
 │   ├── config.py              # typed configuration trust boundary
 │   └── main.py                # ASGI and console entry point
 ├── tests/                     # deterministic unit, HTTP, integration, and E2E tests
-├── scripts/                   # development helpers
+│   └── integration_live/      # credential-gated live provider/Telegram tests
+├── scripts/                   # development, release, and e2e helpers
+├── realrun-evidence/          # real-credential run drivers and captured evidence
 └── pyproject.toml
 ```
 
@@ -264,11 +326,13 @@ rules remain the canonical center; persistence implements the storage boundary.
 ## Documentation
 
 - [Usage & operations guide](docs/USAGE.md) — install, configure, run, and drive the full workflow
+- [Changelog](CHANGELOG.md) — every fix wave with the failure each item corresponds to
 - [Requirement ledger](docs/REQUIREMENT_LEDGER.md) — confirmed behavior, invariants, and evidence
 - [Current-state ledger](docs/CURRENT_STATE_LEDGER.md) — verified, partial, and blocked areas
 - [Dependency map](docs/DEPENDENCY_MAP.md) — safe milestone and capability ordering
 - [Architecture decisions](docs/decisions/) — 26 ADRs covering identity, execution, context,
   providers, integration, interfaces, security, and rollout
+- [Live testing](docs/LIVE_TESTING.md) — credential gates for the live provider/Telegram suites
 - [Phase 9 closeout](docs/PHASE_9_CLOSEOUT.md) — latest verification and rollout decision
 
 ## Development rules
@@ -279,6 +343,9 @@ Changes should preserve the control-plane invariants:
 - do not share writable workspaces between concurrent tasks;
 - do not use display names, usernames, routes, or UI state as authority;
 - do not expose raw provider, tool, or user secrets to model context or audit logs;
+- do not commit a credential, or a log that embeds one, in any form;
+- do not block the event loop on database or network I/O in an `async` handler — the routers are
+  synchronous on purpose and run in the threadpool;
 - do not update memory or RAG from rejected or unintegrated work;
 - do not report planned capability as implemented capability.
 
