@@ -1,0 +1,37 @@
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "exec"}
+{"phase": "R2 /status reports routed model + workers", "ok": true, "detail": "log reply", "profile": "exec"}
+{"phase": "R3 /model reports claude-opus-5", "ok": true, "detail": "log reply", "profile": "exec"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": true, "detail": "log marker", "profile": "exec"}
+{"phase": "R4b answer streamed + finalize edit accepted (live-streamed)", "ok": true, "detail": "processed: ingested as conversation event evt_2g3g1qm1hjr4lfy3nstpqvc0; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "exec"}
+{"phase": "R4c durable chat history kept the answer", "ok": true, "detail": "chars=399", "profile": "exec"}
+{"phase": "R5a streamed turn with tool call completed", "ok": true, "detail": "processed: ingested as conversation event evt_6erakd7ssiyozjzqw28lrz3q; planner output rejected; conversational reply sent; tools used: 1; live-streamed", "profile": "exec"}
+{"phase": "R5b tool invocation durably audited", "ok": true, "detail": "tool audit rows 1 -> 2", "profile": "exec"}
+{"phase": "X1 plan proposed (real claude-opus-5 planner)", "ok": true, "detail": "processed: ingested as conversation event evt_pn2ry4nuk24uem24jcc8tdup; proposed revision pr_yiwuhur26mzd2dzbddyq9oci; plan card sent with approval buttons", "profile": "exec"}
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "exec"}
+{"phase": "R2 /status reports routed model + workers", "ok": true, "detail": "log reply", "profile": "exec"}
+{"phase": "R3 /model reports claude-opus-5", "ok": true, "detail": "log reply", "profile": "exec"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": true, "detail": "log marker", "profile": "exec"}
+{"phase": "R4b answer streamed + finalize edit accepted (live-streamed)", "ok": true, "detail": "processed: ingested as conversation event evt_qypzi704mw7sove1wbazrati; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "exec"}
+{"phase": "R4c durable chat history kept the answer", "ok": true, "detail": "chars=241", "profile": "exec"}
+{"phase": "R5a streamed turn with tool call completed", "ok": true, "detail": "processed: ingested as conversation event evt_mj6c7l5x7tw5xzbefmara0j4; no actionable plan proposed; conversational reply sent; tools used: 1; live-streamed", "profile": "exec"}
+{"phase": "R5b tool invocation durably audited", "ok": true, "detail": "tool audit rows 2 -> 3", "profile": "exec"}
+{"phase": "X1 plan proposed (real claude-opus-5 planner)", "ok": true, "detail": "processed: ingested as conversation event evt_0jrs9zlciypyog17a2p66s6j; proposed revision pr_i1coeanfkhsbd7nj0dtijf36; plan card sent with approval buttons", "profile": "exec"}
+{"phase": "X2a approve token minted", "ok": true, "detail": "count=1", "profile": "exec"}
+{"phase": "X2b approve callback processed", "ok": true, "detail": "processed: callback approve executed for revision 1", "profile": "exec"}
+{"phase": "X3 LIVE execution progress bubble in the REAL group", "ok": true, "detail": "log marker", "profile": "exec"}
+{"phase": "X4 execution summary delivered to the REAL group", "ok": true, "detail": "message_id=558", "profile": "exec"}
+{"phase": "X5 /tasks lists the execution", "ok": false, "detail": "processed: event kind command logged", "profile": "exec"}
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "exec"}
+{"phase": "R2 /status reports routed model + workers", "ok": true, "detail": "log reply", "profile": "exec"}
+{"phase": "R3 /model reports claude-opus-5", "ok": true, "detail": "log reply", "profile": "exec"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": true, "detail": "log marker", "profile": "exec"}
+{"phase": "R4b answer streamed + finalize edit accepted (live-streamed)", "ok": true, "detail": "processed: ingested as conversation event evt_gb7wuw31eark7ay8r24m957g; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "exec"}
+{"phase": "R4c durable chat history kept the answer", "ok": true, "detail": "chars=574", "profile": "exec"}
+{"phase": "R5a streamed turn with tool call completed", "ok": true, "detail": "processed: ingested as conversation event evt_kaik8i730phkplmhga0k0l43; no actionable plan proposed; conversational reply sent; tools used: 1; live-streamed", "profile": "exec"}
+{"phase": "R5b tool invocation durably audited", "ok": true, "detail": "tool audit rows 3 -> 4", "profile": "exec"}
+{"phase": "X1 plan proposed (real claude-opus-5 planner)", "ok": true, "detail": "processed: ingested as conversation event evt_zusgik4cy3lgnsno0l7gwzqw; proposed revision pr_b06i2hsljlji1m9xnjq845hm; plan card sent with approval buttons", "profile": "exec"}
+{"phase": "X2a approve token minted", "ok": true, "detail": "count=1", "profile": "exec"}
+{"phase": "X2b approve callback processed", "ok": true, "detail": "processed: callback approve executed for revision 1", "profile": "exec"}
+{"phase": "X3 LIVE execution progress bubble in the REAL group", "ok": true, "detail": "log marker", "profile": "exec"}
+{"phase": "X4 execution summary delivered to the REAL group", "ok": true, "detail": "message_id=558", "profile": "exec"}
+{"phase": "X5 /tasks lists the execution", "ok": true, "detail": "log reply", "profile": "exec"}

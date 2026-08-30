@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +37,7 @@ from zero.adapters.telegram_render import (
     TELEGRAM_MESSAGE_LIMIT,
     chunk_telegram_text,
     render_telegram_html,
+    render_telegram_html_bounded,
     utf16_len,
 )
 from zero.config import Settings
@@ -135,6 +137,105 @@ def test_chunk_indicators_appended_when_requested() -> None:
 def test_chunk_empty_and_tiny() -> None:
     assert chunk_telegram_text("") == []
     assert chunk_telegram_text("short") == ["short"]
+
+
+# ----------------------------------------------------------------------
+# 2b. Bounded rendering: the limit applies to the SOURCE, never to
+#     rendered HTML (slicing HTML cuts tags/entities and Telegram then
+#     rejects the message with 400 "can't parse entities").
+# ----------------------------------------------------------------------
+def _tags_balanced(html_text: str) -> bool:
+    stack: list[str] = []
+    for match in re.finditer(r"<(/?)([a-z]+)[^>]*>", html_text):
+        if match.group(1):
+            if not stack or stack.pop() != match.group(2):
+                return False
+        else:
+            stack.append(match.group(2))
+    return not stack
+
+
+def _has_truncated_markup(html_text: str) -> bool:
+    """A tag opened but never closed, or an entity cut mid-sequence."""
+    return bool(re.search(r"<[^>]*$", html_text) or re.search(r"&[a-zA-Z]{0,6}$", html_text))
+
+
+def test_bounded_render_never_cuts_a_tag_at_the_boundary() -> None:
+    # Unbounded rendering puts "<b>bol" at the 4096th character, so a
+    # naive rendered[:4096] would ship a half-written tag.
+    source = "y" * 4090 + "**boldtext**"
+    assert render_telegram_html(source)[:TELEGRAM_MESSAGE_LIMIT].endswith("<b>bol")
+
+    out = render_telegram_html_bounded(source, TELEGRAM_MESSAGE_LIMIT)
+    assert utf16_len(out) <= TELEGRAM_MESSAGE_LIMIT
+    assert _tags_balanced(out)
+    assert not _has_truncated_markup(out)
+
+
+def test_bounded_render_never_cuts_a_character_entity() -> None:
+    source = "x" * 4093 + "<>tail"
+    assert render_telegram_html(source)[:TELEGRAM_MESSAGE_LIMIT].endswith("&lt")
+
+    out = render_telegram_html_bounded(source, TELEGRAM_MESSAGE_LIMIT)
+    assert utf16_len(out) <= TELEGRAM_MESSAGE_LIMIT
+    assert not _has_truncated_markup(out)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "empty",
+        "short_markdown",
+        "ampersand_flood",
+        "angle_bracket_flood",
+        "astral_flood",
+        "astral_ampersand_mix",
+        "long_plain",
+        "giant_fence",
+        "many_links",
+        "headers_and_quotes",
+    ],
+)
+def test_bounded_render_respects_the_utf16_bound_after_expansion(case: str) -> None:
+    # Built by name: a parametrized 20k-character id overflows the
+    # PYTEST_CURRENT_TEST environment variable on Windows.
+    sources = {
+        "empty": "",
+        "short_markdown": "**bold** and `code`",
+        "ampersand_flood": "&" * 5000,  # each character expands 5x
+        "angle_bracket_flood": "<" * 5000,
+        "astral_flood": "😀" * 5000,  # 2 UTF-16 units each
+        "astral_ampersand_mix": "😀&" * 4000,
+        "long_plain": "a" * 20000,
+        "giant_fence": "```python\n" + "print(1)\n" * 2000 + "```",
+        "many_links": "[ok](https://example.com/x) " * 500,
+        "headers_and_quotes": "# T\n> q\n" * 2000,
+    }
+    out = render_telegram_html_bounded(sources[case], TELEGRAM_MESSAGE_LIMIT)
+    assert utf16_len(out) <= TELEGRAM_MESSAGE_LIMIT
+    assert _tags_balanced(out)
+    assert not _has_truncated_markup(out)
+    assert out.count("<pre>") == out.count("</pre>")
+
+
+def test_bounded_render_keeps_short_text_untouched() -> None:
+    assert render_telegram_html_bounded("**bold** `code`", TELEGRAM_MESSAGE_LIMIT) == (
+        render_telegram_html("**bold** `code`")
+    )
+    assert render_telegram_html_bounded("", TELEGRAM_MESSAGE_LIMIT) == ""
+
+
+def test_bounded_render_edit_payload_stays_under_the_limit() -> None:
+    seen: dict[str, str] = {}
+
+    def responder(method, url, headers=None, json=None, timeout=None):
+        seen["text"] = (json or {}).get("text", "")
+        return SimpleNamespace(status_code=200, json=lambda: {"ok": True, "result": True})
+
+    adapter = _adapter(transport=SimpleNamespace(request=responder, close=lambda: None))
+    adapter.edit_message(chat_id="-100", message_id="7", text="&" * 9000)
+    assert utf16_len(seen["text"]) <= TELEGRAM_MESSAGE_LIMIT
+    assert not _has_truncated_markup(seen["text"])
 
 
 # ----------------------------------------------------------------------

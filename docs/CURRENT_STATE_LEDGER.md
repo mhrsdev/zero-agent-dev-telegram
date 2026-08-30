@@ -1,4 +1,26 @@
-# Current State Ledger
+# Current State Ledger — SUPERSEDED
+
+> **This ledger is superseded by [`/CURRENT_STATE_LEDGER.md`](../CURRENT_STATE_LEDGER.md)
+> (repo root), which tracks the effective state of the working tree after the
+> rounds-8/9 Hermes live-streaming parity wave (suite: 1155 passed / 13 skipped /
+> 0 failed; round-9 live grade: 39/39 phases, 0 failures).**
+>
+> The content below is the historical snapshot from the August 2026 engineering
+> pass (794-test era) and is retained for claim-level context only. Per-phase
+> closeout evidence remains in `docs/PHASE_*_CLOSEOUT.md`.
+
+---
+
+## Historical snapshot (August 2026 engineering pass)
+
+Living summary of what is verified in this repository and what remains
+open. Claim-level evidence lives in `docs/PHASE_*_CLOSEOUT.md`; this
+ledger tracks the effective state of the working tree after the
+August 2026 engineering pass.
+---
+
+## Historical snapshot (August 2026 engineering pass)
+
 
 Living summary of what is verified in this repository and what remains
 open. Claim-level evidence lives in `docs/PHASE_*_CLOSEOUT.md`; this
@@ -77,6 +99,13 @@ fixed; pins live in `tests/test_hardening_wave8.py` (16 tests).
   loopback-HTTP suites that skip where the environment cannot complete a
   loopback round trip. The earlier figure was 794 passed / 31 skipped
   against a tree with 25 environment-induced failures.
+
+## Verified locally (deterministic, Windows host)
+
+- Full deterministic suite green: **794 passed, 0 failed, 31 skipped**
+  (825 collected) under `ZERO_ENV=test`. Skips are platform-gated
+  POSIX cases, optional extras (tokenizer, psycopg), and
+  credential-gated live tests that skip by design.
 - Ruff lint and format clean across `src/`, `tests/`, and `scripts/`.
 - HTTP API decomposed into `zero.app.routers`: sixteen per-domain
   router modules plus shared `deps.py`/`models.py`; `app/api.py`

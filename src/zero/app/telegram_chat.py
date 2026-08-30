@@ -40,9 +40,11 @@ import base64
 import logging
 import mimetypes
 import threading
+from typing import Any
 
 from zero.app.chat_history_repository import ChatHistoryRepository
 from zero.app.chat_service import ChatService
+from zero.app.telegram_live import TelegramLiveStream
 from zero.app.interface_transport_service import (
     InterfaceTransportService,
     InterfaceTransportUnknownOutcome,
@@ -204,6 +206,8 @@ class TelegramChatBridge:
                 return f"media-only ack sent ({'; '.join(media_notes)})"
             return "empty message; no reply"
 
+        result: Any = None
+        live_streamed = False
         try:
             from zero.domain.providers import CanonicalMessage
 
@@ -217,7 +221,7 @@ class TelegramChatBridge:
                 CanonicalMessage(role=item["role"], content=item["content"])
                 for item in prior
             )
-            result = self._chat_service.complete(
+            turn_kwargs = dict(
                 project_id=binding.project_id,
                 actor_id=user_id,
                 message=message,
@@ -227,20 +231,73 @@ class TelegramChatBridge:
                 history=history_messages,
                 image_data_urls=image_urls,
             )
+            # Hermes live-stream parity (gap A+B): the answer streams
+            # INTO a Telegram message that is progressively edited as
+            # text deltas and tool calls arrive, then converges to the
+            # final content (overflow split included). A chat service
+            # without a streaming surface (or a dead transport) degrades
+            # to the historical single-shot path — the durable chunked
+            # send below remains the delivery fallback either way.
+            complete_stream = getattr(self._chat_service, "complete_stream", None)
+            live = None
+            if callable(complete_stream):
+                try:
+                    adapter = self._transport.build_telegram_adapter(
+                        project_id=binding.project_id,
+                        binding_id=binding.id,
+                        actor_id=user_id,
+                    )
+                    live = TelegramLiveStream(
+                        adapter=adapter,
+                        chat_id=str(event.chat_id),
+                        topic_id=str(event.topic_id) if event.topic_id else None,
+                        header="✍️ Zero is thinking…",
+                    )
+                except Exception as exc:  # noqa: BLE001 - streaming is best-effort
+                    logger.debug("live stream unavailable: %s", type(exc).__name__)
+                    live = None
+            if callable(complete_stream):
+                result = complete_stream(
+                    **turn_kwargs,
+                    event_cb=(
+                        None
+                        if live is None
+                        else lambda payload: self._route_stream_event(live, payload)
+                    ),
+                )
+            else:
+                result = self._chat_service.complete(**turn_kwargs)
             answer = (result.content or "").strip() or "(the model returned an empty answer)"
+            if live is not None:
+                live_streamed = bool(
+                    live.finalize(
+                        answer,
+                        tool_names=[
+                            call["tool_name"] for call in result.tool_calls_executed
+                        ],
+                    )
+                )
         except Exception as exc:  # noqa: BLE001 - chat failure must not crash intake
             logger.warning(
                 "conversational turn failed: %s: %s", type(exc).__name__, str(exc)[:200]
             )
+            apology = (
+                "I could not answer that just now "
+                f"(provider error: {type(exc).__name__}). "
+                "Try again in a moment, or rephrase the request."
+            )
+            if live is not None:
+                # A stale "thinking…" bubble must never outlive a failed
+                # turn: converge it to the honest failure text.
+                try:
+                    live.finalize(apology)
+                except Exception:  # noqa: BLE001
+                    pass
             self._send(
                 binding=binding,
                 event=event,
                 user_id=user_id,
-                text=(
-                    "I could not answer that just now "
-                    f"(provider error: {type(exc).__name__}). "
-                    "Try again in a moment, or rephrase the request."
-                ),
+                text=apology,
             )
             return f"conversational fallback failed ({type(exc).__name__}); apology sent"
 
@@ -269,14 +326,59 @@ class TelegramChatBridge:
         suffix = ""
         if media_notes:
             suffix = "\n\n(Media received: " + "; ".join(media_notes) + ".)"
-        self._send(
-            binding=binding,
-            event=event,
-            user_id=user_id,
-            text=answer + suffix,
+            # Media notes ride a SHORT follow-up when the answer itself
+            # already streamed into the live bubble (no duplication).
+            self._send(
+                binding=binding,
+                event=event,
+                user_id=user_id,
+                text="(Media received: " + "; ".join(media_notes) + ".)",
+            )
+        if not live_streamed:
+            # The live bubble never opened: the durable chunked send is
+            # the only delivery path (historical behavior, unchanged).
+            self._send(
+                binding=binding,
+                event=event,
+                user_id=user_id,
+                text=answer + suffix,
+            )
+        tool_note = (
+            f"; tools used: {len(result.tool_calls_executed)}"
+            if result.tool_calls_executed
+            else ""
         )
-        tool_note = f"; tools used: {len(result.tool_calls_executed)}" if result.tool_calls_executed else ""
-        return f"conversational reply sent{tool_note}"
+        stream_note = "; live-streamed" if live_streamed else ""
+        return f"conversational reply sent{tool_note}{stream_note}"
+
+    # ------------------------------------------------------------------
+    # Stream routing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _route_stream_event(live: Any, payload: Any) -> None:
+        """Route one provider/chat stream event into the live bubble.
+
+        Shaped exactly like the provider ``stream_observer`` payloads:
+        ``text_delta`` (incremental text), ``tool_call`` (name + parsed
+        arguments), ``message_end`` (ignored — finalize handles it).
+        Unknown shapes are ignored; routing never raises.
+        """
+        if not isinstance(payload, dict) or live is None:
+            return
+        kind = payload.get("type")
+        if kind == "text_delta":
+            live.on_text_delta(str(payload.get("text") or ""))
+        elif kind == "text_reset":
+            live.on_text_reset()
+        elif kind == "tool_call":
+            live.on_tool_call(
+                str(payload.get("name") or "tool"), payload.get("arguments")
+            )
+        elif kind == "tool_result":
+            live.on_tool_result(
+                str(payload.get("name") or "tool"), bool(payload.get("ok", True))
+            )
 
     # ------------------------------------------------------------------
     # Media helpers

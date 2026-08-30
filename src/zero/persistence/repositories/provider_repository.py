@@ -19,6 +19,7 @@ from zero.domain.artifacts import ArtifactId
 from zero.domain.execution import ExecutionId
 from zero.domain.identity import ProjectId
 from zero.domain.providers import (
+    ALL_CAPABILITIES,
     PricingEntry,
     ProviderErrorClass,
     ProviderModel,
@@ -143,6 +144,46 @@ class ProviderRepository:
             if commit:
                 conn.rollback()
             raise
+
+    def set_provider_model_capabilities(
+        self,
+        model: ProviderModel,
+        capabilities: tuple[str, ...],
+        *,
+        commit: bool = True,
+    ) -> ProviderModel:
+        """Persist an OBSERVED capability set for one provider model.
+
+        Capabilities describe observed contract support (per
+        ``zero-provider-adapter-contract``). The live-probe path uses
+        this to record that a gateway silently strips the native
+        ``tools`` parameter: every native-tool request would otherwise
+        sail through validation and produce hallucinated answers with
+        ``tool_calls: []`` forever.
+        """
+        cleaned: list[str] = []
+        for capability in capabilities:
+            if capability not in ALL_CAPABILITIES:
+                raise ValueError(f"unknown provider capability: {capability!r}")
+            if capability not in cleaned:
+                cleaned.append(capability)
+        conn = self._database.connect()
+        conn.execute(
+            "UPDATE provider_models SET capabilities = ? WHERE id = ?",
+            (json.dumps(cleaned), model.id.value),
+        )
+        if commit:
+            conn.commit()
+        return ProviderModel(
+            id=model.id,
+            provider=model.provider,
+            model_name=model.model_name,
+            context_window=model.context_window,
+            max_output_tokens=model.max_output_tokens,
+            capabilities=tuple(cleaned),
+            is_active=model.is_active,
+            created_at=model.created_at,
+        )
 
     def get_provider_model(self, provider: str, model_name: str) -> ProviderModel:
         conn = self._database.connect()

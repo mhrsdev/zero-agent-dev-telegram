@@ -24,6 +24,12 @@ from zero.domain.providers import CanonicalMessage, CanonicalRequest
 
 _MAX_MODEL_OUTPUT = 64 * 1024
 _CODE_FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.IGNORECASE | re.DOTALL)
+#: A fenced JSON object ANYWHERE in the text (live-run 2026-08-30: the
+#: model appends prose AFTER the closing fence — the historical
+#: full-match parse rejected perfectly valid payloads).
+_CODE_FENCE_ANYWHERE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.IGNORECASE | re.DOTALL)
+#: A bare JSON object anywhere (fallback for unfenced output).
+_BARE_JSON = re.compile(r"\{.*\}", re.DOTALL)
 
 
 class PlannerOutputError(ValueError):
@@ -132,6 +138,19 @@ class PlannerService:
         match = _CODE_FENCE.match(candidate)
         if match:
             candidate = match.group(1)
+        else:
+            # Tolerate prose around a fenced JSON object (live-run
+            # 2026-08-30: the model appends explanations after the
+            # closing fence; the historical full-match parse rejected
+            # the payload and the sender got no reply). Fenced first,
+            # then the outermost bare object.
+            fenced = _CODE_FENCE_ANYWHERE.search(candidate)
+            if fenced:
+                candidate = fenced.group(1)
+            else:
+                bare = _BARE_JSON.search(candidate)
+                if bare:
+                    candidate = bare.group(0)
         try:
             payload = json.loads(candidate)
         except (TypeError, json.JSONDecodeError) as exc:

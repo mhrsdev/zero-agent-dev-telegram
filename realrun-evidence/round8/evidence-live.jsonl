@@ -1,0 +1,80 @@
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "live"}
+{"phase": "R2 /status reports routed model + workers", "ok": false, "detail": "processed: event kind command logged", "profile": "live"}
+{"phase": "R3 /model reports claude-opus-5", "ok": false, "detail": "processed: event kind command logged", "profile": "live"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": false, "detail": "log marker", "profile": "live"}
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "live"}
+{"phase": "R2 /status reports routed model + workers", "ok": false, "detail": "log reply", "profile": "live"}
+{"phase": "R3 /model reports claude-opus-5", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": true, "detail": "log marker", "profile": "live"}
+{"phase": "R4b answer streamed + finalize edit accepted (live-streamed)", "ok": true, "detail": "processed: ingested as conversation event evt_nvkqoiyqihu784rp1myczatr; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R4c durable chat history kept the answer", "ok": true, "detail": "chars=4474", "profile": "live"}
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "live"}
+{"phase": "R2 /status reports routed model + workers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R3 /model reports claude-opus-5", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": true, "detail": "log marker", "profile": "live"}
+{"phase": "R4b answer streamed + finalize edit accepted (live-streamed)", "ok": true, "detail": "processed: ingested as conversation event evt_hwdi947grsw6bpqeyaksm1uc; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R4c durable chat history kept the answer", "ok": true, "detail": "chars=4182", "profile": "live"}
+{"phase": "R5a streamed turn with tool call completed", "ok": true, "detail": "processed: ingested as conversation event evt_vgwk95bx9majd6xhhn0cslxa; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R5b tool invocation durably audited", "ok": false, "detail": "tool audit rows 0 -> 0", "profile": "live"}
+{"phase": "R6a /tasks answers", "ok": false, "detail": "log reply", "profile": "live"}
+{"phase": "R6b /approvals answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "live"}
+{"phase": "R2 /status reports routed model + workers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R3 /model reports claude-opus-5", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": true, "detail": "log marker", "profile": "live"}
+{"phase": "R4b answer streamed + finalize edit accepted (live-streamed)", "ok": true, "detail": "processed: ingested as conversation event evt_yu9jt6s5ynebhbdsy9oyjsu3; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R4c durable chat history kept the answer", "ok": true, "detail": "chars=3994", "profile": "live"}
+{"phase": "R5a streamed turn with tool call completed", "ok": false, "detail": "processed: ingested as conversation event evt_ycf87m8b582tv6gxyy7mmjcc; planner output rejected", "profile": "live"}
+{"phase": "R5b tool invocation durably audited", "ok": false, "detail": "tool audit rows 0 -> 0", "profile": "live"}
+{"phase": "R6a /tasks answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R6b /approvals answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "live"}
+{"phase": "R2 /status reports routed model + workers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R3 /model reports claude-opus-5", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": true, "detail": "log marker", "profile": "live"}
+{"phase": "R4b answer streamed + finalize edit accepted (live-streamed)", "ok": true, "detail": "processed: ingested as conversation event evt_s2bbw3qvenexszgr8vmwn7ay; planner output rejected; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R4c durable chat history kept the answer", "ok": true, "detail": "chars=3972", "profile": "live"}
+{"phase": "R5a streamed turn with tool call completed", "ok": true, "detail": "processed: ingested as conversation event evt_yu74gkw3qqa8h9ghxeryrb1m; planner output rejected; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R5b tool invocation durably audited", "ok": false, "detail": "tool audit rows 0 -> 0", "profile": "live"}
+{"phase": "R6a /tasks answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R6b /approvals answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "live"}
+{"phase": "R2 /status reports routed model + workers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R3 /model reports claude-opus-5", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": true, "detail": "log marker", "profile": "live"}
+{"phase": "R4b answer streamed + finalize edit accepted (live-streamed)", "ok": true, "detail": "processed: ingested as conversation event evt_g1pa8rv6ga7a5igf89iibr78; planner output rejected; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R4c durable chat history kept the answer", "ok": true, "detail": "chars=4233", "profile": "live"}
+{"phase": "R5a streamed turn with tool call completed", "ok": true, "detail": "processed: ingested as conversation event evt_hlu02byzacc3wcaavl68drn0; planner output rejected; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R5b tool invocation durably audited", "ok": false, "detail": "tool audit rows 0 -> 0", "profile": "live"}
+{"phase": "R6a /tasks answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R6b /approvals answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "live"}
+{"phase": "R2 /status reports routed model + workers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R3 /model reports claude-opus-5", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": true, "detail": "log marker", "profile": "live"}
+{"phase": "R4b answer streamed + finalize edit accepted (live-streamed)", "ok": true, "detail": "processed: ingested as conversation event evt_vstflw0olyxnft6ulanx1r5u; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R4c durable chat history kept the answer", "ok": true, "detail": "chars=2628", "profile": "live"}
+{"phase": "R5a streamed turn with tool call completed", "ok": true, "detail": "processed: ingested as conversation event evt_qgwkds4zltcnuphnkd2p18w0; planner output rejected; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R5b tool invocation durably audited", "ok": false, "detail": "tool audit rows 0 -> 0", "profile": "live"}
+{"phase": "R6a /tasks answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R6b /approvals answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "live"}
+{"phase": "R2 /status reports routed model + workers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R3 /model reports claude-opus-5", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": true, "detail": "log marker", "profile": "live"}
+{"phase": "R4b answer streamed + finalize edit accepted (live-streamed)", "ok": true, "detail": "processed: ingested as conversation event evt_1t1vfvtlp1pckz1a7wb49prn; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R4c durable chat history kept the answer", "ok": true, "detail": "chars=4093", "profile": "live"}
+{"phase": "R5a streamed turn with tool call completed", "ok": true, "detail": "processed: ingested as conversation event evt_y62nx4q2funkhtpuf0m6kasr; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R5b tool invocation durably audited", "ok": false, "detail": "tool audit rows 0 -> 0", "profile": "live"}
+{"phase": "R6a /tasks answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R6b /approvals answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R1 /start replies", "ok": true, "detail": "processed: event kind command logged", "profile": "live"}
+{"phase": "R2 /status reports routed model + workers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R3 /model reports claude-opus-5", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R4a live stream preview opened via REAL Bot API", "ok": true, "detail": "log marker", "profile": "live"}
+{"phase": "R4b answer streamed + finalize edit accepted (live-streamed)", "ok": true, "detail": "processed: ingested as conversation event evt_lnbjmdzkej91p3bewejunk9x; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "live"}
+{"phase": "R4c durable chat history kept the answer", "ok": true, "detail": "chars=219", "profile": "live"}
+{"phase": "R5a streamed turn with tool call completed", "ok": true, "detail": "processed: ingested as conversation event evt_krt4079pwmqdce008ddcz0ei; no actionable plan proposed; conversational reply sent; tools used: 1; live-streamed", "profile": "live"}
+{"phase": "R5b tool invocation durably audited", "ok": true, "detail": "tool audit rows 0 -> 1", "profile": "live"}
+{"phase": "R6a /tasks answers", "ok": true, "detail": "log reply", "profile": "live"}
+{"phase": "R6b /approvals answers", "ok": true, "detail": "log reply", "profile": "live"}

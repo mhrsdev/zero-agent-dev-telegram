@@ -135,6 +135,37 @@ def render_telegram_html(text: str) -> str:
     return source
 
 
+def render_telegram_html_bounded(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> str:
+    """Render markdown to HTML that fits ``limit`` UTF-16 units.
+
+    The bound is applied to the SOURCE text (via :func:`chunk_telegram_text`)
+    and never to the rendered result: slicing rendered HTML can cut a tag or a
+    character entity in half (``<b`` , ``&am``) and Telegram then rejects the
+    whole message with 400 "can't parse entities".
+
+    Rendering expands text — ``&`` becomes ``&amp;``, emphasis gains tags — so
+    a source that fits the bound can still render over it. The source budget
+    therefore shrinks until the rendered frame fits.
+
+    Only the first chunk is returned: a single message (or in-place edit) has
+    one text field, so the bound is a real limit rather than a split point.
+    """
+    source = str(text or "")
+    if not source:
+        return ""
+    bound = max(64, int(limit))
+    budget = bound
+    while True:
+        chunks = chunk_telegram_text(source, limit=budget)
+        rendered = render_telegram_html(chunks[0]) if chunks else ""
+        units = utf16_len(rendered)
+        if units <= bound or budget <= 64:
+            return rendered
+        # Scale by the observed expansion ratio, but always give up at
+        # least 5% so a near-boundary frame cannot stall the loop.
+        budget = max(64, min(budget * bound // units, budget - budget // 20))
+
+
 def _split_at(text: str, limit: int) -> tuple[str, str]:
     """Split ``text`` so the head fits ``limit`` UTF-16 units.
 
@@ -269,5 +300,6 @@ __all__ = [
     "TELEGRAM_MESSAGE_LIMIT",
     "chunk_telegram_text",
     "render_telegram_html",
+    "render_telegram_html_bounded",
     "utf16_len",
 ]

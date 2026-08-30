@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException, Request, status
 from zero.app.routers.deps import authorized_actor
 from zero.app.routers.models import StoreArtifactRequest, StoreRagDocumentRequest
 from zero.app.services import Services
+
+from zero.domain.artifacts import RagDocumentAlreadyExistsError
 from zero.domain.identity import (
     ProjectId,
 )
@@ -110,9 +112,10 @@ def register_artifact_routes(app: FastAPI, services: Services) -> None:
         request: Request, project_id: str, state: str | None = None
     ) -> list[dict[str, Any]]:
 
-        authorized_actor(request, services, project_id, "project.view")
+        actor = authorized_actor(request, services, project_id, "project.view")
         documents = services.artifacts.list_rag_documents(
             ProjectId(project_id),
+            actor_id=actor,
             state=state,  # type: ignore[arg-type]
         )
         return [_rag_payload(item) for item in documents]
@@ -140,16 +143,25 @@ def register_artifact_routes(app: FastAPI, services: Services) -> None:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="request failed") from exc
+        except RagDocumentAlreadyExistsError:
+            # GAP K (round-9 live find): a duplicate (project, source_type,
+            # source_id) used to escape as an unhandled IntegrityError and
+            # surface as a 500. The typed domain error now maps to an
+            # honest 409 Conflict.
+            raise HTTPException(
+                status_code=409,
+                detail="RAG document already exists for this source",
+            )
         return _rag_payload(document)
 
     @app.get("/projects/{project_id}/rag/{doc_id}", tags=["rag"])
     def get_rag_document(request: Request, project_id: str, doc_id: str) -> dict[str, Any]:
         from zero.domain.artifacts import RagDocumentId
 
-        authorized_actor(request, services, project_id, "project.view")
+        actor = authorized_actor(request, services, project_id, "project.view")
         try:
             document = services.artifacts.get_rag_document(
-                ProjectId(project_id), RagDocumentId(doc_id)
+                ProjectId(project_id), RagDocumentId(doc_id), actor_id=actor
             )
         except Exception as exc:
             raise HTTPException(status_code=404, detail="RAG document not found") from exc

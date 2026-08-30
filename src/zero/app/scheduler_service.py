@@ -11,6 +11,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Event
+from typing import Any
 
 from zero.app.agent_runtime import AgentRuntime, RuntimeTaskResult
 from zero.app.authorization_service import AuthorizationService
@@ -353,8 +354,16 @@ class SchedulerService:
         max_handoffs: int = 8,
         max_tasks: int = 16,
         source: AuditSource = "system",
+        stream_callback: Any = None,
+        task_event_callback: Any = None,
     ) -> SchedulerTickResult:
-        """Perform one bounded, replay-safe scheduler tick."""
+        """Perform one bounded, replay-safe scheduler tick.
+
+        ``stream_callback`` / ``task_event_callback`` (Hermes live-report
+        parity, gap C) ride down to the runtime drain so a messaging
+        surface can render live progress; both are optional and their
+        failures never affect durable outcomes.
+        """
         if max_handoffs < 1 or max_handoffs > 64 or max_tasks < 1 or max_tasks > 128:
             raise ValueError("scheduler bounds are outside the allowed range")
         self._authorization.require_permission(
@@ -438,6 +447,18 @@ class SchedulerService:
         ]
 
         def _drain(execution, budget):
+            # Stamp execution_id onto task lifecycle events so fan-out
+            # sinks (Telegram live progress) can key progress bubbles.
+            wrapped_task_events = None
+            if task_event_callback is not None:
+                execution_value = execution.id.value
+
+                def wrapped_task_events(payload: dict) -> None:
+                    try:
+                        task_event_callback({"execution_id": execution_value, **payload})
+                    except Exception:  # noqa: BLE001 - progress is observability
+                        logger.debug("task event callback failed", exc_info=True)
+
             return self._runtime.run_ready_tasks(
                 execution_id=execution.id,
                 project_id=project_id,
@@ -448,6 +469,8 @@ class SchedulerService:
                 repository_id=effective_repository_id,
                 max_tasks=budget,
                 source=source,
+                stream_callback=stream_callback,
+                task_event_callback=wrapped_task_events,
             )
 
         use_parallel = self._parallel_executions > 1 and len(runnable) > 1
@@ -657,6 +680,8 @@ class SchedulerService:
         interval_seconds: float = 1.0,
         stop_event: Event | None = None,
         on_tick=None,
+        stream_callback: Any = None,
+        task_event_callback: Any = None,
     ) -> None:
         """Host durable ticks in a supervised process until cancellation."""
         if interval_seconds < 0.1 or interval_seconds > 300:
@@ -674,6 +699,8 @@ class SchedulerService:
                     combined_test_command=combined_test_command,
                     combined_test_args=combined_test_args,
                     combined_test_timeout_seconds=combined_test_timeout_seconds,
+                    stream_callback=stream_callback,
+                    task_event_callback=task_event_callback,
                 )
                 if on_tick is not None:
                     on_tick(result)

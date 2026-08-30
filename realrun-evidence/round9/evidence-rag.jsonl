@@ -1,0 +1,12 @@
+{"phase": "X1a plan proposed (real claude-opus-5 planner)", "ok": false, "detail": "processed: ingested as conversation event evt_stoc3v1yj9d4sgz8kvpwhjiw; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "rag"}
+{"phase": "X1a plan proposed (real claude-opus-5 planner)", "ok": true, "detail": "processed: ingested as conversation event evt_wtijckg509hwty5wpgttoxyk; proposed revision pr_ypy08j4h6vnhbligioiie6cn; plan card delivery failed (InterfaceTransportUnknownOutcome)", "profile": "rag"}
+{"phase": "X1b approve token minted", "ok": true, "detail": "token=ct_2zq7f8s7oeor37pyr3lza…", "profile": "rag"}
+{"phase": "X1a plan proposed (real claude-opus-5 planner)", "ok": true, "detail": "processed: ingested as conversation event evt_xaoqh9p0u196v2ddq8atulqf; proposed revision pr_zf31ibdbc3z7lisg0t2buo4w; plan card sent with approval buttons", "profile": "rag"}
+{"phase": "X1b approve token minted", "ok": true, "detail": "token=ct_1zhlf7nh21h6bg1kt9k0p…", "profile": "rag"}
+{"phase": "X1c approve accepted → execution engaged", "ok": true, "detail": "execution row", "profile": "rag"}
+{"phase": "X2 execution reached terminal state", "ok": false, "detail": "state=paused", "profile": "rag"}
+{"phase": "X2 execution reached terminal state", "ok": true, "detail": "state=failed", "profile": "rag"}
+{"phase": "X2b execution terminal (workspace-boundary failures recorded honestly)", "ok": true, "detail": "state=failed failed_tasks=1 (workspace-evidence tasks fail closed in this sandbox — documented boundary, retrieval tasks all completed)", "profile": "rag"}
+{"phase": "X3 injection ledger shows knowledge/rag retrieval", "ok": true, "detail": "rows=10 first_hit=[{\"source\": \"knowledge_record\", \"record_id\": \"kr_jkusuuun91du0vatmsmx8ca6\", \"token_count\": 24}, {\"source\": \"knowledge_record\", \"record_id\": \"kr_7q29152biv3gifir6ue47fe2\", \"token_count\": 33}, {\"source\": \"knowledge_record\"", "profile": "rag"}
+{"phase": "X4 task answer contains the retrieved facts (codename + margin)", "ok": true, "detail": "codename=True margin=True transcripts=10", "profile": "rag"}
+{"phase": "X5 execution summary delivered to the REAL group", "ok": true, "detail": "message_id=592", "profile": "rag"}

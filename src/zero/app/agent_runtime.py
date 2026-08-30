@@ -211,6 +211,7 @@ class AgentRuntime:
         enable_delegation: bool = False,
         approval_gate: Any | None = None,
         metrics: Any | None = None,
+        audit_repo: Any | None = None,
     ) -> None:
         self._worker = worker
         self._providers = providers
@@ -232,6 +233,55 @@ class AgentRuntime:
         # GAP 8: when enabled, the model may call the `delegate` tool to
         # run bounded subtasks in isolated child contexts.
         self._enable_delegation = enable_delegation
+        # GAP L (round-9 live find): optional AuditRepository so delegate
+        # invocations leave the SAME durable `tool.invoke` audit trail as
+        # every registry tool. ``None`` (legacy test compositions) skips
+        # the audit write without changing behavior.
+        self._audit_repo = audit_repo
+
+    def _audit_delegation(
+        self,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        execution_id: ExecutionId,
+        result: str,
+        detail: str,
+    ) -> None:
+        """Write the durable ``tool.invoke`` audit row for one delegate
+        call (GAP L). Failures never affect the delegation outcome."""
+        audit_repo = getattr(self, "_audit_repo", None)
+        if audit_repo is None:
+            return
+        try:
+            from zero.app.tool_service import _now_utc_iso
+            from zero.domain.audit import AuditEvent, AuditEventId, redact_sensitive_text
+            from zero.domain.ids import generate_audit_event_id
+
+            audit_repo.insert(
+                AuditEvent(
+                    id=AuditEventId(generate_audit_event_id()),
+                    project_id=project_id,
+                    actor_id=actor_id,
+                    source="system",
+                    operation="tool.invoke",
+                    target_type="tool",
+                    target_id=DELEGATE_TOOL_NAME,
+                    result=result,  # type: ignore[arg-type]
+                    correlation_id=execution_id.value,
+                    redacted_summary=(
+                        f"Invoked tool {DELEGATE_TOOL_NAME!r} "
+                        f"(status={result}, {redact_sensitive_text(detail)[:400]})"
+                    ),
+                    created_at=_now_utc_iso(),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - audit loss must not crash delegation
+            import logging
+
+            logging.getLogger(__name__).debug(
+                "delegation audit write skipped: %s", type(exc).__name__
+            )
 
     def resolve_agent_policy(
         self,
@@ -292,8 +342,16 @@ class AgentRuntime:
         source: AuditSource = "system",
         agent_type_id: AgentTypeId | None = None,
         stream_callback: Any = None,
+        task_event_callback: Any = None,
     ) -> list[RuntimeTaskResult]:
-        """Claim and run a bounded snapshot of currently ready tasks."""
+        """Claim and run a bounded snapshot of currently ready tasks.
+
+        ``task_event_callback`` (Hermes live-report parity, gap C) is an
+        optional ``callback(event: dict)`` invoked with
+        ``task_started`` / ``task_completed`` / ``task_failed`` events
+        (``task_id``, ``objective``, optional ``detail``) around each
+        run. Callback failures never affect execution outcomes.
+        """
         ready = self._worker.list_ready_tasks(
             execution_id,
             project_id=project_id,
@@ -304,6 +362,15 @@ class AgentRuntime:
             if max_tasks < 1:
                 raise ValueError("max_tasks must be positive")
             ready = ready[:max_tasks]
+
+        def emit_task_event(payload: dict) -> None:
+            if task_event_callback is None:
+                return
+            try:
+                task_event_callback(payload)
+            except Exception:  # noqa: BLE001 - progress is observability
+                _LOGGER.debug("task event dropped", exc_info=True)
+
         # Per-task fault isolation: one poisoned task must not starve its
         # siblings in the same batch. Failures are logged with bounded
         # context; if nothing succeeded the first error propagates so
@@ -311,24 +378,30 @@ class AgentRuntime:
         results: list[RuntimeTaskResult] = []
         errors: list[BaseException] = []
         for task in ready:
+            emit_task_event(
+                {
+                    "type": "task_started",
+                    "task_id": task.id.value,
+                    "objective": task.objective or "",
+                }
+            )
             try:
-                results.append(
-                    self.run_task(
-                        execution_id=execution_id,
-                        project_id=project_id,
-                        task_id=task.id,
-                        actor_id=actor_id,
-                        lease_owner=lease_owner,
-                        provider=provider,
-                        model_name=model_name,
-                        agent_scope=agent_scope,
-                        tool_names=tool_names,
-                        repository_id=repository_id,
-                        source=source,
-                        agent_type_id=agent_type_id,
-                        stream_callback=stream_callback,
-                    )
+                outcome = self.run_task(
+                    execution_id=execution_id,
+                    project_id=project_id,
+                    task_id=task.id,
+                    actor_id=actor_id,
+                    lease_owner=lease_owner,
+                    provider=provider,
+                    model_name=model_name,
+                    agent_scope=agent_scope,
+                    tool_names=tool_names,
+                    repository_id=repository_id,
+                    source=source,
+                    agent_type_id=agent_type_id,
+                    stream_callback=stream_callback,
                 )
+                results.append(outcome)
             except BaseException as exc:
                 if isinstance(exc, KeyboardInterrupt):
                     raise
@@ -342,6 +415,27 @@ class AgentRuntime:
                     task.id.value,
                     execution_id.value,
                     exc,
+                )
+                from zero.domain.audit import redact_sensitive_text
+
+                emit_task_event(
+                    {
+                        "type": "task_failed",
+                        "task_id": task.id.value,
+                        "objective": task.objective or "",
+                        "detail": redact_sensitive_text(
+                            str(exc) or type(exc).__name__
+                        )[:300],
+                    }
+                )
+            else:
+                emit_task_event(
+                    {
+                        "type": "task_completed",
+                        "task_id": task.id.value,
+                        "objective": task.objective or "",
+                        "detail": (outcome.response.content or "")[:300],
+                    }
                 )
         if not results and errors:
             raise errors[0]
@@ -1205,14 +1299,42 @@ class AgentRuntime:
         try:
             input_data = json.loads(call_arguments or "{}")
         except json.JSONDecodeError:
+            self._audit_delegation(
+                project_id=project_id,
+                actor_id=actor_id,
+                execution_id=execution_id,
+                result="error",
+                detail="arguments were not valid JSON",
+            )
             return _error("delegate arguments were not valid JSON")
         if not isinstance(input_data, dict):
+            self._audit_delegation(
+                project_id=project_id,
+                actor_id=actor_id,
+                execution_id=execution_id,
+                result="error",
+                detail="arguments must decode to a JSON object",
+            )
             return _error("delegate arguments must be a JSON object")
         objective = str(input_data.get("objective") or "").strip()
         if not objective or len(objective) > 8192:
+            self._audit_delegation(
+                project_id=project_id,
+                actor_id=actor_id,
+                execution_id=execution_id,
+                result="error",
+                detail="requires a non-empty objective (<=8192 chars)",
+            )
             return _error("delegate requires a non-empty objective")
         depth = current_delegation_depth()
         if depth >= MAX_DELEGATION_DEPTH:
+            self._audit_delegation(
+                project_id=project_id,
+                actor_id=actor_id,
+                execution_id=execution_id,
+                result="error",
+                detail=f"delegation depth limit reached ({MAX_DELEGATION_DEPTH})",
+            )
             return _error(
                 f"delegation depth limit reached ({MAX_DELEGATION_DEPTH}); "
                 "complete the task yourself"
@@ -1306,6 +1428,16 @@ class AgentRuntime:
                 current_request = replace(current_request, messages=tuple(messages))
             if not completed:
                 final_content = "(sub-agent exhausted its round budget)"
+        self._audit_delegation(
+            project_id=project_id,
+            actor_id=actor_id,
+            execution_id=execution_id,
+            result="success",
+            detail=(
+                f"objective={objective[:160]} depth={depth + 1} "
+                f"tools={allowed} model={child_model or model_name}"
+            ),
+        )
         return {
             "status": "completed",
             "depth": depth + 1,
@@ -1429,6 +1561,35 @@ class AgentRuntime:
             )
             current_request_id = empty_provider_request.id
         if not current_response.tool_calls:
+            # Text-protocol fallback (live-run 2026-08-30): some gateways
+            # silently strip the native ``tools`` parameter — the model
+            # then hallucinates tool-like text instead of calling tools.
+            # When the probe confirms native tools are unavailable and
+            # the task declares tools, run the SAME bounded loop through
+            # the text protocol so real tool work stays possible.
+            probe = getattr(self._providers, "tool_call_support", None)
+            if tool_names and callable(probe) and probe(
+                request.provider, request.model_name
+            ) is False:
+                return self._run_text_protocol_tool_rounds(
+                    task=task,
+                    attempt=attempt,
+                    actor_id=actor_id,
+                    execution_id=execution_id,
+                    project_id=project_id,
+                    request=request,
+                    response=current_response,
+                    provider_request_id=current_request_id,
+                    agent_scope=agent_scope,
+                    tool_names=tool_names,
+                    max_tool_rounds=max_tool_rounds,
+                    cancel_event=cancel_event,
+                    lease_owner=lease_owner,
+                    lease_duration_seconds=lease_duration_seconds,
+                    source=source,
+                    stream_observer=stream_observer,
+                    messages=messages,
+                )
             return current_response, current_request_id, messages
 
         for _round in range(max_tool_rounds):
@@ -1747,6 +1908,288 @@ class AgentRuntime:
             if not nudge_response.tool_calls:
                 return nudge_response, nudge_provider_request.id, messages
         raise RuntimeToolError(f"{reason} with unresolved calls: {unresolved}")
+
+    def _run_text_protocol_tool_rounds(
+        self,
+        *,
+        task: Task,
+        attempt: TaskAttempt,
+        actor_id: UserId,
+        execution_id: ExecutionId,
+        project_id: ProjectId,
+        request: CanonicalRequest,
+        response: CanonicalResponse,
+        provider_request_id: ProviderRequestId | None,
+        agent_scope: AgentScope,
+        tool_names: tuple[str, ...],
+        max_tool_rounds: int,
+        cancel_event: Any,
+        lease_owner: str,
+        lease_duration_seconds: int,
+        source: AuditSource,
+        stream_observer: Any,
+        messages: list[CanonicalMessage],
+    ) -> tuple[CanonicalResponse, ProviderRequestId | None, list[CanonicalMessage]]:
+        """Bounded tool loop through the TEXT protocol (no native tools).
+
+        Same invariants as the native loop: lease renewed per round,
+        undeclared tools rejected, the approval gate consulted, tool
+        failures fed back instead of aborting, and identical-failure
+        breakers. Tool results ride user-role ``tool_result`` blocks
+        because the model (gateway) never sees the native tool role.
+        """
+        from zero.app.text_tool_protocol import (
+            parse_tool_call,
+            render_text_tool_instructions,
+            render_tool_error_message,
+            render_tool_result_message,
+            strip_tool_call_markers,
+        )
+
+        declarations = [
+            {
+                "name": d.name,
+                "description": d.description,
+                "parameters": d.normalized_parameters(),
+            }
+            for d in request.tools
+            if hasattr(d, "name")
+        ]
+        protocol_system = (request.system_message or "").rstrip()
+        protocol_system = (
+            protocol_system
+            + "\n\n"
+            + render_text_tool_instructions(declarations)
+        ).strip()
+        requested_names = set(tool_names)
+        current_response = response
+        current_request_id = provider_request_id
+        failure_signatures: dict[str, int] = {}
+
+        def _observe(payload: dict) -> None:
+            if stream_observer is not None:
+                try:
+                    stream_observer(payload)
+                except Exception:  # noqa: BLE001 - progress is observability
+                    pass
+
+        for _round in range(max_tool_rounds):
+            try:
+                self._worker.renew_task_lease(
+                    execution_id=execution_id,
+                    task_id=task.id,
+                    attempt_id=attempt.id,
+                    project_id=project_id,
+                    actor_id=actor_id,
+                    lease_owner=lease_owner,
+                    lease_duration_seconds=lease_duration_seconds,
+                    source=source,
+                )
+            except LeaseOwnershipError as lease_exc:
+                raise RuntimeToolError(
+                    f"attempt lease expired during tool round: {lease_exc}"
+                ) from lease_exc
+            if cancel_event is not None and cancel_event.is_set():
+                raise ProviderCancelledError("task cancelled during tool rounds")
+
+            call = parse_tool_call(current_response.content)
+            if call is None:
+                # No further tool calls: this response IS the deliverable.
+                clean = strip_tool_call_markers(current_response.content)
+                if clean != current_response.content:
+                    current_response = replace(current_response, content=clean)
+                return current_response, current_request_id, messages
+
+            tool_name = call.get("tool")
+            _observe({"type": "text_reset"})
+            _observe(
+                {
+                    "type": "tool_call",
+                    "name": tool_name or "unknown",
+                    "arguments": call.get("arguments") or {},
+                }
+            )
+            raw_text = current_response.content or ""
+
+            if tool_name is None:
+                result_block = render_tool_error_message(
+                    None, call.get("error") or "malformed tool call"
+                )
+                status = "invalid_arguments"
+            elif tool_name == DELEGATE_TOOL_NAME and self._enable_delegation:
+                payload = self._execute_delegation(
+                    call_arguments=json.dumps(call.get("arguments") or {}),
+                    parent_allowed_tools=tool_names,
+                    execution_id=execution_id,
+                    project_id=project_id,
+                    actor_id=actor_id,
+                    provider=request.provider,
+                    model_name=request.model_name,
+                )
+                result_block = render_tool_result_message(
+                    str(tool_name), json.dumps(payload, ensure_ascii=False)
+                )
+                status = "ok"
+            elif tool_name not in requested_names:
+                if self._metrics is not None:
+                    self._metrics.increment(
+                        "agent_runtime_tool_call_defects",
+                        project_id=task.project_id.value,
+                        result="undeclared_tool",
+                    )
+                result_block = render_tool_error_message(
+                    str(tool_name),
+                    f"tool {tool_name!r} is not declared for this task; "
+                    f"declared: {sorted(requested_names)}",
+                )
+                status = "undeclared_tool"
+            else:
+                # Approval gate (same contract as the native loop).
+                arguments = dict(call.get("arguments") or {})
+                if self._approval_gate is not None:
+                    verdict = self._approval_gate.evaluate(
+                        project_id=task.project_id.value,
+                        execution_id=execution_id.value,
+                        tool_name=str(tool_name),
+                        input_data=arguments,
+                    )
+                    if verdict.state != "allowed":
+                        if self._metrics is not None:
+                            self._metrics.increment(
+                                "agent_runtime_tool_call_defects",
+                                project_id=task.project_id.value,
+                                result=(
+                                    "approval_pending"
+                                    if verdict.state == "pending"
+                                    else "approval_denied"
+                                ),
+                            )
+                        hint = (
+                            "A human must approve this tool call before it runs. "
+                            "Continue with other work or finalize your answer."
+                            if verdict.state == "pending"
+                            else "This invocation was denied by policy."
+                        )
+                        result_block = render_tool_error_message(str(tool_name), hint)
+                        status = f"approval_{verdict.state}"
+                    else:
+                        result_block = None
+                else:
+                    result_block = None
+                if result_block is None:
+                    try:
+                        result = self._tools.invoke(  # type: ignore[union-attr]
+                            project_id=task.project_id,
+                            actor_id=actor_id,
+                            agent_scope=agent_scope,
+                            tool_name=str(tool_name),
+                            input_data=arguments,
+                            execution_id=execution_id.value,
+                            task_id=task.id.value,
+                            source=source,
+                        )
+                        result_block = render_tool_result_message(
+                            str(tool_name), result.model_facing
+                        )
+                        status = result.status
+                    except ToolInvocationDeniedError as denied:
+                        result_block = render_tool_error_message(
+                            str(tool_name),
+                            f"This invocation was denied by policy: {denied}",
+                        )
+                        status = "tool_denied"
+                    except Exception as tool_exc:  # noqa: BLE001 - failures feed back
+                        from zero.domain.audit import redact_sensitive_text
+
+                        result_block = render_tool_error_message(
+                            str(tool_name),
+                            redact_sensitive_text(
+                                f"{type(tool_exc).__name__}: {tool_exc}"
+                            )[:512],
+                        )
+                        status = "error"
+
+            # Identical-failure breaker (Hermes parity): the same tool
+            # failing the same way repeatedly must not burn the budget.
+            signature = f"{tool_name}:{status}"
+            failure_signatures[signature] = failure_signatures.get(signature, 0) + 1
+            if failure_signatures[signature] >= _FAILURE_ABORT_THRESHOLD:
+                raise RuntimeToolError(
+                    f"tool {tool_name!r} failed identically "
+                    f"{failure_signatures[signature]} times ({status}); loop aborted"
+                )
+
+            messages.append(
+                CanonicalMessage(
+                    role="assistant",
+                    content=strip_tool_call_markers(raw_text),
+                )
+            )
+            messages.append(CanonicalMessage(role="user", content=result_block))
+            _observe(
+                {
+                    "type": "tool_result",
+                    "name": str(tool_name or "tool"),
+                    "ok": status == "ok",
+                }
+            )
+
+            next_request = replace(
+                request,
+                messages=tuple(messages),
+                tools=(),
+                system_message=protocol_system,
+            )
+            next_provider_request, current_response = (
+                self._providers.send_request_with_fallback(
+                    project_id=task.project_id,
+                    actor_id=actor_id,
+                    execution_id=execution_id,
+                    request=next_request,
+                    cancel_event=cancel_event,
+                    source=source,
+                    agent_scope=agent_scope,
+                    stream_observer=stream_observer,
+                )
+            )
+            current_request_id = next_provider_request.id
+
+        # Round budget exhausted: one final toolless summary request.
+        nudge_request = replace(
+            request,
+            messages=tuple(messages)
+            + (CanonicalMessage(role="user", content=MAX_TOOL_ROUNDS_NUDGE_REQUEST),),
+            tools=(),
+        )
+        try:
+            nudge_provider_request, nudge_response = self._providers.send_request_with_fallback(
+                project_id=task.project_id,
+                actor_id=actor_id,
+                execution_id=execution_id,
+                request=nudge_request,
+                cancel_event=cancel_event,
+                source=source,
+                agent_scope=agent_scope,
+                stream_observer=stream_observer,
+            )
+        except Exception as nudge_exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "text-protocol final summary request failed for task %s: %s",
+                task.id.value,
+                type(nudge_exc).__name__,
+            )
+        else:
+            return (
+                replace(
+                    nudge_response,
+                    content=strip_tool_call_markers(nudge_response.content or ""),
+                ),
+                nudge_provider_request.id,
+                messages,
+            )
+        raise RuntimeToolError(
+            f"text-protocol tool loop exceeded {max_tool_rounds} rounds"
+        )
 
     @staticmethod
     def _tool_argument_error(call: Any) -> str | None:

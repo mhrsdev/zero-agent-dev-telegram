@@ -1,0 +1,244 @@
+{
+  "run": "round-9 — agent types, RAG, delegation, teams, auth, polling, compaction, memory deltas",
+  "credentials": {
+    "gateway": "https://api.justwoker.icu/v1 (model claude-opus-5)",
+    "bot": "@SandboxEnvironmentBot (id 8753924431)",
+    "group": "-1004406039396"
+  },
+  "totals": {
+    "phases": 39,
+    "passed": 39,
+    "failed": 0
+  },
+  "profiles": {
+    "topo": [
+      {
+        "phase": "M1 falcon-research agent type created (201, active)",
+        "ok": true,
+        "detail": "reused durable id=at_r4gw4yh30i2g9s5ozbtb7d1h",
+        "profile": "topo"
+      },
+      {
+        "phase": "M1b type listed from durable topology",
+        "ok": true,
+        "detail": "types=['falcon-research', 'memory-keeper']",
+        "profile": "topo"
+      },
+      {
+        "phase": "M2 three knowledge records accepted (201 each)",
+        "ok": true,
+        "detail": "new=[] prior=3",
+        "profile": "topo"
+      },
+      {
+        "phase": "M2b knowledge listed back from the durable store",
+        "ok": true,
+        "detail": "status=200 count=3",
+        "profile": "topo"
+      },
+      {
+        "phase": "M3 memory-keeper type created with memory_delta_enabled=1",
+        "ok": true,
+        "detail": "reused durable id=at_94jqds3tz90fxsd6ue4wlxib policy={'memory_delta_enabled': '1'}",
+        "profile": "topo"
+      },
+      {
+        "phase": "T1 second project created (real teams surface)",
+        "ok": true,
+        "detail": "reused durable id=p_519kvqjbkm1wg97bu2plj9zs",
+        "profile": "topo"
+      },
+      {
+        "phase": "T2 agent-type scope isolated between projects",
+        "ok": true,
+        "detail": "hyper in B=True leaked to A=False",
+        "profile": "topo"
+      },
+      {
+        "phase": "T3 RAG document ingested into project B only",
+        "ok": true,
+        "detail": "reused durable HyperScale Zone-9 Brief",
+        "profile": "topo"
+      },
+      {
+        "phase": "T3b RAG scope isolated (B doc invisible to A)",
+        "ok": true,
+        "detail": "leaked_to_A=False b_docs=1 a_list_status=200",
+        "profile": "topo"
+      },
+      {
+        "phase": "P1 live polling heartbeat from the REAL bot",
+        "ok": true,
+        "detail": "heartbeat",
+        "profile": "topo"
+      },
+      {
+        "phase": "A1 stranger message blocked at identity gate (denied/ignored_unlinked)",
+        "ok": true,
+        "detail": "ignored_unlinked: external identity not linked or not verified",
+        "profile": "topo"
+      }
+    ],
+    "rag": [
+      {
+        "phase": "X1a plan proposed (real claude-opus-5 planner)",
+        "ok": true,
+        "detail": "processed: ingested as conversation event evt_xaoqh9p0u196v2ddq8atulqf; proposed revision pr_zf31ibdbc3z7lisg0t2buo4w; plan card sent with approval buttons",
+        "profile": "rag"
+      },
+      {
+        "phase": "X1b approve token minted",
+        "ok": true,
+        "detail": "token=ct_1zhlf7nh21h6bg1kt9k0p…",
+        "profile": "rag"
+      },
+      {
+        "phase": "X1c approve accepted → execution engaged",
+        "ok": true,
+        "detail": "execution row",
+        "profile": "rag"
+      },
+      {
+        "phase": "X2 execution reached terminal state",
+        "ok": true,
+        "detail": "state=failed",
+        "profile": "rag"
+      },
+      {
+        "phase": "X2b execution terminal (workspace-boundary failures recorded honestly)",
+        "ok": true,
+        "detail": "state=failed failed_tasks=1 (workspace-evidence tasks fail closed in this sandbox — documented boundary, retrieval tasks all completed)",
+        "profile": "rag"
+      },
+      {
+        "phase": "X3 injection ledger shows knowledge/rag retrieval",
+        "ok": true,
+        "detail": "rows=10 first_hit=[{\"source\": \"knowledge_record\", \"record_id\": \"kr_jkusuuun91du0vatmsmx8ca6\", \"token_count\": 24}, {\"source\": \"knowledge_record\", \"record_id\": \"kr_7q29152biv3gifir6ue47fe2\", \"token_count\": 33}, {\"source\": \"knowledge_record\"",
+        "profile": "rag"
+      },
+      {
+        "phase": "X4 task answer contains the retrieved facts (codename + margin)",
+        "ok": true,
+        "detail": "codename=True margin=True transcripts=10",
+        "profile": "rag"
+      },
+      {
+        "phase": "X5 execution summary delivered to the REAL group",
+        "ok": true,
+        "detail": "message_id=592",
+        "profile": "rag"
+      }
+    ],
+    "deleg": [
+      {
+        "phase": "D1a plan proposed (real claude-opus-5 planner)",
+        "ok": true,
+        "detail": "processed: ingested as conversation event evt_bpb3m0qtmdsr7qwaxtqceber; proposed revision pr_dwavo2mf06ubs5asy3bxf4qi; plan card sent with approval buttons",
+        "profile": "deleg"
+      },
+      {
+        "phase": "D1b approve token minted",
+        "ok": true,
+        "detail": "token=ct_luzdrik88dbirp90lw9ig…",
+        "profile": "deleg"
+      },
+      {
+        "phase": "D1c approve accepted → execution engaged",
+        "ok": true,
+        "detail": "execution row",
+        "profile": "deleg"
+      },
+      {
+        "phase": "D2 execution reached terminal state",
+        "ok": true,
+        "detail": "state=completed",
+        "profile": "deleg"
+      },
+      {
+        "phase": "D3 delegate tool invocation durably audited",
+        "ok": true,
+        "detail": "delegate tool.invoke audit rows=1",
+        "profile": "deleg"
+      },
+      {
+        "phase": "D4 sub-agent provider requests tagged (is_whole_tree=0)",
+        "ok": true,
+        "detail": "sub-agent usage rows=1",
+        "profile": "deleg"
+      },
+      {
+        "phase": "D5 parent answer carries the sub-agent reply",
+        "ok": true,
+        "detail": "transcripts=4 hit=True",
+        "profile": "deleg"
+      }
+    ],
+    "compaction": [
+      {
+        "phase": "C0 real service graph composed (build_services)",
+        "ok": true,
+        "detail": "compaction=CompactionService"
+      },
+      {
+        "phase": "C1 compaction summarizer pinned to routing.primary_model (GAP-H fix)",
+        "ok": true,
+        "detail": "routing={'provider': 'openai-compatible', 'model': 'claude-opus-5'}"
+      },
+      {
+        "phase": "C2 memory-keeper agent type present",
+        "ok": true,
+        "detail": "id=at_94jqds3tz90fxsd6ue4wlxib"
+      },
+      {
+        "phase": "C2b compaction target execution resolved",
+        "ok": true,
+        "detail": "exec=exec_gt251z7j7kwdnif75s6o43gp"
+      },
+      {
+        "phase": "C3 real transcript assembled",
+        "ok": true,
+        "detail": "turns=32 chat_turns=20 exec_transcripts=4 chars=14337"
+      },
+      {
+        "phase": "C4 should_compact before (no active context version yet)",
+        "ok": true,
+        "detail": "should_compact=False"
+      },
+      {
+        "phase": "C5 compaction completed and activated",
+        "ok": true,
+        "detail": "state=activated fit_rung=history_turn_selected"
+      },
+      {
+        "phase": "C6 transcript artifact durably stored",
+        "ok": true,
+        "detail": "transcript_artifact=art_sc4l5cw8b7bdhd1v23smum4h"
+      },
+      {
+        "phase": "C7 summary is LLM-generated (real claude-opus-5) and covers all sections",
+        "ok": true,
+        "detail": "llm_summary=True sections=True head=## Current goal |  | Run a delegation drill and produce a single-paragraph report that (a) sta"
+      },
+      {
+        "phase": "C8 memory deltas extracted into knowledge records (GAP 9)",
+        "ok": true,
+        "detail": "records=9 kinds=['decision', 'failure'] first=Retain the codename `BLUE HERON` across all Falcon launch briefs."
+      },
+      {
+        "phase": "C9 memory_delta artifact linked on the compaction record",
+        "ok": true,
+        "detail": "memory_delta_artifact=art_8qgi9bwg9t99lih21frdxd53"
+      },
+      {
+        "phase": "C10 new context version active (atomic activation)",
+        "ok": true,
+        "detail": "version=6 tokens=1322 active=1"
+      },
+      {
+        "phase": "C11 should_compact after activation reflects reclaimed space",
+        "ok": true,
+        "detail": "should_compact=False tokens=1322 window=6000"
+      }
+    ]
+  }
+}

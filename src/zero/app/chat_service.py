@@ -15,7 +15,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from zero.app.authorization_service import AuthorizationService
@@ -126,6 +126,95 @@ class ChatService:
         OpenAI-compatible ``image_url`` content parts after the text
         part.
         """
+        return self._complete_turn(
+            project_id=project_id,
+            actor_id=actor_id,
+            message=message,
+            agent_scope=agent_scope,
+            max_tool_rounds=max_tool_rounds,
+            provider=provider,
+            model_name=model_name,
+            source=source,
+            history=history,
+            image_data_urls=image_data_urls,
+            stream=False,
+            event_cb=None,
+        )
+
+    # ------------------------------------------------------------------
+    # Streaming turn (Hermes live-report parity, gap A+B)
+    # ------------------------------------------------------------------
+
+    def complete_stream(
+        self,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        message: str,
+        provider: str,
+        model_name: str,
+        event_cb: Any,
+        agent_scope: AgentScope = "main_worker",
+        max_tool_rounds: int = 3,
+        source: AuditSource = "web",
+        history: tuple[CanonicalMessage, ...] = (),
+        image_data_urls: tuple[str, ...] = (),
+    ) -> ChatTurnResult:
+        """Run one chat turn with LIVE event reporting.
+
+        Identical contract to :meth:`complete` (same auth, rate limit,
+        grant check, sanitization, tool rounds) plus one addition:
+        ``event_cb`` receives client-safe event dicts as the turn
+        progresses, so a messaging surface can stream the answer:
+
+        - ``{"type": "text_delta", "text": ...}`` — incremental model
+          text (may arrive across several rounds);
+        - ``{"type": "tool_call", "name": ..., "arguments": ...}`` — a
+          resolved tool invocation is starting;
+        - ``{"type": "tool_result", "name": ..., "ok": ...}`` — the
+          tool settled.
+
+        Observer failures never break the turn (the same guarantee the
+        provider stream observer carries). The durable request/usage
+        bookkeeping is byte-identical to :meth:`complete`; the request
+        is marked ``stream=True`` so the provider adapter streams.
+        """
+        return self._complete_turn(
+            project_id=project_id,
+            actor_id=actor_id,
+            message=message,
+            agent_scope=agent_scope,
+            max_tool_rounds=max_tool_rounds,
+            provider=provider,
+            model_name=model_name,
+            source=source,
+            history=history,
+            image_data_urls=image_data_urls,
+            stream=True,
+            event_cb=event_cb,
+        )
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _complete_turn(
+        self,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        message: str,
+        agent_scope: AgentScope,
+        max_tool_rounds: int,
+        provider: str,
+        model_name: str,
+        source: AuditSource,
+        history: tuple[CanonicalMessage, ...],
+        image_data_urls: tuple[str, ...],
+        stream: bool,
+        event_cb: Any,
+    ) -> ChatTurnResult:
+        """One shared chat-turn body for the streaming and batch paths."""
         if not message.strip():
             raise ValueError("message must not be empty")
         if not 0 <= max_tool_rounds <= _MAX_TOOL_ROUNDS_LIMIT:
@@ -156,6 +245,56 @@ class ChatService:
         messages: list[CanonicalMessage] = [*sanitized_history, last_message]
         executed: list[dict[str, Any]] = []
 
+        def safe_event(payload: dict[str, Any]) -> None:
+            """Forward one client-safe event; a bad sink never breaks the turn."""
+            if event_cb is None:
+                return
+            try:
+                event_cb(payload)
+            except Exception:  # noqa: BLE001 - sinks are observability
+                logger.debug("chat stream event dropped", exc_info=True)
+
+        stream_observer = safe_event if stream else None
+
+        # Text-protocol tool calling (gateway without native tools).
+        # Resolved ONCE per turn: the capability probe is cached per
+        # (provider, model) inside the provider service.
+        use_text_protocol = False
+        granted_declarations: list[dict[str, Any]] = []
+        if granted_tools and self._tools is not None:
+            try:
+                native_tools = self._providers.tool_call_support(provider, model_name)
+            except Exception:  # noqa: BLE001 - probe failure keeps native
+                native_tools = True
+            use_text_protocol = not native_tools
+            if use_text_protocol:
+                logger.info(
+                    "chat text-protocol tool calling active (tools=%s, model=%s:%s)",
+                    list(granted_tools),
+                    provider,
+                    model_name,
+                )
+        if granted_tools:
+            for name in granted_tools:
+                declaration = self._declaration(name)
+                if isinstance(declaration, ToolDeclaration):
+                    granted_declarations.append(
+                        {
+                            "name": declaration.name,
+                            "description": declaration.description,
+                            "parameters": declaration.normalized_parameters(),
+                        }
+                    )
+                else:
+                    granted_declarations.append({"name": str(declaration)})
+        protocol_system = CHAT_SYSTEM_MESSAGE
+        if use_text_protocol and granted_declarations:
+            from zero.app.text_tool_protocol import render_text_tool_instructions
+
+            protocol_system = (
+                CHAT_SYSTEM_MESSAGE + "\n\n" + render_text_tool_instructions(granted_declarations)
+            )
+
         response = None
         provider_request = None
         for round_index in range(max_tool_rounds + 1):
@@ -165,10 +304,11 @@ class ChatService:
                 model_name=model_name,
                 messages=tuple(messages),
                 tools=()
-                if is_final_round
+                if (is_final_round or use_text_protocol)
                 else tuple(self._declaration(name) for name in granted_tools),
-                system_message=CHAT_SYSTEM_MESSAGE,
+                system_message=protocol_system,
                 max_tokens=self._default_model_max_tokens,
+                stream=stream,
             )
             provider_request, response = self._providers.send_request_with_fallback(
                 project_id=project_id,
@@ -177,7 +317,90 @@ class ChatService:
                 request=request,
                 source=source,
                 agent_scope=agent_scope,
+                stream_observer=stream_observer,
             )
+            if use_text_protocol:
+                # One assistant TEXT response may itself contain a tool
+                # call. Parse it; on a call, execute through the normal
+                # boundary and continue the loop. The final round always
+                # breaks with whatever content arrived.
+                from zero.app.text_tool_protocol import (
+                    parse_tool_call,
+                    render_tool_error_message,
+                    render_tool_result_message,
+                    strip_tool_call_markers,
+                )
+
+                call = None if is_final_round else parse_tool_call(response.content)
+                if call is None:
+                    clean = strip_tool_call_markers(response.content)
+                    if clean != response.content:
+                        response = replace(response, content=clean)
+                    break
+                # The raw marker text is protocol noise, not content:
+                # tell streaming surfaces to drop their accumulated
+                # buffer before the tool line lands.
+                safe_event({"type": "text_reset"})
+                safe_event(
+                    {
+                        "type": "tool_call",
+                        "name": call.get("tool") or "unknown",
+                        "arguments": call.get("arguments") or {},
+                    }
+                )
+                if call.get("tool") is None:
+                    result_payload = {
+                        "tool_name": "(unparsed)",
+                        "arguments": {},
+                        "result": render_tool_error_message(
+                            None, call.get("error") or "malformed tool call"
+                        ),
+                        "status": "error",
+                    }
+                else:
+                    result_payload = self._invoke_tool(
+                        project_id=project_id,
+                        actor_id=actor_id,
+                        agent_scope=agent_scope,
+                        tool_name=str(call["tool"]),
+                        arguments_text=json.dumps(call.get("arguments") or {}),
+                        source=source,
+                    )
+                executed.append(result_payload)
+                safe_event(
+                    {
+                        "type": "tool_result",
+                        "name": result_payload.get("tool_name") or "tool",
+                        "ok": result_payload.get("status") == "ok",
+                    }
+                )
+                messages.append(
+                    CanonicalMessage(
+                        role="assistant",
+                        content=strip_tool_call_markers(response.content),
+                    )
+                )
+                if result_payload.get("status") == "error":
+                    messages.append(
+                        CanonicalMessage(
+                            role="user",
+                            content=render_tool_error_message(
+                                result_payload.get("tool_name"),
+                                result_payload.get("result", "tool failed"),
+                            ),
+                        )
+                    )
+                else:
+                    messages.append(
+                        CanonicalMessage(
+                            role="user",
+                            content=render_tool_result_message(
+                                str(result_payload.get("tool_name") or "tool"),
+                                str(result_payload.get("result") or ""),
+                            ),
+                        )
+                    )
+                continue
             if not response.tool_calls:
                 break
             if is_final_round:
@@ -196,6 +419,11 @@ class ChatService:
                 logger.warning("provider requested tools but chat has no tool service")
                 break
             for call in response.tool_calls:
+                try:
+                    arguments = json.loads(call.arguments) if call.arguments.strip() else {}
+                except (TypeError, ValueError):
+                    arguments = call.arguments
+                safe_event({"type": "tool_call", "name": call.tool_name, "arguments": arguments})
                 result_payload = self._invoke_tool(
                     project_id=project_id,
                     actor_id=actor_id,
@@ -205,6 +433,13 @@ class ChatService:
                     source=source,
                 )
                 executed.append(result_payload)
+                safe_event(
+                    {
+                        "type": "tool_result",
+                        "name": call.tool_name,
+                        "ok": result_payload.get("status") == "ok",
+                    }
+                )
                 messages.append(
                     CanonicalMessage(
                         role="tool",
@@ -268,7 +503,12 @@ class ChatService:
             return ()
         try:
             grants = self._tools._tool_repo.list_grants_for_project(project_id)
-        except Exception:  # noqa: BLE001 - degraded: run toolless
+        except Exception as exc:  # noqa: BLE001 - degraded: run toolless
+            logger.warning(
+                "chat tool grants unavailable (%s: %s) — running toolless",
+                type(exc).__name__,
+                str(exc)[:160],
+            )
             return ()
         names: list[str] = []
         for grant in grants:

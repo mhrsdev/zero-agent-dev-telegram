@@ -367,6 +367,17 @@ def _sync_providers(
     if cfg.routing.fallback_models:
         services.providers.set_fallback_models(tuple(cfg.routing.fallback_models))
 
+    # NOTE (live-run 2026-08-30): the gateway tool-calling capability is
+    # observed LAZILY on the first tool-ful request
+    # (``ProviderService.tool_call_support``), not here at boot — a boot
+    # probe would open a real network connection inside every unit test
+    # that runs a config sync (leaked-socket warnings) and add a round
+    # trip to every engine start. The lazy probe records the observed
+    # truth once per (provider, model) and strips the model's
+    # ``native_tools`` capability when the gateway strips tools, which
+    # routes chat, tasks, decomposition, and planning to the text tool
+    # protocol.
+
 
 def _sync_telegram_bindings(
     services: Services,
@@ -635,9 +646,30 @@ def _sync_planner(services: Services, cfg) -> None:
             primary,
         )
 
+    # GAP H (round-9 live fix): the compaction LLM summarizer was the
+    # LAST routing consumer still resolving its model from
+    # ``settings.openai_model`` (the gpt-4o-mini default). On the
+    # operator's gateway every summarizer call then failed, compaction
+    # silently degraded to the deterministic template, and LLM-gated
+    # memory deltas (GAP 9) could never be extracted. Pin the
+    # summarizer to the SAME routing truth.
+    compaction = getattr(services, "compaction", None)
+    if compaction is not None and compaction.summarizer is not None:
+        compaction.summarizer_routing = {
+            "provider": (
+                "anthropic" if provider_protocol == "anthropic" else "openai-compatible"
+            ),
+            "model": primary,
+        }
+        logger.info(
+            "config sync: compaction summarizer aligned with "
+            "routing.primary_model=%s",
+            primary,
+        )
+
 
 def _ensure_web_search_tool(services: Services, project, owner_id) -> None:
-    """Make the keyless ``web_search`` tool real and granted (round 5).
+    """Make the keyless web-search tool real and granted (round 5).
 
     ``WebSearchCfg`` was a stub referenced by the wizard and the doctor
     while no runtime tool existed. The tool is registered once (by
@@ -646,11 +678,24 @@ def _ensure_web_search_tool(services: Services, project, owner_id) -> None:
     the standard grant/redaction/audit pipeline like every other tool.
     Idempotent across restarts: an existing tool row and an existing
     grant short-circuit the registration.
+
+    The registry name is ``internet_search`` (live-run 2026-08-30): the
+    operator's gateway POISONS the tool name ``web_search`` — it is an
+    Anthropic server-side tool name, and through this gateway any tool
+    so named silently never produces tool_calls (the model answers with
+    hallucinated "search results" instead). Renaming the registered
+    tool keeps the same handler and pipeline while the model actually
+    calls it. A legacy ``web_search`` row from an older database still
+    resolves and stays granted.
     """
-    try:
-        tool = services.tools._tool_repo.get_tool_by_name("web_search")
-    except Exception:  # noqa: BLE001 - not registered yet
-        tool = None
+    tool = None
+    for candidate_name in ("internet_search", "web_search"):
+        try:
+            tool = services.tools._tool_repo.get_tool_by_name(candidate_name)
+        except Exception:  # noqa: BLE001 - not registered yet
+            tool = None
+        if tool is not None:
+            break
     if tool is None:
         from zero.app.tools_websearch import (
             WEB_SEARCH_INPUT_SCHEMA,
@@ -659,7 +704,7 @@ def _ensure_web_search_tool(services: Services, project, owner_id) -> None:
         )
 
         tool = services.tools.register_tool(
-            name="web_search",
+            name="internet_search",
             description=(
                 "Search the public web (keyless DuckDuckGo backend) and "
                 "return up to 5 results with title, URL, and snippet."
@@ -670,7 +715,9 @@ def _ensure_web_search_tool(services: Services, project, owner_id) -> None:
             handler=make_web_search_handler(),
             inline=True,
         )
-        logger.info("config sync: web_search tool registered (id=%s)", tool.id.value)
+        logger.info(
+            "config sync: internet_search tool registered (id=%s)", tool.id.value
+        )
     try:
         existing_grants = [
             grant

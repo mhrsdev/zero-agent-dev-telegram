@@ -1,0 +1,15 @@
+{"phase": "D1a plan proposed (real claude-opus-5 planner)", "ok": false, "detail": "processed: ingested as conversation event evt_vojkvk97r2fi0r2xuvs96bdl; no actionable plan proposed; conversational reply sent; live-streamed", "profile": "deleg"}
+{"phase": "D1a plan proposed (real claude-opus-5 planner)", "ok": true, "detail": "processed: ingested as conversation event evt_zvhi00u0xz1zd8hebsh6buht; proposed revision pr_nm9b9g5zfsb8l7c064w0svhh; plan card sent with approval buttons", "profile": "deleg"}
+{"phase": "D1b approve token minted", "ok": true, "detail": "token=ct_4ffvbtd7wjqrsznrswdok…", "profile": "deleg"}
+{"phase": "D1c approve accepted → execution engaged", "ok": true, "detail": "execution row", "profile": "deleg"}
+{"phase": "D2 execution reached terminal state", "ok": true, "detail": "state=completed", "profile": "deleg"}
+{"phase": "D3 delegate tool invocation durably audited", "ok": false, "detail": "delegate tool.invoke audit rows=0", "profile": "deleg"}
+{"phase": "D4 sub-agent provider requests tagged (is_whole_tree=0)", "ok": true, "detail": "sub-agent usage rows=1", "profile": "deleg"}
+{"phase": "D5 parent answer carries the sub-agent reply", "ok": true, "detail": "transcripts=2 hit=True", "profile": "deleg"}
+{"phase": "D1a plan proposed (real claude-opus-5 planner)", "ok": true, "detail": "processed: ingested as conversation event evt_bpb3m0qtmdsr7qwaxtqceber; proposed revision pr_dwavo2mf06ubs5asy3bxf4qi; plan card sent with approval buttons", "profile": "deleg"}
+{"phase": "D1b approve token minted", "ok": true, "detail": "token=ct_luzdrik88dbirp90lw9ig…", "profile": "deleg"}
+{"phase": "D1c approve accepted → execution engaged", "ok": true, "detail": "execution row", "profile": "deleg"}
+{"phase": "D2 execution reached terminal state", "ok": true, "detail": "state=completed", "profile": "deleg"}
+{"phase": "D3 delegate tool invocation durably audited", "ok": true, "detail": "delegate tool.invoke audit rows=1", "profile": "deleg"}
+{"phase": "D4 sub-agent provider requests tagged (is_whole_tree=0)", "ok": true, "detail": "sub-agent usage rows=1", "profile": "deleg"}
+{"phase": "D5 parent answer carries the sub-agent reply", "ok": true, "detail": "transcripts=4 hit=True", "profile": "deleg"}

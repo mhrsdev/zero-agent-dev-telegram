@@ -102,10 +102,10 @@ def register_topology_routes(app: FastAPI, services: Services) -> None:
     def list_knowledge(request: Request, project_id: str, type_id: str) -> list[dict[str, Any]]:
         from zero.domain.agent_types import AgentTypeId
 
-        authorized_actor(request, services, project_id, "project.view")
+        actor = authorized_actor(request, services, project_id, "project.view")
         try:
             records = services.agent_types.list_knowledge_for_type(
-                ProjectId(project_id), AgentTypeId(type_id)
+                ProjectId(project_id), AgentTypeId(type_id), actor_id=actor
             )
         except Exception as exc:
             raise HTTPException(status_code=404, detail="Knowledge not found") from exc

@@ -4,6 +4,112 @@ All notable changes to Zero Develop are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions
 are milestone-based rather than semver until 1.0.
 
+## [Unreleased] — Hermes live-streaming parity + live feature-proof wave (rounds 8–9)
+
+Two consecutive waves driven by a line-by-line read of the Hermes Agent
+codebase (`gateway/stream_consumer.py`, `stream_events.py`,
+`plugins/platforms/telegram/adapter.py`) and by live runs against the
+operator's real stack (real bot @SandboxEnvironmentBot, real
+OpenAI-compatible gateway, real claude-opus-5, real group). Every item
+below is pinned by a regression test and, where noted, proven live with
+durable evidence under `realrun-evidence/round8/` and
+`realrun-evidence/round9/`. Suite after both waves: **1155 passed,
+13 skipped, 0 failed** (pre-wave baseline: 1124 passed).
+
+### Added
+
+- **Live streaming into Telegram chat (GAP A)** —
+  `src/zero/app/telegram_live.py`: `TelegramLiveStream`, a
+  Hermes-style edit-in-place previewer. Throttled `edit_message_text`
+  (default 1.2s tick), UTF-16 codepoint saturation accounting with
+  overflow dedup (`_last_overflow_preview` parity), final-response
+  overflow split into continuation messages, and a never-raises failure
+  contract (a broken preview must never kill the turn). The chat bridge
+  degrades to the durable single-shot send when streaming is
+  unavailable, and a preview that never opened still falls back to a
+  durable send.
+- **Tool-call reporting in the stream bubble (GAP B)** — Strategy-B
+  parity: tool lines (`🔧 tool(args)… ✓/✗`) are appended under the
+  streaming text inside the same preview bubble, exactly like Hermes'
+  tool progress lines, driven by `text_delta` / `tool_call` /
+  `tool_result` events.
+- **Task-execution progress bubbles (GAP C)** —
+  `TelegramExecutionProgress`: one lazy progress bubble per execution,
+  showing per-task lines plus the current task's live text tail and
+  tool lines. `agent_runtime.run_ready_tasks` emits
+  `task_started/completed/failed`; the scheduler tick fans these out
+  per Telegram binding via `stream_callback`/`task_event_callback`, so
+  autonomous background work is no longer silent until its summary.
+- **Chat command book (GAP F+G)** — `src/zero/app/telegram_commands.py`:
+  `/status` (worker liveness, queue depth, model routing),
+  `/tasks` (recent executions from durable state), `/model`
+  (effective routing), `/approvals` (pending manual tool approvals via
+  `approval_gate.list_pending`); `/help` updated. All commands read
+  durable state only — no LLM cost.
+- **Streaming turn pipeline** — `ChatService.complete_stream(stream=,
+  event_cb=)`: same durable bookkeeping as `complete()` but emits
+  provider deltas through `ProviderService.send_request_with_fallback`
+  → OpenAI adapter `text_delta`/`tool_call_delta`/`message_end`.
+  Pinned end-to-end by `tests/test_hermes_parity_round8_live.py`
+  (18 tests) including the bridge streaming e2e.
+- **Per-chat serial dispatch lanes (GAP E)** —
+  `background_workers._ChatSerialDispatcher`: bounded lane pool
+  (8 lanes / 16 queued) giving per-chat FIFO ordering while decoupling
+  message handling from the polling loop; polling detects adapter
+  support via `inspect.signature` (webhook path unaffected).
+
+### Fixed
+
+- **GAP H — compaction summarizer was the last unaligned routing
+  consumer, so memory deltas were never extracted on the operator
+  gateway.** `CompactionService` resolved its LLM summarizer from
+  `settings.openai_model` (the gpt-4o-mini default) while config_sync
+  aligned only planner/chat/scheduler. Against the operator gateway
+  every summarizer call failed → deterministic fallback → memory
+  extraction never ran. `CompactionService.summarizer_routing` +
+  config_sync pin now bind the summarizer to `routing.primary_model`
+  (registered-adapter fallback preserved; per-call override honored).
+  4 pinned tests; proven live (real claude-opus-5 summary with all 6
+  sections, 9 durable memory deltas extracted, context version
+  activated).
+- **GAP I — `GET /projects/{pid}/rag` returned 500** (route called
+  `list_rag_documents` without the required keyword-only `actor_id`).
+  Fixed and pinned (`test_hermes_parity_round9_routes.py`).
+- **GAP J — `GET /projects/{pid}/agent-types/{tid}/knowledge` returned
+  a misleading 404** (same missing-`actor_id` class). Fixed; a full
+  router scan (resolving actual service classes via the Services
+  dataclass + `inspect.signature`) confirms no remaining call sites of
+  this class.
+- **GAP K — duplicate RAG ingest crashed with a raw IntegrityError
+  500.** Now surfaced as an honest `409 Conflict`
+  (`RagDocumentAlreadyExistsError`). Pinned.
+- **GAP L — delegation bypassed the tool registry, so delegations left
+  no durable `tool.invoke` audit trail.** `AgentRuntime` now accepts
+  `audit_repo` and writes a redacted `tool.invoke`
+  (`target_id='delegate'`) row on every delegation exit path
+  (success, refusal, error); `getattr`-guarded for test-built
+  runtimes. 2 pinned tests + live proof (audit row present for the
+  real delegated execution).
+- **Edit-path hardening (GAP D)** — `TelegramAdapter.edit_message` now
+  renders markdown → Telegram HTML (`render_telegram_html`), tolerates
+  `message is not modified` (idempotent edits), and honors bounded
+  `RetryAfter` flood waits; `adapters/messaging.py` enriches 4xx /
+  retryable errors with a redacted response-body snippet so rejection
+  reasons are actionable instead of opaque.
+
+### Live evidence (round-9 final grade: 39/39 phases, 0 failures)
+
+- `realrun-evidence/round9/evidence.json` + `realrun-evidence/round9/GRADE_REPORT.md`:
+  topology profile 11/11, RAG profile 8/8 (injection ledger shows the
+  3 real `knowledge_record` ids retrieved; 7 task transcripts contain
+  the planted codename), delegation profile 7/7 (sub-agent usage
+  tagged whole-tree=0, SUBAGENT-OK in the parent answer, durable
+  delegate audit row), compaction verifier 13/13 (real claude-opus-5
+  summary, memory deltas durable, GAP-H pin proven).
+- Known operator-side boundary (documented, not a defect): worktree /
+  file-editing tasks require a real isolation backend (docker /
+  firejail); the sandbox host cannot exercise that path.
+
 ## [Unreleased] — round-8 security & correctness wave
 
 A full-tree audit pass. Every item was reproduced before it was fixed and

@@ -19,6 +19,7 @@ actor, project, revision, and transition.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
@@ -26,7 +27,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
-from starlette.concurrency import run_in_threadpool
 
 from zero import __version__
 from zero.app.auth_service import (
@@ -114,6 +114,18 @@ def create_app(settings: Settings) -> FastAPI:
         migration_counter=count_applied_migrations,
     )
     worker_host = BackgroundWorkerHost(settings, services)
+    # Dynamic Telegram slash commands (gaps F+G): /status /tasks /model
+    # /approvals read durable state + live worker-loop counters.
+    try:
+        from zero.app.telegram_commands import TelegramCommandBook
+
+        services.interfaces.command_book = TelegramCommandBook(
+            services, worker_status=worker_host.status.to_dict
+        )
+    except Exception:  # noqa: BLE001 - command surface is optional
+        _logging.getLogger(__name__).warning(
+            "telegram command book could not be wired", exc_info=True
+        )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -292,11 +304,7 @@ def _register_auth_middleware(app: FastAPI, services: Services, settings: Settin
             token = request.cookies.get("zero_access_token", "")
             token_source = "cookie"
         try:
-            # Token authentication is a synchronous database read. Running
-            # it inline would block the event loop on SQLite I/O for every
-            # authenticated request, serializing the whole process; the
-            # routers and the webhook path already use the threadpool.
-            actor_id = await run_in_threadpool(services.auth.authenticate, token)
+            actor_id = services.auth.authenticate(token)
         except AuthenticationError:
             return JSONResponse(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -318,26 +326,13 @@ def _register_auth_middleware(app: FastAPI, services: Services, settings: Settin
 
             match = _PROJECT_PATH.match(path)
             if match:
-                project_id_value = match.group(1)
-
-                def _check_project_scope() -> None:
-                    # The actor ContextVar is bound on the event-loop task,
-                    # so the worker thread re-binds it for the duration of
-                    # this check; the service layer reads it for audit
-                    # attribution and impersonation refusal.
-                    scoped = bind_actor(actor_id)
-                    try:
-                        services.authorization.require_permission(
-                            actor_id=actor_id,
-                            project_id=ProjectId(project_id_value),
-                            permission="project.view",
-                            source="web",
-                        )
-                    finally:
-                        reset_actor(scoped)
-
                 try:
-                    await run_in_threadpool(_check_project_scope)
+                    services.authorization.require_permission(
+                        actor_id=actor_id,
+                        project_id=ProjectId(match.group(1)),
+                        permission="project.view",
+                        source="web",
+                    )
                 except (AuthorizationError, ValueError):
                     return JSONResponse(
                         status_code=status.HTTP_404_NOT_FOUND,

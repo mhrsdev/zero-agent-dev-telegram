@@ -447,6 +447,12 @@ def build_services(
         Uses the first registered provider; returns ``None`` when no
         provider exists so the deterministic fallback summary applies.
         The transcript is bounded and passed as data-only material.
+
+        GAP H (round-9 live fix): when config sync pinned a routing
+        override (``routing.primary_model``), the summarizer calls
+        exactly that provider/model — the same truth the planner, the
+        chat bridge, and the scheduler tick already follow. Without the
+        override the historical settings-derived choice applies.
         """
         provider_names = provider_service.registered_provider_names
         if not provider_names:
@@ -461,8 +467,16 @@ def build_services(
         transcript_text = "\n".join(lines)[:48_000]
         import hashlib
 
-        primary = provider_names[0]
-        if primary == "anthropic":
+        routing = compaction_service.summarizer_routing or {}
+        primary = str(routing.get("provider") or "").strip() or provider_names[0]
+        if primary not in provider_names:
+            # The routed provider adapter is not registered (e.g. a
+            # config edit removed it) — degrade to the first registered
+            # adapter rather than dropping the summarizer entirely.
+            primary = provider_names[0]
+        if routing.get("model"):
+            model_name = str(routing["model"])
+        elif primary == "anthropic":
             model_name = settings.anthropic_model
         elif primary == "openai-compatible":
             model_name = settings.openai_model
@@ -473,7 +487,7 @@ def build_services(
             project_id=project_id,
             actor_id=actor_id,
             request=CanonicalRequest(
-                provider=provider_names[0],
+                provider=primary,
                 model_name=model_name,
                 system_message=COMPACTION_SUMMARIZER_SYSTEM,
                 messages=(CanonicalMessage(role="user", content=transcript_text),),
@@ -588,6 +602,7 @@ def build_services(
         metrics=metrics_service,
         compaction=compaction_service,
         enable_delegation=True,
+        audit_repo=audit_repo,
         # Bug fix (real run, 2026-08-28): the runtime used to fall back to
         # a hidden default test command ("pytest -q") that the worktree
         # command policy does not allowlist — every task whose

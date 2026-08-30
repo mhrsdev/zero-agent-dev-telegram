@@ -16,6 +16,7 @@ from .messaging import (
     HttpTransport,
     PermanentTransportError,
     RetryPolicy,
+    TransportError,
     UnsupportedUpdateError,
     WebhookAuthError,
     _cursor_get,
@@ -23,9 +24,38 @@ from .messaging import (
     safe_render_text,
     verify_secret_header,
 )
-from .telegram_render import chunk_telegram_text, render_telegram_html
+from .telegram_render import (
+    TELEGRAM_MESSAGE_LIMIT,
+    chunk_telegram_text,
+    render_telegram_html,
+    render_telegram_html_bounded,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _noop_http_response() -> HttpResponse:
+    """A synthetic 200 used when a redundant edit is treated as success."""
+
+    class _NoopResponse:
+        status_code = 200
+        content = b'{"ok":true,"result":true}'
+        headers: dict[str, str] = {}
+
+    return _NoopResponse()  # type: ignore[return-value]
+
+
+def _parse_retry_after(message: str) -> float | None:
+    """Extract a Bot API RetryAfter seconds value from an error string."""
+    import re as _re
+
+    match = _re.search(r"retry after (\d+)", str(message).lower())
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+    return None
 
 
 def _callback_outcome_text(result: Any) -> str:
@@ -477,16 +507,89 @@ class TelegramAdapter(BaseMessagingAdapter):
         message_id: str,
         text: str,
         topic_id: str | None = None,
+        disable_web_page_preview: bool = True,
     ) -> HttpResponse:
+        """Edit one message in place (Hermes streaming parity).
+
+        Hardened for LIVE streaming use (gap D, Hermes audit 2026-08-29):
+        - ``render_telegram_html_bounded`` renders the conservative
+          markdown subset (bold/code/fences/links) instead of raw
+          escaping, so a streaming preview shows formatted output rather
+          than literal ``**`` markers, and bounds the SOURCE rather than
+          slicing rendered HTML — a slice can cut a tag or entity in half
+          and Telegram then rejects the frame with 400 "can't parse
+          entities";
+        - a Telegram 400 "message is not modified" is treated as
+          SUCCESS — a repeated identical frame is a no-op, not an error
+          (Hermes: "Message is not modified" — content identical);
+        - Bot API RetryAfter (flood control) sleeps the demanded bound
+          (capped) once and retries the edit;
+        - ``disable_web_page_preview`` keeps progressive frames from
+          flashing link previews.
+        """
         payload: dict[str, Any] = {
             "chat_id": str(chat_id),
             "message_id": str(message_id),
-            "text": safe_render_text(text, platform="telegram", limit=4096),
+            "text": render_telegram_html_bounded(text, TELEGRAM_MESSAGE_LIMIT),
             "parse_mode": "HTML",
         }
+        if disable_web_page_preview:
+            payload["link_preview_options"] = {"is_disabled": True}
         if topic_id is not None:
             payload["message_thread_id"] = str(topic_id)
-        return self._call_api("editMessageText", payload)
+        try:
+            return self._call_api("editMessageText", payload)
+        except PermanentTransportError as exc:
+            message = str(exc)
+            if "not modified" in message.lower():
+                return _noop_http_response()
+            retry_after = _parse_retry_after(message)
+            if "retry after" in message.lower() and retry_after is not None:
+                import time as _time
+
+                wait = min(float(retry_after), 15.0)
+                logger.warning(
+                    "Telegram flood control on edit: waiting %.1fs (bounded)",
+                    wait,
+                )
+                _time.sleep(wait)
+                return self._call_api("editMessageText", payload)
+            raise
+        except TransportError as exc:
+            # 429 "Too Many Requests: retry after N" arrives as a
+            # (retryable) TransportError — the same flood tolerance
+            # applies, bounded, once.
+            message = str(exc)
+            retry_after = _parse_retry_after(message)
+            if "retry after" not in message.lower() or retry_after is None:
+                raise
+            import time as _time
+
+            wait = min(float(retry_after), 15.0)
+            logger.warning(
+                "Telegram flood control on edit: waiting %.1fs (bounded)",
+                wait,
+            )
+            _time.sleep(wait)
+            return self._call_api("editMessageText", payload)
+        except RuntimeError as exc:
+            # ok=false responses surface as plain RuntimeError; the same
+            # tolerances apply (identical frame / flood wait).
+            message = str(exc)
+            if "not modified" in message.lower():
+                return _noop_http_response()
+            if "retry after" in message.lower():
+                retry_after = _parse_retry_after(message)
+                wait = min(float(retry_after or 1.0), 15.0)
+                logger.warning(
+                    "Telegram flood control on edit: waiting %.1fs (bounded)",
+                    wait,
+                )
+                import time as _time
+
+                _time.sleep(wait)
+                return self._call_api("editMessageText", payload)
+            raise
 
     def answer_callback_query(
         self, callback_query_id: str, *, text: str | None = None
@@ -496,8 +599,18 @@ class TelegramAdapter(BaseMessagingAdapter):
             payload["text"] = safe_render_text(text, platform="telegram", limit=200)
         return self._call_api("answerCallbackQuery", payload)
 
-    def poll_once(self, *, scope_key: str = "default") -> list[Any]:
-        """Fetch one bounded polling batch and persist the next offset."""
+    def poll_once(self, *, scope_key: str = "default", background_dispatch=None) -> list[Any]:
+        """Fetch one bounded polling batch and persist the next offset.
+
+        ``background_dispatch`` (Hermes parity, gap E) is an optional
+        ``submit(fn) -> None`` sink. When provided, MESSAGE events are
+        handed to it as zero-argument callables and NOT awaited — a long
+        agent turn (LLM call) can no longer stall the polling loop or
+        its heartbeat while it runs. Callback queries stay inline: they
+        are fast, durable, and their answer toast must not be delayed
+        behind a queued turn. The durable event claim still serializes
+        duplicate deliveries, so at-least-once offsets remain safe.
+        """
         cursor = _cursor_get(self._cursor_store, "telegram", scope_key)
         payload: dict[str, Any] = {
             "timeout": self._poll_timeout_seconds,
@@ -534,6 +647,12 @@ class TelegramAdapter(BaseMessagingAdapter):
                 logger.warning("Telegram polling skipped malformed update: %s", type(exc).__name__)
                 continue
             if event is not None:
+                if background_dispatch is not None and event.event_kind != "callback_query":
+                    self._submit_background(
+                        background_dispatch, event, numeric_update_id
+                    )
+                    results.append({"dispatched": "background", "update_id": numeric_update_id})
+                    continue
                 try:
                     result = self._dispatch(event)
                 except Exception:
@@ -562,6 +681,44 @@ class TelegramAdapter(BaseMessagingAdapter):
         if max_update_id is not None:
             _cursor_set(self._cursor_store, "telegram", scope_key, str(max_update_id + 1))
         return results
+
+    def _submit_background(self, background_dispatch: Any, event: Any, update_id: int) -> None:
+        """Hand one message event to the background dispatch sink.
+
+        The submitted callable owns the FULL dispatch contract of the
+        inline path: durable claim, processing, and crash-honest
+        callback feedback. A rejected submission (saturated queue) is
+        logged and DROPPED — the durable offset has already advanced, and
+        the event's claim stays unclaimed for recovery replay, so nothing
+        is silently lost.
+        """
+
+        def _run() -> None:
+            try:
+                self._dispatch(event)
+            except Exception as exc:  # noqa: BLE001 - a turn crash must not kill the worker
+                logger.warning(
+                    "background dispatch of update %s failed: %s",
+                    update_id,
+                    type(exc).__name__,
+                )
+
+        # Per-chat serialization contract (gap E): the dispatch sink keys
+        # its lanes by this attribute, preserving per-chat order while
+        # different chats proceed in parallel.
+        try:
+            _run.chat_id = event.chat_id  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            background_dispatch(_run)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "background dispatch rejected update %s: %s: %s",
+                update_id,
+                type(exc).__name__,
+                str(exc)[:200],
+            )
 
     def poll_forever(
         self,

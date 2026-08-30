@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 from zero.app.services import Services
 from zero.config import Settings
@@ -198,6 +199,10 @@ class BackgroundWorkerHost:
         interval = max(0.1, float(self._settings.polling_interval_seconds))
         cursor_store = _InMemoryCursorStore()
         poll_lock = TokenPollLock()
+        # Hermes parity (gap E): message events dispatch OFF the polling
+        # loop, serialized per chat, so one slow agent turn cannot stall
+        # other chats, the heartbeat, or the stall watchdog.
+        dispatcher = _ChatSerialDispatcher()
         backoff_until: dict[str, float] = {}
         backoff_step: dict[str, int] = {}
         conflict_reported: set[str] = set()
@@ -291,9 +296,18 @@ class BackgroundWorkerHost:
                             chat_token=token,
                             cursor_store=cursor_store,
                         )
-                        updates = await asyncio.to_thread(
-                            adapter.poll_once, scope_key=binding.id.value
-                        )
+                        poll_kwargs: dict[str, Any] = {"scope_key": binding.id.value}
+                        try:
+                            import inspect as _inspect
+
+                            if (
+                                "background_dispatch"
+                                in _inspect.signature(adapter.poll_once).parameters
+                            ):
+                                poll_kwargs["background_dispatch"] = dispatcher
+                        except (TypeError, ValueError):  # noqa: BLE001
+                            pass
+                        updates = await asyncio.to_thread(adapter.poll_once, **poll_kwargs)
                         polled_any = polled_any or bool(updates)
                         self.status.polling_iterations += 1
                         # A successful poll IS a successful round trip:
@@ -423,6 +437,14 @@ class BackgroundWorkerHost:
         for project in services.identity.list_projects():
             try:
                 owner = project.owner_user_id
+                # Hermes live-report parity (gap C): task executions
+                # stream live progress into every enabled Telegram
+                # binding of the project (lazy: quiet ticks send
+                # nothing). Any sink failure degrades to silent — the
+                # durable scheduler outcome never depends on it.
+                stream_cb, task_event_cb = self._build_live_progress_callbacks(
+                    project_id=project.id, actor_id=owner
+                )
                 services.scheduler.run_once(
                     project_id=project.id,
                     actor_id=owner,
@@ -432,9 +454,89 @@ class BackgroundWorkerHost:
                     combined_test_command=(combined_command[0] if combined_command else None),
                     combined_test_args=tuple(combined_command[1:]),
                     combined_test_timeout_seconds=self._settings.combined_test_timeout_seconds,
+                    stream_callback=stream_cb,
+                    task_event_callback=task_event_cb,
                 )
             except Exception as exc:  # noqa: BLE001 - per-project isolation
                 self._record_error(f"scheduler:{project.id.value}: {type(exc).__name__}")
+
+    def _build_live_progress_callbacks(self, *, project_id, actor_id):
+        """Build (stream_callback, task_event_callback) fanning out to
+        every enabled Telegram binding of the project.
+
+        Returns ``(None, None)`` when no Telegram binding is enabled —
+        the common case for web-only projects — so the hot path stays
+        allocation-free. All adapter construction is lazy (first event),
+        and every delivery failure is swallowed: progress is
+        presentation, never authority.
+        """
+        try:
+            transports = self._services.interface_transports
+            if transports is None:
+                return None, None
+            bindings = self._services.result_delivery.list_enabled_bindings(project_id)
+            targets = [b for b in bindings if b.platform == "telegram"]
+            if not targets:
+                return None, None
+            from zero.app.telegram_live import TelegramExecutionProgress
+
+            progress: dict[str, list[Any]] = {}
+
+            def _progress_for(execution_id: str) -> list[Any]:
+                views = progress.get(execution_id)
+                if views is not None:
+                    return views
+                views = []
+                for binding in targets:
+                    try:
+                        adapter = transports.build_telegram_adapter(
+                            project_id=project_id,
+                            binding_id=binding.id,
+                            actor_id=actor_id,
+                        )
+                        views.append(
+                            TelegramExecutionProgress(
+                                adapter=adapter,
+                                chat_id=str(binding.chat_id),
+                                topic_id=(
+                                    str(binding.topic_id)
+                                    if getattr(binding, "topic_id", None)
+                                    else None
+                                ),
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001 - per-binding isolation
+                        logger.debug(
+                            "live progress adapter for %s unavailable: %s",
+                            binding.id.value,
+                            type(exc).__name__,
+                        )
+                progress[execution_id] = views
+                return views
+
+            def stream_callback(execution_id_value: str, payload: dict) -> None:
+                for view in _progress_for(execution_id_value):
+                    view.on_stream_event(payload)
+
+            def task_event_callback(payload: dict) -> None:
+                execution_id_value = str(payload.get("execution_id") or "")
+                kind = payload.get("type")
+                for view in _progress_for(execution_id_value):
+                    if kind == "task_started":
+                        view.on_task_started(
+                            str(payload.get("task_id") or ""),
+                            str(payload.get("objective") or ""),
+                        )
+                    elif kind in ("task_completed", "task_failed"):
+                        view.on_task_finished(
+                            str(payload.get("task_id") or ""),
+                            "completed" if kind == "task_completed" else "failed",
+                            str(payload.get("detail") or ""),
+                        )
+
+            return stream_callback, task_event_callback
+        except Exception:  # noqa: BLE001 - progress must never break the tick
+            return None, None
 
     def _delivery_drain(self) -> None:
         services = self._services
@@ -515,6 +617,84 @@ class _InMemoryCursorStore:
             current = self._cursors.get((platform, scope_key))
             if current is None or int(value) > int(current):
                 self._cursors[(platform, scope_key)] = value
+
+
+class _ChatSerialDispatcher:
+    """Per-chat serialized background dispatch for polled messages.
+
+    Hermes parity (gap E): a conversational agent turn can run for
+    MINUTES; dispatching it inline in the polling worker stalled every
+    other chat, the heartbeat, and the stall watchdog behind one slow
+    LLM call. Message events are therefore handed to single-thread
+    executors keyed by chat id — per-chat ORDER is preserved, different
+    chats proceed in parallel, and the polling loop returns immediately.
+
+    Bounded by design: at most ``max_workers`` chat lanes exist at once
+    and each lane queues at most ``max_queue`` events. When the queue is
+    full the submission raises — the adapter logs and drops, the durable
+    claim stays open, and recovery replays the event.
+    """
+
+    def __init__(self, *, max_workers: int = 8, max_queue: int = 16) -> None:
+        import queue as _queue
+        import threading as _threading
+
+        if max_workers < 1 or max_queue < 1:
+            raise ValueError("max_workers and max_queue must be positive")
+        self._max_workers = max_workers
+        self._max_queue = max_queue
+        self._lanes: dict[str, tuple[_threading.Thread, "_queue.SimpleQueue"]] = {}
+        self._lock = _threading.Lock()
+
+    def _lane(self, chat_id: str):
+        import queue as _queue
+        import threading as _threading
+
+        with self._lock:
+            existing = self._lanes.get(chat_id)
+            if existing is not None:
+                thread, q = existing
+                if thread.is_alive():
+                    return thread, q
+                del self._lanes[chat_id]
+            if len(self._lanes) >= self._max_workers:
+                raise RuntimeError(
+                    f"all {self._max_workers} dispatch lanes are busy"
+                )
+            q: "_queue.SimpleQueue" = _queue.SimpleQueue()
+            thread = _threading.Thread(
+                target=self._drain_lane, args=(q,), daemon=True,
+                name=f"zero-telegram-dispatch-{chat_id}",
+            )
+            thread.start()
+            self._lanes[chat_id] = (thread, q)
+            return thread, q
+
+    @staticmethod
+    def _drain_lane(q) -> None:
+        while True:
+            job = q.get()
+            if job is None:
+                return
+            fn = job[0]
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 - lane must survive job crashes
+                logger.debug("dispatch lane job failed", exc_info=True)
+
+    def submit_for_chat(self, chat_id: str, fn) -> None:
+        """Queue ``fn`` on the chat's lane; raises when saturated."""
+        thread, q = self._lane(str(chat_id))
+        if q.qsize() >= self._max_queue:
+            raise RuntimeError(f"dispatch lane for chat {chat_id} is saturated")
+        q.put((fn,))
+
+    def submit(self, fn) -> None:
+        """Adapter contract: serialize by the event's chat id when the
+        callable carries one (``_run`` closes over the event), else run
+        on the anonymous pool lane."""
+        chat_id = getattr(fn, "chat_id", None) or "_pool"
+        self.submit_for_chat(chat_id, fn)
 
 
 def _build_binding_adapter(*, services, chat_token: str, cursor_store):

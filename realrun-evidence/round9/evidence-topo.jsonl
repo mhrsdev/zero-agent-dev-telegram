@@ -1,0 +1,30 @@
+{"phase": "M1 falcon-research agent type created (201, active)", "ok": true, "detail": "status=201 id=at_r4gw4yh30i2g9s5ozbtb7d1h state=active", "profile": "topo"}
+{"phase": "M1b type listed from durable topology", "ok": true, "detail": "types=['falcon-research']", "profile": "topo"}
+{"phase": "M2 three knowledge records accepted (201 each)", "ok": true, "detail": "ids=['kr_7q29152biv3gifir6ue47fe2', 'kr_jkusuuun91du0vatmsmx8ca6', 'kr_en1mkid0kdxobxta1amxjv1h']", "profile": "topo"}
+{"phase": "M2b knowledge listed back from the durable store", "ok": false, "detail": "count=1", "profile": "topo"}
+{"phase": "M3 memory-keeper type created with memory_delta_enabled=1", "ok": true, "detail": "id=at_94jqds3tz90fxsd6ue4wlxib policy={'memory_delta_enabled': '1'}", "profile": "topo"}
+{"phase": "T1 second project created (real teams surface)", "ok": true, "detail": "status=201 id=p_519kvqjbkm1wg97bu2plj9zs", "profile": "topo"}
+{"phase": "T2 agent-type scope isolated between projects", "ok": true, "detail": "hyper in B=True leaked to A=False", "profile": "topo"}
+{"phase": "T3 RAG document ingested into project B only", "ok": true, "detail": "status=201", "profile": "topo"}
+{"phase": "M1 falcon-research agent type created (201, active)", "ok": true, "detail": "reused durable id=at_r4gw4yh30i2g9s5ozbtb7d1h", "profile": "topo"}
+{"phase": "M1b type listed from durable topology", "ok": true, "detail": "types=['falcon-research', 'memory-keeper']", "profile": "topo"}
+{"phase": "M2 three knowledge records accepted (201 each)", "ok": true, "detail": "new=[] prior=3", "profile": "topo"}
+{"phase": "M2b knowledge listed back from the durable store", "ok": true, "detail": "status=200 count=3", "profile": "topo"}
+{"phase": "M3 memory-keeper type created with memory_delta_enabled=1", "ok": true, "detail": "reused durable id=at_94jqds3tz90fxsd6ue4wlxib policy={'memory_delta_enabled': '1'}", "profile": "topo"}
+{"phase": "T1 second project created (real teams surface)", "ok": true, "detail": "reused durable id=p_519kvqjbkm1wg97bu2plj9zs", "profile": "topo"}
+{"phase": "T2 agent-type scope isolated between projects", "ok": true, "detail": "hyper in B=True leaked to A=False", "profile": "topo"}
+{"phase": "T3 RAG document ingested into project B only", "ok": false, "detail": "status=500", "profile": "topo"}
+{"phase": "T3b RAG scope isolated (B doc invisible to A)", "ok": false, "detail": "leaked_to_A=False b_docs=1 a_list_status=200", "profile": "topo"}
+{"phase": "A1 stranger message denied at identity gate", "ok": false, "detail": "ignored_unlinked: external identity not linked or not verified", "profile": "topo"}
+{"phase": "P1 live polling heartbeat from the REAL bot", "ok": true, "detail": "heartbeat", "profile": "topo"}
+{"phase": "M1 falcon-research agent type created (201, active)", "ok": true, "detail": "reused durable id=at_r4gw4yh30i2g9s5ozbtb7d1h", "profile": "topo"}
+{"phase": "M1b type listed from durable topology", "ok": true, "detail": "types=['falcon-research', 'memory-keeper']", "profile": "topo"}
+{"phase": "M2 three knowledge records accepted (201 each)", "ok": true, "detail": "new=[] prior=3", "profile": "topo"}
+{"phase": "M2b knowledge listed back from the durable store", "ok": true, "detail": "status=200 count=3", "profile": "topo"}
+{"phase": "M3 memory-keeper type created with memory_delta_enabled=1", "ok": true, "detail": "reused durable id=at_94jqds3tz90fxsd6ue4wlxib policy={'memory_delta_enabled': '1'}", "profile": "topo"}
+{"phase": "T1 second project created (real teams surface)", "ok": true, "detail": "reused durable id=p_519kvqjbkm1wg97bu2plj9zs", "profile": "topo"}
+{"phase": "T2 agent-type scope isolated between projects", "ok": true, "detail": "hyper in B=True leaked to A=False", "profile": "topo"}
+{"phase": "T3 RAG document ingested into project B only", "ok": true, "detail": "reused durable HyperScale Zone-9 Brief", "profile": "topo"}
+{"phase": "T3b RAG scope isolated (B doc invisible to A)", "ok": true, "detail": "leaked_to_A=False b_docs=1 a_list_status=200", "profile": "topo"}
+{"phase": "A1 stranger message blocked at identity gate (denied/ignored_unlinked)", "ok": true, "detail": "ignored_unlinked: external identity not linked or not verified", "profile": "topo"}
+{"phase": "P1 live polling heartbeat from the REAL bot", "ok": true, "detail": "heartbeat", "profile": "topo"}

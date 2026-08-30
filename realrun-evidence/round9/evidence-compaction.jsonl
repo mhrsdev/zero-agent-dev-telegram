@@ -1,0 +1,13 @@
+{"phase": "C0 real service graph composed (build_services)", "ok": true, "detail": "compaction=CompactionService"}
+{"phase": "C1 compaction summarizer pinned to routing.primary_model (GAP-H fix)", "ok": true, "detail": "routing={'provider': 'openai-compatible', 'model': 'claude-opus-5'}"}
+{"phase": "C2 memory-keeper agent type present", "ok": true, "detail": "id=at_94jqds3tz90fxsd6ue4wlxib"}
+{"phase": "C2b compaction target execution resolved", "ok": true, "detail": "exec=exec_gt251z7j7kwdnif75s6o43gp"}
+{"phase": "C3 real transcript assembled", "ok": true, "detail": "turns=32 chat_turns=20 exec_transcripts=4 chars=14337"}
+{"phase": "C4 should_compact before (no active context version yet)", "ok": true, "detail": "should_compact=False"}
+{"phase": "C5 compaction completed and activated", "ok": true, "detail": "state=activated fit_rung=history_turn_selected"}
+{"phase": "C6 transcript artifact durably stored", "ok": true, "detail": "transcript_artifact=art_sc4l5cw8b7bdhd1v23smum4h"}
+{"phase": "C7 summary is LLM-generated (real claude-opus-5) and covers all sections", "ok": true, "detail": "llm_summary=True sections=True head=## Current goal |  | Run a delegation drill and produce a single-paragraph report that (a) sta"}
+{"phase": "C8 memory deltas extracted into knowledge records (GAP 9)", "ok": true, "detail": "records=9 kinds=['decision', 'failure'] first=Retain the codename `BLUE HERON` across all Falcon launch briefs."}
+{"phase": "C9 memory_delta artifact linked on the compaction record", "ok": true, "detail": "memory_delta_artifact=art_8qgi9bwg9t99lih21frdxd53"}
+{"phase": "C10 new context version active (atomic activation)", "ok": true, "detail": "version=6 tokens=1322 active=1"}
+{"phase": "C11 should_compact after activation reflects reclaimed space", "ok": true, "detail": "should_compact=False tokens=1322 window=6000"}

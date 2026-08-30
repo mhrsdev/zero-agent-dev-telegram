@@ -131,6 +131,18 @@ class CompactionService:
         # Optional GAP 9 collaborator: writes accepted memory deltas
         # from LLM summaries into durable knowledge records.
         self._agent_type_service = agent_type_service
+        # GAP H (round-9 live fix): routing override for the LLM
+        # summarizer, aligned by config_sync with
+        # ``routing.primary_model``. The planner, the chat bridge, and
+        # the scheduler tick were aligned in earlier rounds, but the
+        # compaction summarizer still resolved its model from
+        # ``settings.openai_model`` (the gpt-4o-mini default) — on a
+        # gateway that no longer serves that default every summarizer
+        # call failed, compaction silently degraded to the
+        # deterministic template, and LLM-gated memory deltas (GAP 9)
+        # could never be extracted. ``None`` keeps the historical
+        # settings-derived behavior (composition-time default).
+        self._summarizer_routing: dict | None = None
 
     @property
     def summarizer(self):
@@ -140,6 +152,28 @@ class CompactionService:
     @summarizer.setter
     def summarizer(self, value) -> None:
         self._summarizer = value
+
+    @property
+    def summarizer_routing(self) -> dict | None:
+        """Optional ``{"provider", "model"}`` override for the summarizer.
+
+        Set by config sync so the compaction summarizer calls exactly
+        the provider/model the operator routed (same truth as the
+        planner, the chat bridge, and the scheduler tick).
+        """
+        return self._summarizer_routing
+
+    @summarizer_routing.setter
+    def summarizer_routing(self, value: dict | None) -> None:
+        if value is not None:
+            if not isinstance(value, dict):
+                raise TypeError("summarizer_routing must be a dict or None")
+            unknown = set(value) - {"provider", "model"}
+            if unknown:
+                raise ValueError(f"unknown summarizer_routing keys: {sorted(unknown)}")
+            if not str(value.get("model") or "").strip():
+                raise ValueError("summarizer_routing requires a non-empty 'model'")
+        self._summarizer_routing = value
 
     def should_compact(
         self,

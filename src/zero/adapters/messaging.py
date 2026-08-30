@@ -73,6 +73,34 @@ def _cause_summary(exc: BaseException, *, limit: int = 200) -> str:
     return f"{type(exc).__name__}: {redact_bot_token(text)[:limit]}"
 
 
+def _error_body_snippet(response: Any, *, limit: int = 200) -> str:
+    """Bounded token-redacted body snippet for a non-2xx response.
+
+    Live-streaming edits must REACT to the Bot API's actual rejection
+    reason ("Bad Request: message is not modified", "Too Many Requests:
+    retry after 17"), but the historical transport error carried ONLY the
+    numeric status — the description in the JSON body was discarded, so
+    callers could not distinguish a harmless redundant edit from a real
+    failure. The snippet is squeezed to one line and the bot token is
+    redacted before the message leaves this module; unreadable bodies
+    contribute nothing.
+    """
+    body: Any = None
+    try:
+        raw = getattr(response, "content", None)
+        if raw:
+            body = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+    except Exception:  # noqa: BLE001 - snippet is best-effort only
+        return ""
+    if not isinstance(body, Mapping):
+        return ""
+    description = str(body.get("description") or "").strip()
+    if not description:
+        return ""
+    squeezed = " ".join(description.split())
+    return f" — {redact_bot_token(squeezed)[:limit]}"
+
+
 class HttpResponse(Protocol):
     status_code: int
 
@@ -194,13 +222,17 @@ class BaseMessagingAdapter:
                 if status_code in retryable_statuses or status_code >= 500:
                     last_error = TransportError(
                         f"provider returned retryable HTTP status {status_code}"
+                        + _error_body_snippet(response)
                     )
                     if attempt + 1 < self._retry_policy.attempts:
                         self._sleeper(self._retry_policy.backoff_seconds * (2**attempt))
                         continue
                     raise last_error
                 if status_code < 200 or status_code >= 300:
-                    raise PermanentTransportError(f"provider returned HTTP status {status_code}")
+                    raise PermanentTransportError(
+                        f"provider returned HTTP status {status_code}"
+                        + _error_body_snippet(response)
+                    )
                 return response
             except (TimeoutError, ConnectionError, OSError, RequestError) as exc:
                 last_error = exc

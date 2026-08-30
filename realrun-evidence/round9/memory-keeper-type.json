@@ -1,0 +1,18 @@
+{
+  "id": "at_94jqds3tz90fxsd6ue4wlxib",
+  "project_id": "p_h7gercewcvbkol3w77f4cfuu",
+  "name": "memory-keeper",
+  "responsibility": "Maintain durable execution memory and compaction deltas.",
+  "memory_scope": "project",
+  "permitted_tools": [],
+  "model_policy": {
+    "memory_delta_enabled": "1"
+  },
+  "context_budget_tokens": 64000,
+  "max_concurrent_instances": 1,
+  "state": "active",
+  "version": 1,
+  "superseded_by": null,
+  "created_at": "2026-08-30T13:11:04.317Z",
+  "updated_at": "2026-08-30T13:11:04.317Z"
+}

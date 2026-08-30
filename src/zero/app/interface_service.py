@@ -892,10 +892,20 @@ class InterfaceAdapterService:
                     )
             except PlannerOutputError:
                 # A malformed model response is a planner failure, not a
-                # reason to lose the durable human conversation event.
+                # reason to lose the durable human conversation event —
+                # and NOT a reason to go SILENT (live-run 2026-08-30: a
+                # planner rejection used to leave the sender with no
+                # reply at all). Degrade to the conversational bridge so
+                # the human always gets an answer.
                 detail += "; planner output rejected"
+                detail += self._try_conversational_fallback(
+                    binding=binding, event=event, user_id=user_id
+                )
             except (PlanError, ProviderError, sqlite3.Error) as exc:
                 detail += f"; planner unavailable ({type(exc).__name__})"
+                detail += self._try_conversational_fallback(
+                    binding=binding, event=event, user_id=user_id
+                )
 
         entry = InterfaceEventLogEntry(
             id=InterfaceEventId(generate_interface_event_id()),
@@ -926,11 +936,15 @@ class InterfaceAdapterService:
         "/help": (
             "Zero commands:\n"
             "\u2022 /start \u2014 check that the bot is alive and linked\n"
-            "\u2022 /help \u2014 this help\n\n"
+            "\u2022 /help \u2014 this help\n"
+            "\u2022 /status \u2014 engine status, worker loops, pending work\n"
+            "\u2022 /tasks \u2014 recent executions and task states\n"
+            "\u2022 /model \u2014 the provider/model currently routed\n"
+            "\u2022 /approvals \u2014 pending tool approvals\n\n"
             "Anything else you send is treated as engineering work: I draft "
             "an actionable plan, you review it, and approve/reject it via "
-            "the inline buttons. Casual chat and questions are acknowledged "
-            "but never executed."
+            "the inline buttons. Casual chat and questions are answered "
+            "live (streamed into the chat) but never executed."
         ),
     }
 
@@ -957,7 +971,23 @@ class InterfaceAdapterService:
             return
         first_token = (event.content or "").strip().split(" ", 1)[0]
         first_token = first_token.split("@", 1)[0].lower()
-        reply = self._COMMAND_REPLIES.get(first_token)
+        # Dynamic command surface (gaps F+G): /status /tasks /model
+        # /approvals build their replies from durable state via the
+        # command book; failures degrade to an honest error line inside
+        # the book itself.
+        command_book = getattr(self, "command_book", None)
+        reply = None
+        if command_book is not None:
+            dynamic = command_book.reply_for(
+                first_token,
+                project_id=binding.project_id,
+                actor_id=user_id,
+                source=binding.platform,
+            )
+            if dynamic is not None:
+                reply = dynamic
+        if reply is None:
+            reply = self._COMMAND_REPLIES.get(first_token)
         if reply is None:
             return
         try:
@@ -971,6 +1001,14 @@ class InterfaceAdapterService:
                 # the message itself.
                 chat_id=str(event.chat_id),
                 topic_id=str(event.topic_id) if event.topic_id else None,
+            )
+            # Operational + e2e evidence: the reply REACHED the real Bot
+            # API (send_message returns only on an accepted request), so
+            # the log carries what was sent, not just that intake ran.
+            logger.info(
+                "command reply sent: %s -> %s",
+                first_token,
+                " ".join(reply.split())[:180],
             )
         except Exception as exc:  # noqa: BLE001 - replies must never fail intake
             logger.info(

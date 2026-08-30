@@ -212,6 +212,11 @@ class ProviderService:
         # route anywhere. ``_fallback_models`` extends the chain with
         # same-provider alternative models before other providers.
         self._fallback_models: tuple[str, ...] = ()
+        # (provider, model) -> bool: does the gateway honor the ``tools``
+        # parameter natively? Probed lazily once per pair (see
+        # ``tool_call_support``); the probe exists because some gateways
+        # ACCEPT the tools parameter and then silently drop it.
+        self._tool_call_support: dict[tuple[str, str], bool] = {}
         self._register_default_adapters(include_fake=include_fake)
 
     def _register_default_adapters(self, *, include_fake: bool) -> None:
@@ -229,6 +234,101 @@ class ProviderService:
     def registered_provider_names(self) -> tuple[str, ...]:
         """Names of adapters that can serve live model requests."""
         return tuple(sorted(self._adapters))
+
+    def tool_call_support(self, provider: str, model_name: str) -> bool:
+        """Does this (provider, model) honor the native ``tools`` parameter?
+
+        Some gateways accept the OpenAI ``tools`` parameter and then
+        silently drop it: every response comes back with
+        ``tool_calls: []`` while the model hallucinates tool-like text.
+        One tiny probe request per (provider, model) per process decides
+        the truth — a declaration-only tool the model cannot resist
+        calling ("echo_check") separates the two behaviors deterministically:
+
+        - a native ``tool_call`` in the response → native works;
+        - text-only response → the gateway strips tools → callers fall
+          back to the text tool protocol.
+
+        Probe failures (gateway unreachable, unknown model) default to
+        ``True`` (native): the fallback protocol must never mask a real
+        outage, and the native path is the historical behavior.
+        """
+        key = (provider, model_name)
+        cached = self._tool_call_support.get(key)
+        if cached is not None:
+            return cached
+        # NOTE: a persisted ``native_tools`` capability is NOT trusted as
+        # proof — it is resolved from model metadata, and the whole point
+        # of this probe is that some gateways advertise what they then
+        # silently strip. The probe runs once per (provider, model) per
+        # process; when it observes stripping, the capability is removed
+        # from the model row so every other surface adapts.
+        supported = True
+        try:
+            from zero.domain.providers import (
+                CanonicalMessage,
+                CanonicalRequest,
+                ToolDeclaration,
+            )
+
+            probe = CanonicalRequest(
+                provider=provider,
+                model_name=model_name,
+                messages=(
+                    CanonicalMessage(
+                        role="user",
+                        content=(
+                            "Call the echo_check tool exactly now, with empty "
+                            "arguments. Do not answer in words."
+                        ),
+                    ),
+                ),
+                tools=(
+                    ToolDeclaration(
+                        name="echo_check",
+                        description=(
+                            "Mandatory handshake tool. The very next action "
+                            "must be a call to this tool with empty arguments."
+                        ),
+                        parameters={"type": "object", "properties": {}},
+                    ),
+                ),
+                max_tokens=64,
+                stream=False,
+            )
+            _request, response = self._adapters[provider].send_request(probe)
+            supported = bool(response.tool_calls)
+            if not supported:
+                logger.warning(
+                    "tool-call probe: gateway %s:%s strips native tools — "
+                    "text-protocol tool calling enabled",
+                    provider,
+                    model_name,
+                )
+        except Exception:
+            supported = True
+        if not supported:
+            # Record the observed truth on the model row: every other
+            # surface (decomposition ladder, planner, forced tool-choice)
+            # keys off the ``native_tools`` capability and will degrade
+            # to the text contract without another probe round trip.
+            try:
+                model = self.get_model(provider, model_name)
+                kept = tuple(
+                    capability
+                    for capability in model.capabilities
+                    if capability != "native_tools"
+                )
+                if len(kept) != len(model.capabilities):
+                    self._repo.set_provider_model_capabilities(model, kept)
+            except Exception:  # noqa: BLE001 - capability bookkeeping is best-effort
+                pass
+        self._tool_call_support[key] = supported
+        return supported
+
+    def set_tool_call_support(self, provider: str, model_name: str, supported: bool) -> None:
+        """Override the cached probe result (tests / operator knowledge)."""
+        self._tool_call_support[(provider, model_name)] = bool(supported)
 
     def set_fallback_chain(self, chain: tuple[str, ...]) -> None:
         """Configure the ordered provider fallback chain.
