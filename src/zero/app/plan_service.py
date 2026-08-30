@@ -25,8 +25,8 @@ logical operation.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 
+from zero.app.clock import now_utc_iso
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.audit import AuditEvent, AuditEventId, AuditSource, redact_sensitive_text
 from zero.domain.identity import ProjectId, UserId
@@ -61,10 +61,6 @@ from zero.domain.plans import (
 )
 from zero.persistence.repositories.audit_repository import AuditRepository
 from zero.persistence.repositories.plan_repository import PlanRepository
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 class PlanService:
@@ -145,7 +141,7 @@ class PlanService:
             external_event_id=external_event_id,
             origin_kind=origin_kind,
             content=redact_sensitive_text(content.strip()),
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         # The repository's UNIQUE(source, external_event_id) constraint
         # makes duplicate delivery idempotent. We let the
@@ -219,8 +215,8 @@ class PlanService:
             project_id=project_id,
             current_state="draft",
             current_revision_number=0,
-            created_at=_now_utc_iso(),
-            updated_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
+            updated_at=now_utc_iso(),
         )
         with self._plan_repo._database.transaction():
             self._plan_repo.insert_plan(plan, commit=False)
@@ -235,7 +231,7 @@ class PlanService:
                     target_id=plan.id.value,
                     result="success",
                     redacted_summary=f"Created plan {plan.id.value}",
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -301,7 +297,7 @@ class PlanService:
             content=content,
             proposed_by=actor_id,
             state="proposed",
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         # Insert revision and update plan state atomically.
         with self._plan_repo._database.transaction():
@@ -323,7 +319,7 @@ class PlanService:
                         f"Proposed revision {new_revision_number} for plan {plan.id.value}"
                     ),
                     correlation_id=plan.id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -445,7 +441,7 @@ class PlanService:
             result="approved",
             idempotency_key=idempotency_key,
             redacted_reason=redacted_reason,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         handoff = PlanHandoff(
             id=PlanHandoffId(generate_plan_handoff_id()),
@@ -454,7 +450,7 @@ class PlanService:
             project_id=plan.project_id,
             approved_by=actor_id,
             execution_id=None,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         with self._plan_repo._database.transaction():
             # Re-read under BEGIN IMMEDIATE. The pre-check above is only an
@@ -483,7 +479,7 @@ class PlanService:
                         f"Approved revision {revision.revision_number} of plan {plan.id.value}"
                     ),
                     correlation_id=plan.id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -546,7 +542,7 @@ class PlanService:
             result="rejected",
             idempotency_key=idempotency_key,
             redacted_reason=redacted_reason,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         with self._plan_repo._database.transaction():
             self._plan_repo.insert_approval(approval, commit=False)
@@ -566,7 +562,7 @@ class PlanService:
                         f"Rejected revision {revision.revision_number} of plan {plan.id.value}"
                     ),
                     correlation_id=plan.id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )

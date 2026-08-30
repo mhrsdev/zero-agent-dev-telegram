@@ -15,8 +15,6 @@ already-redacted text the caller provides.
 
 from __future__ import annotations
 
-from typing import Any
-
 from zero.persistence.connection import Database
 
 

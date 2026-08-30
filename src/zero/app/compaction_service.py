@@ -42,9 +42,9 @@ Per PLAN.md M9 invariants:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
 from typing import Any
 
+from zero.app.clock import now_utc_iso
 from zero.app.artifact_service import ArtifactService
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.artifacts import CompactionThrashError
@@ -65,10 +65,6 @@ from zero.domain.ids import (
 from zero.persistence.repositories.context_repository import (
     ContextRepository,
 )
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 #: The no-thrash threshold: if this many consecutive compactions do not
@@ -271,7 +267,7 @@ class CompactionService:
                             fit_rung="no_thrash_blocked",
                             state="no_thrash_blocked",
                             no_thrash_count=no_thrash_count,
-                            created_at=_now_utc_iso(),
+                            created_at=now_utc_iso(),
                         )
                         self._context_repo.insert_compaction_record(record)
                         raise CompactionThrashError(
@@ -364,7 +360,7 @@ class CompactionService:
             fit_rung=fit_rung,
             state="pre_flush",
             no_thrash_count=no_thrash_count,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._context_repo.insert_compaction_record(record)
         # 8. Create the new context version (not yet active).
@@ -393,7 +389,7 @@ class CompactionService:
             + _tokens(execution_snapshot)
             + _tokens(summary)
             + _tokens(json.dumps(fitted_messages[-3:], ensure_ascii=False)),
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._context_repo.insert_context_version(new_cv)
         # 9. Update compaction record state.

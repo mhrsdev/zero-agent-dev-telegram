@@ -23,6 +23,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -67,6 +68,26 @@ class _TransactionConnection:
         return None
 
 
+def _close_connections(connections: set[sqlite3.Connection]) -> None:
+    """Close and forget every connection in ``connections``.
+
+    Registered as a :func:`weakref.finalize` callback so an abandoned
+    :class:`Database` still releases its handles. The callback holds the
+    only other strong reference to the set, which keeps the connections
+    alive until it runs — relying on ``__del__`` instead is not enough,
+    because a ``Database`` and its connections are usually collected in
+    the same cyclic-GC batch and the connection's own finalizer may run
+    first, emitting ``ResourceWarning: unclosed database`` (an error
+    under this repo's warnings-as-errors policy).
+    """
+    for conn in tuple(connections):
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+    connections.clear()
+
+
 class Database:
     """Thin wrapper around a SQLite connection.
 
@@ -76,6 +97,7 @@ class Database:
 
     - give us one place to enable ``PRAGMA foreign_keys = ON``;
     - cache in-memory databases per-process so tests work;
+    - own the lifecycle of every connection it hands out;
     - give us one place to add tracing/metrics later (Milestone 14).
     """
 
@@ -90,6 +112,7 @@ class Database:
         self._connections: set[sqlite3.Connection] = set()
         self._lock = threading.RLock()
         self._local = threading.local()
+        self._finalizer = weakref.finalize(self, _close_connections, self._connections)
 
     @property
     def is_in_memory(self) -> bool:
@@ -273,15 +296,22 @@ class Database:
     def close(self) -> None:
         """Close all lifecycle-managed connections owned by this database."""
         with self._lock:
-            for conn in tuple(self._connections):
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
-            self._connections.clear()
+            _close_connections(self._connections)
             self._memory_conn = None
             if hasattr(self._local, "file_conn"):
                 self._local.file_conn = None
+
+    def __del__(self) -> None:
+        """Release connections deterministically when the wrapper dies.
+
+        The ``weakref.finalize`` registered in ``__init__`` is the
+        guaranteed path; this keeps the thread-local bookkeeping tidy
+        when the object is dropped normally.
+        """
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 - interpreter teardown must not raise
+            pass
 
     # ------------------------------------------------------------------
     # Health probe

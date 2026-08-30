@@ -35,8 +35,13 @@ BIN = VENV / "bin"
 REALRUN = Path("/home/z/my-project/scripts/realrun")
 STATE = REALRUN / "state.json"
 
-BOT_TOKEN = "8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8"
-API_KEY = "sk-BlwjB2GhsGBwFLjQBBAhKK7FpmfJYP9usqGfrImaLaA1JOKW"
+BOT_TOKEN = os.environ.get("REALRUN_BOT_TOKEN", "")
+API_KEY = os.environ.get("REALRUN_API_KEY", "")
+if not BOT_TOKEN or not API_KEY:
+    raise RuntimeError(
+        "set REALRUN_BOT_TOKEN and REALRUN_API_KEY "
+        "(real credentials are no longer embedded in this module)"
+    )
 BASE_URL = "https://api.justwoker.icu/v1"
 MODEL = "claude-opus-5"
 GROUP_ID = "-1004406039396"

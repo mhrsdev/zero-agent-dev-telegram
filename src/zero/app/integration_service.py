@@ -34,9 +34,9 @@ import signal
 import subprocess
 import tempfile
 import threading
-from datetime import UTC, datetime
 from pathlib import Path
 
+from zero.app.clock import now_utc_iso
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.audit import (
     AuditEvent,
@@ -79,8 +79,6 @@ from zero.persistence.repositories.worktree_repository import (
 logger = logging.getLogger(__name__)
 
 
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 _MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024
@@ -507,8 +505,8 @@ class IntegrationService:
                 f"{len(impact_set)} impacted files; "
                 f"{len(conflicts)} conflicts"
             ),
-            created_at=_now_utc_iso(),
-            updated_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
+            updated_at=now_utc_iso(),
         )
         self._repo.insert_review(review)
         self._audit_repo.insert(
@@ -523,7 +521,7 @@ class IntegrationService:
                 result="success",
                 redacted_summary=review.redacted_summary or "",
                 correlation_id=execution_id.value,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return review
@@ -748,7 +746,7 @@ class IntegrationService:
                     content_hash=hashlib.sha256(
                         (stdout + "\0" + stderr).encode("utf-8", errors="replace")
                     ).hexdigest(),
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 )
                 self._repo.insert_review_evidence(evidence)
                 if target_path is not None:
@@ -925,8 +923,8 @@ class IntegrationService:
             checks_passed=review.combined_test_result == "pass",
             risks=risks,
             state="proposed",
-            created_at=_now_utc_iso(),
-            updated_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
+            updated_at=now_utc_iso(),
         )
         self._repo.insert_proposal(proposal)
         self._audit_repo.insert(
@@ -941,7 +939,7 @@ class IntegrationService:
                 result="success",
                 redacted_summary=(f"Proposed merge of {len(source_tasks)} tasks"),
                 correlation_id=execution_id.value,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return proposal
@@ -983,7 +981,7 @@ class IntegrationService:
                 result="success",
                 redacted_summary=f"Approved merge {proposal_id.value}",
                 correlation_id=proposal.execution_id.value,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return self._repo.get_proposal(project_id, proposal_id)
@@ -1021,7 +1019,7 @@ class IntegrationService:
                 result="success",
                 redacted_summary=f"Rejected merge {proposal_id.value}",
                 correlation_id=proposal.execution_id.value,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return self._repo.get_proposal(project_id, proposal_id)
@@ -1275,7 +1273,7 @@ class IntegrationService:
                 rollback_revision=target_sha,
                 evidence_ids=tuple(evidence_ids),
             )
-            self._repo.update_proposal_state(proposal_id, "merged", merged_at=_now_utc_iso())
+            self._repo.update_proposal_state(proposal_id, "merged", merged_at=now_utc_iso())
             self._audit_repo.insert(
                 AuditEvent(
                     id=AuditEventId(generate_audit_event_id()),
@@ -1290,7 +1288,7 @@ class IntegrationService:
                         f"Executed verified merge {proposal_id.value} at {integration_sha}"
                     ),
                     correlation_id=proposal.execution_id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 )
             )
             return self._repo.get_proposal(project_id, proposal_id)
@@ -1364,7 +1362,7 @@ class IntegrationService:
                 self._repo.update_proposal_state(
                     MergeProposalId(proposal_id_value),
                     "merged",
-                    merged_at=_now_utc_iso(),
+                    merged_at=now_utc_iso(),
                 )
                 result = "success"
                 summary = (
@@ -1391,7 +1389,7 @@ class IntegrationService:
                     result=result,
                     redacted_summary=summary,
                     correlation_id=None,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 )
             )
         return recovered

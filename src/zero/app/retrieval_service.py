@@ -34,6 +34,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from zero.app.clock import now_utc_iso
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.agent_types import AgentTypeId, AgentTypeNotFoundError
 from zero.domain.context import (
@@ -54,10 +55,6 @@ from zero.persistence.repositories.artifact_repository import (
 from zero.persistence.repositories.context_repository import (
     ContextRepository,
 )
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _knowledge_relevance(query: str, content: str) -> float:
@@ -216,7 +213,7 @@ class RetrievalRouter:
             total_candidates=len(deduped),
             total_tokens=used_tokens,
             budget_tokens=budget_tokens,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._context_repo.insert_injection_ledger(ledger)
         return selected, ledger
@@ -381,7 +378,6 @@ class ContextBuilder:
         token_count: int,
     ) -> None:
         import logging
-        from datetime import UTC, datetime
 
         from zero.domain.context import ContextVersion, ContextVersionId
         from zero.domain.execution import ExecutionId

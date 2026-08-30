@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+from tests.conftest import requires_loopback_http
 from zero.config import Settings
 from zero.persistence.connection import Database
 from zero.persistence.migrations import apply_migrations
@@ -165,6 +166,7 @@ class TestDoctorBrokenStates:
             else:
                 os.environ["ZERO_HOME"] = old
 
+    @requires_loopback_http
     def test_healthy_install_has_no_failures(self, tmp_path, monkeypatch):
         """Post-setup state: real stored token ref + reachable Bot API.
 

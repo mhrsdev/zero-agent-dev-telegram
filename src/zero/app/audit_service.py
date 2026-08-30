@@ -15,8 +15,8 @@ operation it describes.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 
+from zero.app.clock import now_utc_iso
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.audit import (
     AuditEvent,
@@ -26,10 +26,6 @@ from zero.domain.audit import (
 from zero.domain.identity import ProjectId, UserId
 from zero.domain.ids import generate_audit_event_id
 from zero.persistence.repositories.audit_repository import AuditRepository
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 class AuditService:
@@ -80,7 +76,7 @@ class AuditService:
             result=result,  # type: ignore[arg-type]
             correlation_id=correlation_id,
             redacted_summary=redacted_summary,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._audit_repo.insert(event)
         return event

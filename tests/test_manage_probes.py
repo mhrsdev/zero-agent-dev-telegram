@@ -11,6 +11,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from tests.conftest import requires_loopback_http
 from zero.manage.core.probes import telegram_recent_chats
 
 
@@ -29,6 +30,7 @@ class _TelegramStubHandler(BaseHTTPRequestHandler):
         pass  # keep test output quiet
 
 
+@requires_loopback_http
 def test_recent_chats_uses_configured_telegram_api_base(monkeypatch) -> None:
     """Group discovery must honor ZERO_TELEGRAM_API_BASE (gateways/tests)."""
     server = HTTPServer(("127.0.0.1", 0), _TelegramStubHandler)

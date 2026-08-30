@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 
 from zero.app.decomposition_analytics import (
     OUTCOME_NATIVE_FIRST_ASK,
@@ -192,8 +193,11 @@ class TestAnalyticsAggregates:
         assert lines[1]["repairs"][0]["similarity"] == 0.55
 
     def test_resolve_sink_path_from_env(self, monkeypatch):
+        # Compare Path objects, not their string form: ``str(Path(...))``
+        # renders the platform separator, so asserting the POSIX spelling
+        # failed on Windows for a resolver that was behaving correctly.
         monkeypatch.setenv("ZERO_DECOMPOSITION_ANALYTICS_PATH", "/tmp/x/ledger.jsonl")
-        assert str(resolve_sink_path()) == "/tmp/x/ledger.jsonl"
+        assert resolve_sink_path() == Path("/tmp/x/ledger.jsonl")
         monkeypatch.setenv("ZERO_DECOMPOSITION_ANALYTICS_PATH", "   ")
         assert resolve_sink_path() is None
 

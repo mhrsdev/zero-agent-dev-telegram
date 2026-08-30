@@ -18,8 +18,8 @@ decision here is authoritative.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 
+from zero.app.clock import now_utc_iso
 from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
 from zero.domain.authorization import (
     AuthorizationDecision,
@@ -37,10 +37,6 @@ from zero.persistence.repositories.audit_repository import AuditRepository
 from zero.persistence.repositories.identity_repository import (
     IdentityRepository,
 )
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 class AuthorizationService:
@@ -180,6 +176,6 @@ class AuthorizationService:
                     f"Denied {decision.permission} for "
                     f"actor={decision.actor_id} reason={decision.reason}"
                 ),
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )

@@ -30,10 +30,11 @@ import sqlite3
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import replace
-from datetime import UTC, datetime
 from decimal import Decimal
 from threading import Event
 from typing import Any
+
+from zero.app.clock import now_utc_iso
 
 logger = logging.getLogger(__name__)
 
@@ -99,10 +100,6 @@ from zero.persistence.repositories.audit_repository import AuditRepository
 from zero.persistence.repositories.provider_repository import (
     ProviderRepository,
 )
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def request_dedup_scope(
@@ -522,7 +519,7 @@ class ProviderService:
                 request_hash=req_hash,
                 state="pending",
                 idempotency_key=idempotency_key,
-                started_at=_now_utc_iso(),
+                started_at=now_utc_iso(),
             )
             claimed = self._repo.insert_provider_request(provider_request)
             if not claimed:
@@ -657,7 +654,7 @@ class ProviderService:
                             f"request failed: {error_class}"
                         ),
                         correlation_id=execution_id.value if execution_id else None,
-                        created_at=_now_utc_iso(),
+                        created_at=now_utc_iso(),
                     )
                 )
                 if self._metrics is not None:
@@ -762,7 +759,7 @@ class ProviderService:
                             f"Provider {request.provider}:{request.model_name} request completed"
                         ),
                         correlation_id=execution_id.value if execution_id else None,
-                        created_at=_now_utc_iso(),
+                        created_at=now_utc_iso(),
                     ),
                     commit=False,
                 )
@@ -1037,7 +1034,7 @@ class ProviderService:
             estimated_cost_usd=estimated_cost,
             pricing_catalog_version=catalog_version,
             is_whole_tree=is_whole_tree,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         inserted = self._repo.insert_usage_record(record, commit=commit)
         if not inserted:
@@ -1127,7 +1124,7 @@ class ProviderService:
             output_price_per_million=output_price_per_million,
             cache_creation_price_per_million=cache_creation_price_per_million,
             cache_read_price_per_million=cache_read_price_per_million,
-            effective_at=_now_utc_iso(),
+            effective_at=now_utc_iso(),
         )
         self._repo.insert_pricing_entry(entry)
         return entry
@@ -1174,7 +1171,7 @@ class ProviderService:
                 target_id=usage_id.value,
                 result="success",
                 redacted_summary=f"Reconciled usage {usage_id.value}",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
 
@@ -1257,6 +1254,6 @@ class ProviderService:
                 result="success",
                 redacted_summary=f"Reconciled unknown provider request ({resolution})",
                 correlation_id=None,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )

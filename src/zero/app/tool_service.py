@@ -39,11 +39,11 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
 from typing import Any
 
 import jsonschema
 
+from zero.app.clock import now_utc_iso
 from zero.app.authorization_service import AuthorizationService
 from zero.app.tool_runner import (
     IsolatedToolRunner,
@@ -74,8 +74,6 @@ from zero.persistence.repositories.audit_repository import AuditRepository
 from zero.persistence.repositories.tool_repository import ToolRepository
 
 
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 #: Hermes parity (audit 2026-08-28): tool handler failures surface the
@@ -1121,6 +1119,6 @@ class ToolService:
                     + (f", error={error}" if error else "")
                     + ")"
                 ),
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )

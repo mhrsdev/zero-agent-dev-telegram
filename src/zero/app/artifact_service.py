@@ -25,8 +25,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import sqlite3
-from datetime import UTC, datetime
 
+from zero.app.clock import now_utc_iso
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.artifacts import (
     Artifact,
@@ -58,10 +58,6 @@ from zero.persistence.repositories.artifact_repository import (
 from zero.persistence.repositories.audit_repository import AuditRepository
 
 logger = logging.getLogger(__name__)
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _sha256(text: str) -> str:
@@ -155,7 +151,7 @@ class ArtifactService:
                     content=content,
                     producer=producer,
                     provenance=provenance,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 )
                 self._repo.insert_artifact(artifact, commit=False)
                 is_new_artifact = True
@@ -170,7 +166,7 @@ class ArtifactService:
                     actor_id=actor_id,
                     producer=producer,
                     provenance=provenance,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -188,7 +184,7 @@ class ArtifactService:
                         redacted_summary=(
                             f"Stored artifact {artifact.id.value} (kind={kind}, size={artifact.size_bytes})"
                         ),
-                        created_at=_now_utc_iso(),
+                        created_at=now_utc_iso(),
                     ),
                     commit=False,
                 )
@@ -334,8 +330,8 @@ class ArtifactService:
             content=content,
             content_hash=content_hash,
             state=persisted_state,
-            created_at=_now_utc_iso(),
-            updated_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
+            updated_at=now_utc_iso(),
         )
         self._repo.insert_rag_document(doc)
         index_error: Exception | None = None
@@ -372,7 +368,7 @@ class ArtifactService:
                     f"(requested_state={requested_state}, "
                     f"state={'candidate' if index_error else requested_state})"
                 ),
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return self._repo.get_rag_document(project_id, doc.id)
@@ -527,7 +523,7 @@ class ArtifactService:
                 target_id=None,
                 result="success",
                 redacted_summary=f"Rebuilt RAG index: {count} documents",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return count

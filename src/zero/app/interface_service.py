@@ -40,6 +40,8 @@ import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
+from zero.app.clock import now_utc_iso
+
 logger = logging.getLogger(__name__)
 
 from zero.app.authorization_service import AuthorizationService
@@ -83,8 +85,6 @@ from zero.persistence.repositories.interface_repository import (
 )
 
 
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _event_content(content: str) -> str:
@@ -226,7 +226,7 @@ class InterfaceAdapterService:
             event_content=content,
             processing_result=result,  # type: ignore[arg-type]
             processing_detail=detail,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
 
     def _try_auto_link_owner(
@@ -432,8 +432,8 @@ class InterfaceAdapterService:
             topic_id=str(topic_id) if topic_id is not None else None,
             is_enabled=is_enabled,
             created_by=actor_id,
-            created_at=_now_utc_iso(),
-            updated_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
+            updated_at=now_utc_iso(),
         )
         self._repo.insert_binding(binding)
         self._audit_repo.insert(
@@ -451,7 +451,7 @@ class InterfaceAdapterService:
                     + (f" topic {topic_id}" if topic_id else "")
                     + f" (enabled={is_enabled})"
                 ),
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return binding
@@ -542,7 +542,7 @@ class InterfaceAdapterService:
                 event_content="[duplicate event]",
                 processing_result="processed",
                 processing_detail="duplicate or in-flight delivery ignored",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         token_context = self._claim_token.set(claim_token)
         try:
@@ -597,7 +597,7 @@ class InterfaceAdapterService:
                 event_content="[duplicate event]",
                 processing_result="processed",
                 processing_detail="duplicate delivery ignored",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
 
         # 2. Resolve the interface binding (scope check).
@@ -632,7 +632,7 @@ class InterfaceAdapterService:
                     event_content=_event_content(event.content),
                     processing_result="ignored_disabled",
                     processing_detail="scope not enabled",
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 )
                 self._record_event(entry)
                 return entry
@@ -711,7 +711,7 @@ class InterfaceAdapterService:
                     event_content=_event_content(event.content),
                     processing_result="ignored_unlinked",
                     processing_detail="external identity not linked or not verified",
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 )
                 self._record_event(entry)
                 return entry
@@ -735,7 +735,7 @@ class InterfaceAdapterService:
                     event_content="[policy denied]",
                     processing_result="denied",
                     processing_detail=f"policy: {decision.reason}",
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 )
                 self._record_event(entry)
                 return entry
@@ -763,7 +763,7 @@ class InterfaceAdapterService:
                 event_content=_event_content(event.content),
                 processing_result="denied",
                 processing_detail="resolved user is not a member of the project",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
             self._record_event(entry)
             return entry
@@ -799,7 +799,7 @@ class InterfaceAdapterService:
                 event_content=_event_content(event.content),
                 processing_result="processed",
                 processing_detail=f"event kind {event.event_kind} logged",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
             self._record_event(entry)
             self._maybe_send_command_reply(
@@ -861,7 +861,7 @@ class InterfaceAdapterService:
                 event_content=_event_content(event.content),
                 processing_result="error",
                 processing_detail=f"conversation intake failed: {type(exc).__name__}",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
             return self._record_event(entry, succeeded=False)
 
@@ -910,7 +910,7 @@ class InterfaceAdapterService:
             event_content=_event_content(event.content),
             processing_result="processed",
             processing_detail=detail,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._record_event(entry)
         self._maybe_send_command_reply(binding=binding, event=event, user_id=user_id)
@@ -1148,7 +1148,7 @@ class InterfaceAdapterService:
                 event_content="[no callback token]",
                 processing_result="error",
                 processing_detail="callback query without token",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
             self._record_event(entry)
             return entry
@@ -1171,7 +1171,7 @@ class InterfaceAdapterService:
                 event_content="[invalid callback token]",
                 processing_result="error",
                 processing_detail="callback token not found",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
             self._record_event(entry)
             return entry
@@ -1239,7 +1239,7 @@ class InterfaceAdapterService:
                 event_content="[callback already used]",
                 processing_result="processed",
                 processing_detail="callback token already used (idempotent)",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
             self._record_event(entry)
             return entry
@@ -1261,7 +1261,7 @@ class InterfaceAdapterService:
                 event_content="[callback expired]",
                 processing_result="error",
                 processing_detail="callback token expired",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
             self._record_event(entry)
             return entry
@@ -1288,7 +1288,7 @@ class InterfaceAdapterService:
                 event_content=f"[stale callback: rev {token.revision_number} vs current {plan.current_revision_number}]",
                 processing_result="denied",
                 processing_detail="stale callback: revision mismatch",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
             self._record_event(entry)
             return entry
@@ -1327,7 +1327,7 @@ class InterfaceAdapterService:
         if result == "processed":
             # This is the one-shot consumption point: authorization and the
             # domain action have already completed.
-            used = self._repo.mark_callback_token_used(token_id, _now_utc_iso())
+            used = self._repo.mark_callback_token_used(token_id, now_utc_iso())
             if not used:
                 detail = "callback action was already finalized by another process"
 
@@ -1344,7 +1344,7 @@ class InterfaceAdapterService:
             event_content=f"[callback {token.action}]",
             processing_result=result,  # type: ignore[arg-type]
             processing_detail=detail,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._record_event(entry, succeeded=result != "error")
         return entry
@@ -1410,7 +1410,7 @@ class InterfaceAdapterService:
             expires_at=expires_at,
             used_at=None,
             created_by=created_by,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._repo.insert_callback_token(token)
         return token

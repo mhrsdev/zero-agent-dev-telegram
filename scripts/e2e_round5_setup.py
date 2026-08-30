@@ -23,15 +23,33 @@ SECRET_KEY = "e" * 64
 
 import os as _os
 PROVIDER_BASE = _os.environ.get("E2E_PROVIDER_BASE", "https://api.justwoker.icu/v1")
-PROVIDER_KEY = "sk-BlwjB2GhsGBwFLjQBBAhKK7FpmfJYP9usqGfrImaLaA1JOKW"
 PROVIDER_MODEL = "claude-opus-5"
-BOT_TOKEN = "8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8"
 GROUP_ID = "-1004406039396"
-WEBHOOK_SECRET = "e2e-webhook-secret-9f31c2"
+# Real credentials are injected per run — never committed. The literal
+# values that used to live here were live secrets (scrubbed 2026-08-30).
+PROVIDER_KEY = _os.environ.get("E2E_PROVIDER_KEY", "").strip()
+BOT_TOKEN = _os.environ.get("E2E_BOT_TOKEN", "").strip()
+WEBHOOK_SECRET = _os.environ.get("E2E_WEBHOOK_SECRET", "").strip()
 
 
 def main() -> int:
     import shutil
+
+    missing = [
+        name
+        for name, value in (
+            ("E2E_PROVIDER_KEY", PROVIDER_KEY),
+            ("E2E_BOT_TOKEN", BOT_TOKEN),
+            ("E2E_WEBHOOK_SECRET", WEBHOOK_SECRET),
+        )
+        if not value
+    ]
+    if missing:
+        sys.exit(
+            "missing required environment variables: "
+            + ", ".join(missing)
+            + " (real credentials are no longer embedded in this script)"
+        )
 
     if HOME.exists():
         shutil.rmtree(HOME)

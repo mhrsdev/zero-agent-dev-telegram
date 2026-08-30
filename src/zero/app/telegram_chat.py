@@ -40,7 +40,6 @@ import base64
 import logging
 import mimetypes
 import threading
-from typing import Any
 
 from zero.app.chat_history_repository import ChatHistoryRepository
 from zero.app.chat_service import ChatService

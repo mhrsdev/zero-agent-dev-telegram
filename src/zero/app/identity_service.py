@@ -15,8 +15,8 @@ constraints).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 
+from zero.app.clock import now_utc_iso
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
 from zero.domain.identity import (
@@ -42,10 +42,6 @@ from zero.persistence.repositories.audit_repository import AuditRepository
 from zero.persistence.repositories.identity_repository import (
     IdentityRepository,
 )
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 class IdentityService:
@@ -92,7 +88,7 @@ class IdentityService:
             id=UserId(generate_user_id()),
             display_name=display_name.strip(),
             status="active",
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._identity_repo.insert_user(user, commit=commit)
         self._audit_repo.insert(
@@ -106,7 +102,7 @@ class IdentityService:
                 target_id=user.id.value,
                 result="success",
                 redacted_summary=f"Created user {user.id.value}",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             ),
             commit=commit,
         )
@@ -141,7 +137,7 @@ class IdentityService:
             id=ProjectId(generate_project_id()),
             name=name.strip(),
             owner_user_id=owner.id,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         owner_membership = ProjectMembership(
             project_id=project.id,
@@ -161,7 +157,7 @@ class IdentityService:
                 target_id=project.id.value,
                 result="success",
                 redacted_summary=f"Created project {project.id.value}",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return project
@@ -204,7 +200,7 @@ class IdentityService:
             project_id=project.id,
             user_id=member.id,
             role=role,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         with self._identity_repo._database.transaction():
             self._identity_repo.insert_membership(membership, commit=False)
@@ -221,7 +217,7 @@ class IdentityService:
                     redacted_summary=(
                         f"Added user {member.id.value} to project {project.id.value} as {role}"
                     ),
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -265,7 +261,7 @@ class IdentityService:
                     redacted_summary=(
                         f"Removed user {member_id.value} from project {project.id.value}"
                     ),
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -330,8 +326,8 @@ class IdentityService:
             platform=platform,
             external_id=external_id.strip(),
             external_username=external_username,
-            verified_at=_now_utc_iso() if verified else None,
-            created_at=_now_utc_iso(),
+            verified_at=now_utc_iso() if verified else None,
+            created_at=now_utc_iso(),
         )
         self._identity_repo.insert_external_identity(identity)
         self._audit_repo.insert(
@@ -347,7 +343,7 @@ class IdentityService:
                 redacted_summary=(f"Linked {platform} identity to user {user.id.value}"),
                 # NOTE: external_id is intentionally NOT included in
                 # the summary; it is platform-specific PII.
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return identity
@@ -372,7 +368,7 @@ class IdentityService:
         if existing.verified_at is not None:
             # Idempotent: already verified.
             return existing
-        verified_at = _now_utc_iso()
+        verified_at = now_utc_iso()
         self._identity_repo.mark_external_identity_verified(existing.id, verified_at)
         self._audit_repo.insert(
             AuditEvent(

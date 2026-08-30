@@ -30,12 +30,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from datetime import UTC, datetime
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from zero.app.clock import now_utc_iso
 from zero.app.authorization_service import AuthorizationService
 from zero.config import Settings
 from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
@@ -55,10 +55,6 @@ from zero.persistence.repositories.audit_repository import AuditRepository
 from zero.persistence.repositories.secret_repository import (
     SecretRepository,
 )
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _derive_fernet_key(secret_key_material: str) -> bytes:
@@ -178,7 +174,7 @@ class SecretService:
             project_id=project_id,
             name=name.strip(),
             secret_type=secret_type,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._secret_repo.insert(secret_ref, encrypted, key_id=self._current_key_id())
         self._audit_repo.insert(
@@ -195,7 +191,7 @@ class SecretService:
                 # any ciphertext. The secret ID is enough for
                 # correlation.
                 redacted_summary=f"Stored secret reference {secret_ref.id.value}",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return secret_ref
@@ -300,7 +296,7 @@ class SecretService:
             permission="secret.manage",
             source=source,
         )
-        self._secret_repo.revoke(project_id, secret_id, _now_utc_iso())
+        self._secret_repo.revoke(project_id, secret_id, now_utc_iso())
         self._audit_repo.insert(
             AuditEvent(
                 id=AuditEventId(generate_audit_event_id()),
@@ -312,7 +308,7 @@ class SecretService:
                 target_id=secret_id.value,
                 result="success",
                 redacted_summary=f"Revoked secret reference {secret_id.value}",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
 

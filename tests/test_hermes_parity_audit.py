@@ -39,6 +39,7 @@ from typing import ClassVar
 import pytest
 
 from zero.config import Settings
+from tests.conftest import loopback_http_works
 from zero.domain.providers import CanonicalMessage, CanonicalRequest, CanonicalResponse
 
 # ----------------------------------------------------------------------
@@ -98,6 +99,8 @@ class _Upstream(BaseHTTPRequestHandler):
 
 @pytest.fixture(scope="module")
 def upstream():
+    if not loopback_http_works():
+        pytest.skip("loopback HTTP round-trips do not complete in this environment")
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

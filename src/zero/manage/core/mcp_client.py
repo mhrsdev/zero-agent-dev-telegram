@@ -29,10 +29,12 @@ import re
 import subprocess
 import threading
 
+from zero import __version__
+
 logger = logging.getLogger(__name__)
 
 _MCP_PROTOCOL_VERSION = "2024-11-05"
-_CLIENT_INFO = {"name": "zero-develop", "version": "0.1.0"}
+_CLIENT_INFO = {"name": "zero-develop", "version": __version__}
 _REQUEST_TIMEOUT_SECONDS = 30.0
 
 

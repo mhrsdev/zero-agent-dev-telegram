@@ -4,6 +4,114 @@ All notable changes to Zero Develop are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versions
 are milestone-based rather than semver until 1.0.
 
+## [Unreleased] — round-8 security & correctness wave
+
+A full-tree audit pass. Every item was reproduced before it was fixed and
+is pinned by a test in `tests/test_hardening_wave8.py` (16 tests) unless
+noted otherwise.
+
+### Security
+
+- **A live Telegram bot token and a live provider API key were committed
+  to the repository.** The token appeared 1,342 times in
+  `realrun-evidence/server.log` and 13 times in
+  `realrun-evidence/round5/engine.log` (Bot API request URLs embed the
+  credential), and both the token and an `sk-…` provider key were
+  hard-coded as module constants in `scripts/e2e_round5_setup.py`,
+  `realrun-evidence/env_common.py`, `realrun-evidence/s7_console_session.py`,
+  and `realrun-evidence/s2_start_server.sh`. A webhook secret was
+  hard-coded in `scripts/e2e_round5_engine.sh`.
+  - Every literal was replaced with a required environment read
+    (`E2E_BOT_TOKEN`, `E2E_PROVIDER_KEY`, `E2E_WEBHOOK_SECRET`,
+    `REALRUN_BOT_TOKEN`, `REALRUN_API_KEY`); the drivers now fail closed
+    with a named-variable error instead of running with an embedded
+    secret.
+  - Token occurrences inside the captured logs were redacted, and the raw
+    logs were untracked. `.gitignore` now excludes `*.log` so a captured
+    engine log can never republish a Bot API URL.
+  - `test_no_live_credentials_in_tracked_files` scans every tracked
+    text file for Telegram-token, OpenAI-key, AWS-key, GitHub-PAT, and
+    Slack-token shapes, so a future commit cannot reintroduce one.
+  - **Operator action still required:** the exposed bot token and
+    provider key are in published git history. Revoke the bot token via
+    @BotFather and rotate the provider key, then rewrite history if the
+    old objects must be purged.
+- **The admin GUI's CSRF token was derivable from the session id.**
+  `_csrf()` returned `sha256("csrf:" + session_id)[:32]`, so anyone who
+  learned a session id — from a proxy log, a shared screenshot, a
+  browser history entry — could compute the matching token, leaving the
+  CSRF check with no defense beyond the cookie it was meant to backstop.
+  Tokens are now independent `secrets.token_urlsafe(32)` values held per
+  session, issued at session creation, and dropped together with the
+  session on logout and on password change.
+- **`DockerExecutor` handed the full host environment to the `docker`
+  CLI.** The *container* environment was already built from explicit
+  `-e` flags, but the wrapper process received `dict(os.environ)` —
+  every provider key, bot token, and secret in the engine's environment.
+  A new `docker_cli_env()` passes only `PATH`, locale, and the Docker
+  daemon locators (`DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`,
+  `DOCKER_CERT_PATH`, `DOCKER_TLS*`), matching the scrubbing discipline
+  the other two backends already followed.
+
+### Fixed
+
+- **The authentication middleware blocked the event loop on every
+  authenticated request.** `_register_auth_middleware`'s `async def`
+  body called `services.auth.authenticate()` (a SQLite read) and
+  `services.authorization.require_permission()` (two more reads)
+  inline, serializing the whole process on database I/O while every
+  router and the webhook path already used the threadpool. Both calls
+  now go through `run_in_threadpool`; the project-scope check re-binds
+  the actor `ContextVar` inside the worker thread so audit attribution
+  and impersonation refusal are unchanged.
+- **`Database` never released the connections it cached.** Abandoned
+  wrappers left their handles to `sqlite3.Connection` finalization,
+  which raises `ResourceWarning: unclosed database` on CPython ≥ 3.13;
+  under this repo's warnings-as-errors policy that failed unrelated
+  tests non-deterministically, depending on when the cyclic collector
+  ran. A `weakref.finalize` now closes them (the callback holds the only
+  other strong reference to the connection set, so it always runs before
+  the connections' own finalizers), and `close()` remains idempotent.
+- **Tests resolved the operator's real `$ZERO_HOME`.** `zero_home()`
+  reads the variable per call, so the management-layer policy gate
+  live-loaded the operator's real `~/.zero/config.yaml`: a configured
+  `owner_only` access policy resolved the real `owner_project_id`
+  against the test's empty in-memory database and denied **every**
+  inbound interface event (`processing_result == "denied"`), failing 25
+  tests across interfaces, approval buttons, and webhooks — and
+  home-writing tests mutated the operator's live configuration. A
+  session-scoped autouse fixture points `$ZERO_HOME` at a throwaway
+  directory; per-test `monkeypatch.setenv` still overrides it.
+- **Suites that stand up a real loopback HTTP server failed as if the
+  adapters were broken.** In environments where loopback accepts the
+  connection and delivers the request but never returns the response,
+  `test_audit_real_http`, `test_hermes_parity_audit`,
+  `test_audit_wizard_e2e`, `test_manage_probes`, and the doctor's
+  healthy-install check hung until `ReadTimeout`. A one-time
+  `loopback_http_works()` probe performs a real request/response
+  round-trip and skips those tests with an honest reason, so a genuine
+  adapter regression still fails while an unusable network stack does
+  not masquerade as one.
+- **`test_resolve_sink_path_from_env` asserted a POSIX path spelling.**
+  It compared `str(Path("/tmp/x/ledger.jsonl"))` against the literal
+  string, which renders backslashes on Windows; the resolver was
+  correct. It now compares `Path` objects.
+
+### Changed
+
+- **The package version no longer contradicts the tree.**
+  `pyproject.toml` declared `0.1.0` while the repository was at v0.8.5,
+  so the wheel, `/healthz`, `zero --version`, and the MCP client
+  handshake all reported a version three release lines stale.
+  `zero.__version__` is now the single source of truth (`0.8.5`),
+  `pyproject.toml` reads it via `[tool.setuptools.dynamic]`, and
+  `mcp_client._CLIENT_INFO` reads it instead of its own hard-coded copy.
+- **One canonical UTC clock.** `_now_utc_iso` was defined 17 times with
+  a byte-identical body across the application services; the format —
+  millisecond-precision ISO-8601 with a `Z` suffix, which every
+  repository ordering comparison depends on — now lives once in
+  `zero/app/clock.py` as `now_utc_iso()`.
+
 ## [Unreleased] — real-server hardening (live gateway + autonomous pipeline)
 
 Fixes proven against a live server (`uvicorn zero.main:app`) driving a

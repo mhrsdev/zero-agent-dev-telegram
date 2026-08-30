@@ -189,9 +189,17 @@ def test_restore_rejects_authenticated_partial_schema(services, tmp_path) -> Non
         "merge_proposals",
     )
     sql = "\n".join(f"CREATE TABLE {table} (id TEXT PRIMARY KEY);" for table in tables) + "\n"
-    with sqlite3.connect(":memory:") as conn:
+    # ``with sqlite3.connect(...)`` commits but does NOT close the
+    # connection, so the handle survived the block and its finalizer
+    # later raised ``ResourceWarning: unclosed database`` — an error
+    # under the repo's warnings-as-errors policy, surfacing in whichever
+    # test happened to run when the collector caught up.
+    conn = sqlite3.connect(":memory:")
+    try:
         conn.executescript(sql)
         schema_hash = services.backup._schema_hash(conn)
+    finally:
+        conn.close()
     payload = {
         "format": "zero-sqlite-backup-v1",
         "created_at": "2026-01-01T00:00:00Z",

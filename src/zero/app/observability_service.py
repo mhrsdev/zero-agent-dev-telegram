@@ -51,7 +51,6 @@ import os
 import re
 import sqlite3
 import tempfile
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +58,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+from zero.app.clock import now_utc_iso
 from zero.domain.audit import looks_sensitive
 from zero.domain.identity import ProjectId
 
@@ -79,10 +79,6 @@ def _derive_backup_key(key_material: bytes) -> bytes:
         info=b"zero-develop/backup-encryption/v1",
     )
     return hkdf.derive(key_material)
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 # ----------------------------------------------------------------------
@@ -414,7 +410,7 @@ class BackupService:
         schema_hash = self._schema_hash(conn)
         payload = {
             "format": "zero-sqlite-backup-v1",
-            "created_at": _now_utc_iso(),
+            "created_at": now_utc_iso(),
             "schema_hash": schema_hash,
             "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
             "sql": sql,

@@ -26,7 +26,7 @@ rm -f "$REAL_HOME/zero.pid"
 export ZERO_ENV=development
 export ZERO_HOME="$REAL_HOME"
 export ZERO_DATABASE_URL="sqlite:///${REAL_HOME}/engine.db"
-export ZERO_OPENAI_API_KEY="sk-BlwjB2GhsGBwFLjQBBAhKK7FpmfJYP9usqGfrImaLaA1JOKW"
+export ZERO_OPENAI_API_KEY="${REALRUN_API_KEY:?set REALRUN_API_KEY (never committed)}"
 export ZERO_OPENAI_BASE_URL="https://api.justwoker.icu/v1"
 export ZERO_OPENAI_MODEL="claude-opus-5"
 # Model-level fallback routing (Hermes parity): mirrors routing.fallback_models

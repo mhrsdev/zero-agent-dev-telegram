@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zero-develop"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Zero Develop — multi-agent control plane for concurrent software development"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -60,6 +60,12 @@ zero = "zero.manage.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The package version is derived from ``zero.__version__`` so the wheel,
+# ``/healthz``, and ``--version`` can never disagree (they did: the
+# package said 0.1.0 while the tree was v0.8.5).
+[tool.setuptools.dynamic]
+version = { attr = "zero.__version__" }
 
 [tool.setuptools.package-data]
 "zero.web" = ["templates/*.html", "static/*"]

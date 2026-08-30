@@ -73,6 +73,12 @@ STEP_ORDER_IDX: dict = {s: i for i, s in enumerate(ORDER_LIST)}
 
 _SALT = b"zero-admin-v1"
 _sessions: dict[str, float] = {}  # sid -> expiry (single-process)
+# CSRF tokens are independent random secrets per session. Deriving one
+# from the session id (the old ``sha256("csrf:" + sid)``) meant anyone
+# who learned a session id — a proxy log, a shared screenshot, a browser
+# history entry — could compute the matching CSRF token, so the token
+# added no defense beyond the cookie it was meant to backstop.
+_csrf_tokens: dict[str, str] = {}  # sid -> csrf token
 # Brute-force mitigation: per-client-IP failure timestamps.
 _login_failures: dict[str, list[float]] = {}
 _LOCKOUT_THRESHOLD = 5
@@ -156,6 +162,7 @@ def _valid_session(request: Request) -> bool:
     exp = _sessions.get(sid, 0)
     if exp < time.time():
         _sessions.pop(sid, None)
+        _csrf_tokens.pop(sid, None)
         return False
     _sessions[sid] = time.time() + 1800
     return True
@@ -164,16 +171,26 @@ def _valid_session(request: Request) -> bool:
 def _new_session() -> tuple[str, str]:
     sid = secrets.token_urlsafe(32)
     _sessions[sid] = time.time() + 1800
+    _csrf_tokens[sid] = secrets.token_urlsafe(32)
     return sid, sid[:12]
 
 
 def _csrf(sid: str) -> str:
-    return hashlib.sha256(f"csrf:{sid}".encode()).hexdigest()[:32]
+    """Return this session's random CSRF token (empty when unknown)."""
+    if not sid:
+        return ""
+    token = _csrf_tokens.get(sid)
+    if token is None and sid in _sessions:
+        # A session restored without its token still gets one rather
+        # than falling back to a value an attacker could derive.
+        token = secrets.token_urlsafe(32)
+        _csrf_tokens[sid] = token
+    return token or ""
 
 
 def _check_csrf(sid: str, token: str) -> bool:
     expected = _csrf(sid or "")
-    return bool(token) and hmac.compare_digest(token, expected)
+    return bool(token) and bool(expected) and hmac.compare_digest(token, expected)
 
 
 _BASE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -316,6 +333,7 @@ def register_admin(app, services=None) -> None:
         # existing session (fixation/theft mitigation). The current
         # caller receives the single fresh session below.
         _sessions.clear()
+        _csrf_tokens.clear()
         sid, _ = _new_session()
         resp = RedirectResponse("/admin", status_code=303)
         resp.set_cookie("zero_admin", sid, httponly=True, samesite="strict")
@@ -344,6 +362,7 @@ def register_admin(app, services=None) -> None:
         sid = request.cookies.get("zero_admin") or ""
         if _check_csrf(sid, csrf):
             _sessions.pop(sid, None)
+            _csrf_tokens.pop(sid, None)
         return RedirectResponse("/admin/login", status_code=303)
 
     # ---- authenticated pages -------------------------------------------

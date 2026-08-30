@@ -36,10 +36,10 @@ import signal
 import sqlite3
 import subprocess
 import threading
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
+from zero.app.clock import now_utc_iso
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
 from zero.domain.execution import ExecutionId, TaskId
@@ -80,8 +80,6 @@ from zero.persistence.repositories.worktree_repository import (
 logger = logging.getLogger(__name__)
 
 
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _sha256(text: str) -> str:
@@ -541,7 +539,7 @@ class WorktreeService:
             name=name.strip(),
             local_path=validated_path,
             default_base_revision=default_base_revision,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._repo.insert_repository(repository)
         self._audit_repo.insert(
@@ -555,7 +553,7 @@ class WorktreeService:
                 target_id=repository.id.value,
                 result="success",
                 redacted_summary=f"Registered repository {repository.name!r}",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return repository
@@ -707,8 +705,8 @@ class WorktreeService:
             worktree_path=worktree_path,
             base_revision=actual_base,
             state="allocated",
-            created_at=_now_utc_iso(),
-            updated_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
+            updated_at=now_utc_iso(),
         )
         try:
             self._repo.insert_worktree(worktree)
@@ -731,7 +729,7 @@ class WorktreeService:
                 result="success",
                 redacted_summary=(f"Created worktree {worktree.id.value} for task {task_id.value}"),
                 correlation_id=execution_id.value,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return worktree
@@ -1097,7 +1095,7 @@ class WorktreeService:
                 result="success",
                 redacted_summary=f"Read bounded task file {display_path!r}",
                 correlation_id=worktree.execution_id.value,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return content
@@ -1159,7 +1157,7 @@ class WorktreeService:
                     f"({len(encoded)} bytes, sha256={content_hash})"
                 ),
                 correlation_id=worktree.execution_id.value,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return content_hash
@@ -1233,7 +1231,7 @@ class WorktreeService:
             exit_code=None,
             timed_out=False,
             timeout_seconds=timeout_seconds,
-            started_at=_now_utc_iso(),
+            started_at=now_utc_iso(),
             completed_at=None,
             state="running",
         )
@@ -1324,7 +1322,7 @@ class WorktreeService:
                     f"Ran {command} (exit={exit_code}, timed_out={timed_out}, state={new_state})"
                 ),
                 correlation_id=worktree.execution_id.value,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         run = self._repo.get_command_run(run_id)
@@ -1605,7 +1603,7 @@ class WorktreeService:
             kind="source_snapshot",
             content=content,
             content_hash=_sha256(content),
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
 
     def _capture_artifact(
@@ -1627,7 +1625,7 @@ class WorktreeService:
             kind=kind,
             content=content,
             content_hash=_sha256(content),
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._repo.insert_artifact(artifact)
         return artifact
@@ -1668,7 +1666,7 @@ class WorktreeService:
         self._repo.update_worktree_state(
             worktree_id,
             "cleanup_eligible",
-            cleanup_eligible_at=_now_utc_iso(),
+            cleanup_eligible_at=now_utc_iso(),
         )
         return self._repo.get_worktree(project_id, worktree_id)
 
@@ -1740,7 +1738,7 @@ class WorktreeService:
                 result="success",
                 redacted_summary=f"Removed worktree {worktree_id.value}",
                 correlation_id=worktree.execution_id.value,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return self._repo.get_worktree(project_id, worktree_id)
@@ -1793,7 +1791,7 @@ class WorktreeService:
                     target_id=None,
                     result="success",
                     redacted_summary=(f"Recovered {len(recovered)} worktrees after restart"),
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 )
             )
         return recovered

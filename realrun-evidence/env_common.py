@@ -18,14 +18,19 @@ WORKSPACE = Path("/home/z/my-project/zero-workspace")
 REPO = WORKSPACE / "textkit-repo"
 STATE = Path("/home/z/my-project/scripts/realrun/state.json")
 
-BOT_TOKEN = "8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8"
-API_KEY = "sk-BlwjB2GhsGBwFLjQBBAhKK7FpmfJYP9usqGfrImaLaA1JOKW"
+BOT_TOKEN = os.environ.get("REALRUN_BOT_TOKEN", "")
+API_KEY = os.environ.get("REALRUN_API_KEY", "")
 GROUP_ID = "-1004406039396"
 MODEL = "claude-opus-5"
 TG_SENDER_ID = "777000001"  # synthetic-but-verified telegram external id for the owner
 
 
 def setup_env() -> None:
+    if not BOT_TOKEN or not API_KEY:
+        raise RuntimeError(
+            "set REALRUN_BOT_TOKEN and REALRUN_API_KEY "
+            "(real credentials are no longer embedded in this module)"
+        )
     REAL_HOME.mkdir(parents=True, exist_ok=True)
     (REAL_HOME / "worktrees").mkdir(exist_ok=True)
     (REAL_HOME / "plugins").mkdir(exist_ok=True)

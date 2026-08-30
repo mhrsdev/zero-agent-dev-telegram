@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from threading import Event, Lock
 from typing import Any, cast
 
+from zero.app.clock import now_utc_iso
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.artifacts import ArtifactId, ArtifactNotFoundError
 from zero.domain.audit import AuditEvent, AuditEventId, AuditSource
@@ -82,8 +83,6 @@ from zero.persistence.repositories.plan_repository import PlanRepository
 logger = logging.getLogger(__name__)
 
 
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 _EVIDENCE_KINDS: dict[str, frozenset[str]] = {
@@ -348,8 +347,8 @@ class WorkerService:
             project_id=plan.project_id,
             state="pending",
             idempotency_key=handoff.id.value,
-            created_at=_now_utc_iso(),
-            updated_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
+            updated_at=now_utc_iso(),
         )
         with self._execution_repo._database.transaction():
             # The transaction starts with BEGIN IMMEDIATE, so this re-read
@@ -376,8 +375,8 @@ class WorkerService:
                     expected_evidence=spec.expected_evidence,
                     state="pending",  # will compute readiness below
                     agent_type_id=spec.agent_type_id,
-                    created_at=_now_utc_iso(),
-                    updated_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
+                    updated_at=now_utc_iso(),
                 )
                 self._execution_repo.insert_task(task, commit=False)
 
@@ -422,7 +421,7 @@ class WorkerService:
                         f"Created execution {execution.id.value} from plan {plan.id.value}"
                     ),
                     correlation_id=execution.id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -839,7 +838,7 @@ class WorkerService:
                 state="running",
                 lease_owner=lease_owner,
                 lease_expires_at=lease_expires.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                started_at=_now_utc_iso(),
+                started_at=now_utc_iso(),
             )
             self._execution_repo.insert_attempt(attempt, commit=False)
             # A recovered/paused execution with ready work resumes when a
@@ -967,7 +966,7 @@ class WorkerService:
                     target_id=task.id.value,
                     result="success",
                     correlation_id=execution_id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -1044,7 +1043,7 @@ class WorkerService:
                     result="failure",
                     redacted_summary=f"Task {task.id.value} failed",
                     correlation_id=execution_id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -1121,7 +1120,7 @@ class WorkerService:
                     result="error",
                     redacted_summary=f"Task {task.id.value} requires provider reconciliation",
                     correlation_id=execution_id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -1296,7 +1295,7 @@ class WorkerService:
                     result="success",
                     redacted_summary=f"Cancelled execution {execution.id.value}",
                     correlation_id=execution_id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -1352,7 +1351,7 @@ class WorkerService:
                     result="success",
                     redacted_summary=f"Task {task.id.value} requeued for retry",
                     correlation_id=execution_id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -1419,7 +1418,7 @@ class WorkerService:
                     result="success",
                     redacted_summary=f"Task {task.id.value} reconciled by operator; requeued",
                     correlation_id=execution_id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -1462,7 +1461,7 @@ class WorkerService:
                 result="success",
                 redacted_summary=(f"Task {task.id.value} retry scheduled after {next_retry_at}"),
                 correlation_id=task.execution_id.value,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return self._execution_repo.get_task(task_id, project_id=project_id)
@@ -1532,7 +1531,7 @@ class WorkerService:
                     result="success",
                     redacted_summary=f"Task {task.id.value} cancelled",
                     correlation_id=execution_id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -1593,7 +1592,7 @@ class WorkerService:
                 execution_id,
                 project_id=project_id,
             )
-            now = _now_utc_iso()
+            now = now_utc_iso()
             for task in tasks:
                 if task.state != "running":
                     continue
@@ -1748,7 +1747,7 @@ class WorkerService:
                 snapshot_version=version,
                 graph_state=json.dumps(graph, sort_keys=True),
                 snapshot_reason=reason,
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
             self._execution_repo.insert_snapshot(snapshot, commit=commit)
             return snapshot

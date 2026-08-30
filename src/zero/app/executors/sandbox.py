@@ -61,6 +61,39 @@ def scrubbed_env(cwd: str) -> dict[str, str]:
     }
 
 
+#: Host variables the ``docker`` CLI itself needs to reach the daemon.
+#: The wrapper process gets these and nothing else, so host credentials
+#: and tokens never reach the CLI's environment; the container's own
+#: environment is built separately from explicit ``-e`` flags.
+_DOCKER_CLI_PASSTHROUGH = (
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_CONFIG",
+    "DOCKER_CERT_PATH",
+    "DOCKER_TLS",
+    "DOCKER_TLS_VERIFY",
+    "SYSTEMROOT",
+    "WINDIR",
+    "USERPROFILE",
+    "TEMP",
+    "TMP",
+)
+
+
+def docker_cli_env() -> dict[str, str]:
+    """Minimal environment for the ``docker`` client process itself."""
+    env: dict[str, str] = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    for name in _DOCKER_CLI_PASSTHROUGH:
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
+    return env
+
+
 def run_bounded_process(
     argv: list[str],
     *,
@@ -303,7 +336,7 @@ class DockerExecutor:
         result = run_bounded_process(
             full_argv,
             cwd=cwd,
-            env=dict(os.environ),
+            env=docker_cli_env(),
             timeout_seconds=timeout_seconds + self._grace,
             output_limit=output_limit,
             kill_callbacks=(kill_container,),
@@ -397,6 +430,7 @@ __all__ = [
     "HostBoundedExecutor",
     "SandboxUnavailableError",
     "build_command_executor",
+    "docker_cli_env",
     "run_bounded_process",
     "scrubbed_env",
 ]

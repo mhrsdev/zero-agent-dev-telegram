@@ -33,13 +33,13 @@ import json
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping, Sequence
-from datetime import UTC, datetime
 from threading import Event
 from typing import Any, ClassVar
 from urllib.parse import urlsplit
 
 import httpx
 
+from zero.app.clock import now_utc_iso
 from zero.domain.ids import (
     generate_provider_model_id,
 )
@@ -65,8 +65,6 @@ from zero.persistence.repositories.provider_repository import (
 )
 
 
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _render_tools(
@@ -549,7 +547,7 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
                 "cancellation",
             ),
             is_active=True,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
 
     def send_request(
@@ -1144,7 +1142,7 @@ class AnthropicMessagesProviderAdapter(ProviderAdapter):
                 "prompt_caching",
             ),
             is_active=True,
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
 
     # -- request rendering ------------------------------------------------
@@ -1709,7 +1707,7 @@ class FakeProviderAdapter(ProviderAdapter):
                     max_output_tokens=max_out,
                     capabilities=caps,
                     is_active=True,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 )
                 self._repo.insert_provider_model(model)
 

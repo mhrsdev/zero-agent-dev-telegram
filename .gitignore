@@ -39,6 +39,13 @@ Thumbs.db
 # Local env (NEVER commit real secrets)
 .env
 
+# Captured runtime logs. Bot API URLs embed the bot token, so committing
+# an engine log publishes the credential (it happened: the token appeared
+# 1,342 times in realrun-evidence/server.log). Structured evidence files
+# (*.json / *.jsonl / GRADE_REPORT.md) stay tracked; raw logs do not.
+*.log
+realrun-evidence/**/*.log
+
 # Type checkers
 .mypy_cache/
 .ruff_cache/

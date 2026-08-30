@@ -29,8 +29,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
 
+from zero.app.clock import now_utc_iso
 from zero.app.authorization_service import AuthorizationService
 from zero.domain.agent_types import (
     AgentInstance,
@@ -63,10 +63,6 @@ from zero.persistence.repositories.agent_type_repository import (
     AgentTypeRepository,
 )
 from zero.persistence.repositories.audit_repository import AuditRepository
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _sha256(text: str) -> str:
@@ -138,8 +134,8 @@ class AgentTypeService:
             max_concurrent_instances=max_concurrent_instances,
             state="active",
             version=1,
-            created_at=_now_utc_iso(),
-            updated_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
+            updated_at=now_utc_iso(),
         )
         self._repo.insert_agent_type(agent_type, commit=commit)
         self._audit_repo.insert(
@@ -153,7 +149,7 @@ class AgentTypeService:
                 target_id=agent_type.id.value,
                 result="success",
                 redacted_summary=f"Created agent type {agent_type.name!r}",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             ),
             commit=commit,
         )
@@ -213,7 +209,7 @@ class AgentTypeService:
                 target_id=type_id.value,
                 result="success",
                 redacted_summary=f"Updated agent type {type_id.value}",
-                created_at=_now_utc_iso(),
+                created_at=now_utc_iso(),
             )
         )
         return self._repo.get_agent_type(project_id, type_id)
@@ -260,8 +256,8 @@ class AgentTypeService:
             agent_type_id=type_id,
             task_id=None,
             state="idle",
-            created_at=_now_utc_iso(),
-            updated_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
+            updated_at=now_utc_iso(),
         )
         self._repo.insert_instance(instance)
         return instance
@@ -371,8 +367,8 @@ class AgentTypeService:
             content_hash=_sha256(content),
             provenance=provenance,
             state=state,
-            created_at=_now_utc_iso(),
-            updated_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
+            updated_at=now_utc_iso(),
         )
         self._repo.insert_knowledge(record)
         return record
@@ -553,7 +549,7 @@ class AgentTypeService:
                         f"unrouted records"
                     ),
                     correlation_id=snapshot.id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -651,7 +647,7 @@ class AgentTypeService:
                         f"{dest_type.name!r}; migrated {total_migrated} records"
                     ),
                     correlation_id=snapshot.id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -724,7 +720,7 @@ class AgentTypeService:
                     result="success",
                     redacted_summary=f"Retired type {agent_type.name!r}",
                     correlation_id=snapshot.id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -842,7 +838,7 @@ class AgentTypeService:
                     result="success",
                     redacted_summary=f"Rolled back to snapshot {snapshot_id.value}",
                     correlation_id=rollback_snapshot.id.value,
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 ),
                 commit=False,
             )
@@ -894,7 +890,7 @@ class AgentTypeService:
             snapshot_version=version,
             reason=reason,
             topology_state=json.dumps(state, sort_keys=True),
-            created_at=_now_utc_iso(),
+            created_at=now_utc_iso(),
         )
         self._repo.insert_snapshot(snapshot, commit=commit)
         return snapshot

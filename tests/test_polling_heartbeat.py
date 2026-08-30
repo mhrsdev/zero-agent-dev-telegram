@@ -58,6 +58,31 @@ class _HealthyAdapter:
         return {"username": "SandboxEnvironmentBot", "id": 8753924431}
 
 
+async def _wait_until(predicate, *, timeout: float = 10.0) -> bool:
+    """Await ``predicate`` becoming true, polling cooperatively.
+
+    The original tests slept a fixed 0.3s and asserted a poll count.
+    That count is a function of how much CPU the event loop actually got:
+    under full-suite load the loop completed fewer iterations and the
+    assertion failed while the behavior under test — polling surviving a
+    failed heartbeat — was intact. Waiting for the condition with a
+    generous deadline tests the behavior instead of the machine's speed.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return predicate()
+
+
+async def _drain(host, task) -> None:
+    host._stop.set()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_heartbeat_fires_and_succeeds(monkeypatch) -> None:
     adapter = _HealthyAdapter()
@@ -67,12 +92,14 @@ async def test_heartbeat_fires_and_succeeds(monkeypatch) -> None:
 
     monkeypatch.setattr(workers_mod, "_POLLING_HEARTBEAT_SECONDS", 0.05)
     task = asyncio.create_task(host._polling_loop())
-    await asyncio.sleep(0.3)
-    host._stop.set()
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-    assert adapter.polls >= 1
-    assert adapter.probes >= 1, "the periodic getMe heartbeat must fire"
+    try:
+        fired = await _wait_until(lambda: adapter.polls >= 1 and adapter.probes >= 1)
+    finally:
+        await _drain(host, task)
+    assert fired, (
+        f"the periodic getMe heartbeat must fire "
+        f"(polls={adapter.polls}, probes={adapter.probes})"
+    )
 
 
 @pytest.mark.asyncio
@@ -88,9 +115,11 @@ async def test_heartbeat_failure_does_not_kill_polling(monkeypatch) -> None:
 
     monkeypatch.setattr(workers_mod, "_POLLING_HEARTBEAT_SECONDS", 0.05)
     task = asyncio.create_task(host._polling_loop())
-    await asyncio.sleep(0.3)
-    host._stop.set()
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-    # Polling continued past the failed heartbeat probes.
-    assert adapter.polls >= 3
+    try:
+        # Polling must continue past the failed heartbeat probes.
+        survived = await _wait_until(lambda: adapter.polls >= 3)
+    finally:
+        await _drain(host, task)
+    assert survived, (
+        f"a failing heartbeat probe must not stop polling (polls={adapter.polls})"
+    )
