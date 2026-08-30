@@ -1,0 +1,13 @@
+{"phase": "P0 health", "ok": true, "detail": "{\"status\":\"ok\",\"version\":\"0.1.0\",\"environment\":\"development\",\"database\":\"ok\",\"migration_count\":34}", "profile": "decomposition"}
+{"phase": "P1 capabilities", "ok": true, "detail": "{\"environment\":\"development\",\"capabilities\":{\"database_backend\":{\"status\":\"available\",\"detail\":\"sqlite (file)\"},\"worktree_execution\":{\"status\":\"unavailable\",\"de", "profile": "decomposition"}
+{"phase": "P2a /start intake", "ok": true, "detail": "{\"id\":\"iev_ksm6biqxer38jnu8nybp0xag\",\"project_id\":\"p_8f7omuhn8oa3bvczw0zcwut5\",\"platform\":\"telegram\",\"external_event_id\"", "profile": "decomposition"}
+{"phase": "P2b /start welcome reply delivered", "ok": true, "detail": "rows=1 sendMessage_logged=True", "profile": "decomposition"}
+{"phase": "P3a actionable intake", "ok": true, "detail": "", "profile": "decomposition"}
+{"phase": "P3b planner proposed + plan card with buttons sent", "ok": true, "detail": "revisions=1 tokens=2 card_sends_logged=2", "profile": "decomposition"}
+{"phase": "P4a callback approve accepted", "ok": true, "detail": "", "profile": "decomposition"}
+{"phase": "P4b plan approved via callback token", "ok": true, "detail": "approved_plans=1", "profile": "decomposition"}
+{"phase": "P4c execution ran (real agent loop) + SUCCESS delivered to REAL group", "ok": true, "detail": "execution SUCCEEDED and result delivered to Telegram THIS run (message_id=473)", "profile": "decomposition"}
+{"phase": "P4d decomposition built a multi-task graph, ALL tasks completed", "ok": true, "detail": "decomposed into 9 tasks, ALL completed", "profile": "decomposition"}
+{"phase": "P7 web_search granted (real keyless backend verified separately)", "ok": true, "detail": "grants=1", "profile": "decomposition"}
+{"phase": "P8 MCP stdio server tool registered", "ok": true, "detail": "tools=['mcp_e2e_echo_add']", "profile": "decomposition"}
+{"phase": "P9 real Telegram polling identity", "ok": true, "detail": "@SandboxEnvironmentBot", "profile": "decomposition"}

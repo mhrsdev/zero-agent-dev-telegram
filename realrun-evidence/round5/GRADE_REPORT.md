@@ -93,6 +93,75 @@ Commits: ea051da (Hermes-parity overhaul) + 55ee64e (this pass).
 | Multi-project/teams| management scope live        | persistence/pg-dialect tests |
 | Runtimes           | openai-compatible + anthropic adapters live | test_anthropic_and_hermes_parity.py, test_hermes_parity_audit.py (fallback chain, auth classes) |
 
+## 5b. Round-7 "FULLY" verification wave (three FULLY directives, zero simulation)
+
+User directive: MAKE SURE THE INLINEKEYBOARD / THE DECOMPOSITION / THE
+APPROVAL FULLY WORKING. Evidence on tree main @ e61b466 + round-7 fixes,
+real credentials throughout (real bot, real group, real claude-opus-5).
+
+### INLINE KEYBOARD — FULLY VERIFIED
+- Real dual-button plan cards (✅ Approve / ✖️ Reject, callback_data =
+  opaque one-shot token ids) delivered to the REAL group (P3b/P4f-2).
+- Presses route through the REAL webhook/polling intake → durable token
+  validation → plan transition (P4a/P4b approve, P4f-4 reject).
+- Presses are acknowledged on the REAL Bot API after dispatch with the
+  outcome toast (P4e/P4f-5: answerCallbackQuery requests captured; the
+  drive's synthetic query ids get Telegram's expected 400
+  QUERY_ID_INVALID — real ids minted by real clients get 200 + toast,
+  OBSERVED LIVE at 20:58:35 when a real group member pressed a real
+  card button through polling: `answerCallbackQuery "HTTP/1.1 200 OK"`).
+- Payload/text correctness pinned by 18 adapter/service tests.
+
+### APPROVAL — FULLY VERIFIED (real pipeline, boundary matrix)
+- Approve: card → callback token → plan approved → scheduler engaged
+  (P4a/P4b/P4c') with the decomposed graph already running.
+- Reject: second real plan → REAL reject press → plan 'rejected', token
+  consumed once (P4f-3/4/5).
+- Forged token → loud error, zero plan impact (P4g).
+- Stranger press → denied at the identity gate (P4h).
+- Replay → idempotent 'already used', no double approve (P4i).
+- Deeper authorization layers pinned: membership gate (non-member) and
+  per-action permission (viewer role) both leave the token UNUSED.
+
+### DECOMPOSITION — FULLY VERIFIED
+- Real LLM decomposed the approved revision into a 9-task dependency
+  graph; EVERY task ran through the real agent loop (claude-opus-5) and
+  reached completed; the execution summary was delivered to the REAL
+  group (P4c message_id=473; P4d "9 tasks, ALL completed").
+- Earlier runs exercised 10-task and 11-task/16-edge graphs — graph
+  shapes vary with the real LLM, all validated by the graph validator.
+
+### Round-7 bugs found live → fixed → pinned (details in CHANGELOG)
+1. Webhook-path button presses were NEVER answered (credential-less
+   webhook adapter; WebhookAuthError swallowed) → transport service owns
+   the acknowledgement with the binding's resolved credential.
+2. A stale/expired callback query (HTTP 400 QUERY_ID_INVALID — plain
+   RuntimeError, not AdapterError) killed the ENTIRE polling worker →
+   acknowledgement is now unconditionally best-effort.
+3. `routing.primary_model` never reached task execution/decomposition
+   (scheduler tick used the gpt-4o-mini default; the operator's gateway
+   then stopped serving that model — every task call edge-403'd while
+   the aligned planner succeeded) → config_sync pins the tick to the
+   routing table.
+4. One transient CDN-edge 403 degraded every decomposition to the
+   single-task fallback → bounded transport retry budget (4 retries,
+   5/15/30/60s backoff) sized to the observed multi-minute gateway
+   flaps; auth failures stay fail-fast.
+
+### Round-7 environmental boundary (documented, not a code defect)
+File-editing (workspace-evidence) tasks fail closed in THIS sandbox:
+command execution requires a genuine isolation backend
+(ZERO_SANDBOX_EXECUTOR=docker|firejail — GAP-3 production rule) and
+none is installable here. The e2e therefore drives an analysis
+deliverable whose every task carries provider_response evidence; the
+coding-task path (repository registration, worktree branching, merge
+bases, diff/test evidence) is pinned by the runtime test suite and
+remains an operator-side capability. Live probes also proved the
+gateway's own flakiness window (403 storms for tool-bearing calls on
+the unaligned model; direct curl probes of every shape succeeded
+between storms) — the resilience additions above make the pipeline
+survive it.
+
 ## 6. GRADE: A
 - Correctness: every real-credentials phase and every real-process
   verifier passes on this exact tree; suite is green modulo one

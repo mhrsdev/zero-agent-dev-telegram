@@ -13,6 +13,80 @@ real-run failure.
 
 ### Fixed
 
+- **Round-7 "FULLY" verification wave — inline keyboard, decomposition,
+  approval** (real-credentials evidence: approval profile 21/21 phases,
+  decomposition profile 13/13 phases, both against the live engine +
+  real bot + real group + real claude-opus-5). Four real bugs were
+  found and fixed by this wave:
+  - **Webhook-delivered button presses were never answered on the Bot
+    API.** The engine's webhook adapter holds no bot credential (tokens
+    are per-binding secrets resolved at action time), so the round-7
+    answer attempt died silently at `_api_url` with a swallowed
+    `WebhookAuthError` — every press spun until Telegram's ~10s query
+    timeout. `InterfaceTransportService.process_webhook` now owns the
+    webhook-path acknowledgement: after the durable dispatch it
+    resolves the binding credential and answers the press with the
+    outcome toast (`✅ Plan approved` / `✖️ Plan rejected` /
+    `⛔ Not allowed` / `⚠️ Failed — see logs`); the crash path is
+    answered too, then the exception propagates. Presses from
+    unresolved actors (strangers) are not answered — the durable denial
+    is authoritative. Pinned by
+    `test_webhook_press_answered_via_binding_credential` +
+    `test_webhook_press_by_stranger_gets_no_credential_resolution` and
+    proven live (answerCallbackQuery requests visible on the real Bot
+    API; a REAL 200 toast observed when a real group member pressed a
+    real card button through the polling path).
+  - **One stale/expired callback query killed the whole polling
+    worker.** `answerCallbackQuery` for an expired/already-answered
+    query id returns HTTP 400 `QUERY_ID_INVALID`, which surfaces as a
+    plain `RuntimeError` (ok=false), NOT an `AdapterError` — it
+    propagated out of `poll_once` and out of `poll_forever`'s
+    exception tuple, taking the bot offline. The acknowledgement is now
+    best-effort in the strongest sense (no failure class can break
+    intake or the polling loop). Pinned by
+    `test_stale_query_id_400_never_kills_the_polling_worker`.
+  - **`routing.primary_model` never reached task execution or
+    decomposition.** The scheduler tick resolved its model from
+    `settings.openai_model` (the gpt-4o-mini default) while config_sync
+    aligned only the planner and the chat bridge. When the operator's
+    gateway stopped serving the gpt-4o-mini default outright (every
+    decomposition/task call died with a CDN-edge 403 while the aligned
+    planner kept succeeding), approved plans could never execute.
+    config_sync now pins the scheduler tick to `routing.primary_model`
+    (`SchedulerService.set_tick_routing`) — one routing truth for
+    planner, chat, decomposition, and task execution. Pinned by
+    `test_config_sync_pins_scheduler_tick_to_routing_primary_model`.
+  - **One transient CDN-edge 403 silently degraded every decomposition
+    to the single-task fallback.** The decomposer's two prompt attempts
+    escalate OUTPUT QUALITY, not transport resilience — a single
+    transient gateway error returned `None` immediately. The decomposer
+    now burns a bounded transport retry budget first
+    (`transport_retries=4`, backoff 5/15/30/60s — sized to the
+    observed multi-minute gateway flaps) before the mandatory fallback;
+    definitive auth failures stay fail-fast. Pinned by
+    `test_transient_edge_403_is_retried_not_degraded` /
+    `test_transient_403_exhausting_budget_still_falls_back` /
+    `test_auth_failure_stays_fail_fast`.
+- **Approval boundary matrix** (service-level pins in
+  `tests/test_telegram_approval_buttons.py`, 18 tests): the ✖️ Reject
+  button runs the same durable pipeline as approve (plan → rejected,
+  one-shot consumption); forged callback_data is a loud error with zero
+  plan-state impact; a linked non-member is denied at the membership
+  gate and a read-only `viewer` member is denied at the per-action
+  permission check — both leave the token UNUSED for the legitimate
+  approver; expired tokens are rejected; replayed tokens are
+  idempotent; the outcome toast mapping is exact.
+- **Round-7 E2E driver**: profile gate (`E2E_PROFILE=approval |
+  decomposition | full`) splits the drive across 10-minute tool
+  windows with incremental JSONL evidence (`evidence-<profile>.jsonl`)
+  that survives a timeout kill; the P4c honesty fix (a "sent" failure
+  notice is a FAIL) and the P4d multi-task-graph assertion
+  (≥2 tasks, ALL completed) are shared predicates across profiles; the
+  actionable request is an analysis deliverable so every decomposed
+  task carries provider_response evidence (file-editing tasks fail
+  closed in this sandbox by GAP-3 design — no docker/firejail backend
+  — an environmental boundary, documented in the grade report).
+
 - **SSE-only provider gateway killed every conversational reply with
   granted tools** (live round-5 finding): `api.justwoker.icu` answers
   every `chat/completions` request that declares `tools` with

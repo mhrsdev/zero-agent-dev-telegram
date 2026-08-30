@@ -1,0 +1,21 @@
+{"phase": "P0 health", "ok": true, "detail": "{\"status\":\"ok\",\"version\":\"0.1.0\",\"environment\":\"development\",\"database\":\"ok\",\"migration_count\":34}", "profile": "approval"}
+{"phase": "P1 capabilities", "ok": true, "detail": "{\"environment\":\"development\",\"capabilities\":{\"database_backend\":{\"status\":\"available\",\"detail\":\"sqlite (file)\"},\"worktree_execution\":{\"status\":\"unavailable\",\"de", "profile": "approval"}
+{"phase": "P2a /start intake", "ok": true, "detail": "{\"id\":\"iev_dtc9wdia76ktyztpzwdo54n0\",\"project_id\":\"p_00qo0f4on5v8oz0y1hmk4014\",\"platform\":\"telegram\",\"external_event_id\"", "profile": "approval"}
+{"phase": "P2b /start welcome reply delivered", "ok": true, "detail": "rows=1 sendMessage_logged=True", "profile": "approval"}
+{"phase": "P3a actionable intake (attempt 1)", "ok": true, "detail": "", "profile": "approval"}
+{"phase": "P3b planner proposed + plan card with buttons sent", "ok": true, "detail": "revisions=1 tokens=2 card_sends_logged=2", "profile": "approval"}
+{"phase": "P4a callback approve accepted", "ok": true, "detail": "", "profile": "approval"}
+{"phase": "P4b plan approved via callback token", "ok": true, "detail": "approved_plans=1", "profile": "approval"}
+{"phase": "P4c' approve handoff created a real execution (scheduler engaged)", "ok": true, "detail": "execution row created, tasks=[{'id': 'task_fhvc46emup3t38v64h3lgk7a', 'state': 'running'}, {'id': 'task_cwqg7oo71f3sm9rtrrmhn8y0', 'state': 'pending'}, {'id': 'task_tlpoerwadymq1mzlyxk01d0v', 'state': 'ready'}, {'id': 'task_ep7swvhr1g11p5qpkfizg8q1', 'state': 'ready'}, {'id': 'task_spojex8if9sd2hq4w3jrndpt', 'state': 'ready'}]", "profile": "approval"}
+{"phase": "P4e button press acknowledged on real Bot API (answerCallbackQuery sent)", "ok": true, "detail": "answerCallbackQuery attempted x1 on real Bot API, statuses=['HTTP/1.1 400 Bad Request'] (synthetic query ids → 400 QUERY_ID_INVALID is the expected Telegram response; real client presses get 200 + toast)", "profile": "approval"}
+{"phase": "P4f-1 second actionable intake (for reject)", "ok": true, "detail": "", "profile": "approval"}
+{"phase": "P4f-2 second plan card with fresh reject button sent", "ok": true, "detail": "reject_tokens=1 card_sends=2", "profile": "approval"}
+{"phase": "P4f-3 callback reject accepted", "ok": true, "detail": "", "profile": "approval"}
+{"phase": "P4f-4 plan REJECTED via reject button (durable)", "ok": true, "detail": "plan 2 state='rejected' via REAL reject button", "profile": "approval"}
+{"phase": "P4f-5 reject press processed + answer sent to real Bot API", "ok": true, "detail": "durable=True answer_sent_to_real_bot_api=True", "profile": "approval"}
+{"phase": "P4g forged callback token rejected as error", "ok": true, "detail": "detail='callback token not found'", "profile": "approval"}
+{"phase": "P4h stranger (unlinked user) press denied at identity gate", "ok": true, "detail": "detail='external identity not linked or not verified'", "profile": "approval"}
+{"phase": "P4i replayed approve token is idempotent (no double approve)", "ok": true, "detail": "replay reported 'callback token already used (idempotent)'", "profile": "approval"}
+{"phase": "P7 web_search granted (real keyless backend verified separately)", "ok": true, "detail": "grants=1", "profile": "approval"}
+{"phase": "P8 MCP stdio server tool registered", "ok": true, "detail": "tools=['mcp_e2e_echo_add']", "profile": "approval"}
+{"phase": "P9 real Telegram polling identity", "ok": true, "detail": "@SandboxEnvironmentBot", "profile": "approval"}

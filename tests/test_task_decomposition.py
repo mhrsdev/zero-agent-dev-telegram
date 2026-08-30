@@ -15,6 +15,7 @@ from zero.app.task_decomposition import (
 from zero.app.worker_service import TaskSpec
 from zero.config import Settings
 from zero.domain.plans import PlanRevisionContent
+from zero.domain.providers import ProviderError
 from zero.persistence.connection import Database
 from zero.persistence.migrations import apply_migrations
 
@@ -252,6 +253,108 @@ class TestTaskDecomposer:
             model_name="fake-standard",
         )
         assert graph is None
+
+    def test_transient_edge_403_is_retried_not_degraded(self, services):
+        """Round-7 LIVE finding: ONE transient CDN edge 403 on the
+        decomposer's single provider call silently degraded every graph
+        to the single-task fallback. A transient error must burn the
+        bounded transport retry budget FIRST; an identical request then
+        succeeds and the REAL multi-task graph is produced."""
+        owner, project, _handoff, revision = _approved_revision(
+            services, idem="dec-transient-1"
+        )
+
+        class Flaky403(_ScriptedAdapter):
+            def __init__(self, content):
+                super().__init__(content)
+                self.failures_left = 1
+
+            def send_request(self, request, *, cancel_event=None, **_kwargs):
+                if self.failures_left > 0:
+                    self.failures_left -= 1
+                    raise ProviderError(
+                        "provider gateway edge protection blocked the request "
+                        "(transient CDN edge 403 with an empty body; identical "
+                        "requests succeed on retry)"
+                    )
+                return super().send_request(request, cancel_event=cancel_event)
+
+        adapter = Flaky403(VALID_GRAPH)
+        sleeps: list[float] = []
+        decomposer = TaskDecomposer(
+            providers=adapter, transport_retries=2, sleeper=sleeps.append
+        )
+        graph = decomposer.decompose(
+            project_id=project.id,
+            actor_id=owner.id,
+            revision_id=revision.id.value,
+            revision_content=revision.content,
+            provider="fake",
+            model_name="fake-standard",
+        )
+        assert graph is not None and len(graph.specs) == 3
+        assert adapter.calls == 1  # the successful call
+        assert sleeps == [5.0]  # bounded backoff before the retry
+
+    def test_transient_403_exhausting_budget_still_falls_back(self, services):
+        """When EVERY transport retry also fails transiently, the
+        mandatory single-task fallback still applies (never raises)."""
+        owner, project, _handoff, revision = _approved_revision(
+            services, idem="dec-transient-2"
+        )
+
+        class Always403(_ScriptedAdapter):
+            def send_request(self, request, *, cancel_event=None, **_kwargs):
+                raise ProviderError(
+                    "provider gateway edge protection blocked the request "
+                    "(transient CDN edge 403 with an empty body; identical "
+                    "requests succeed on retry)"
+                )
+
+        sleeps: list[float] = []
+        decomposer = TaskDecomposer(
+            providers=Always403(VALID_GRAPH),
+            transport_retries=2,
+            sleeper=sleeps.append,
+        )
+        graph = decomposer.decompose(
+            project_id=project.id,
+            actor_id=owner.id,
+            revision_id=revision.id.value,
+            revision_content=revision.content,
+            provider="fake",
+            model_name="fake-standard",
+        )
+        assert graph is None
+        assert sleeps == [5.0, 15.0]  # budget fully burned, bounded backoff
+
+    def test_auth_failure_stays_fail_fast(self, services):
+        """A definitive 401/403 auth rejection must NOT burn the transport
+        budget — retrying cannot fix a bad key."""
+        owner, project, _handoff, revision = _approved_revision(
+            services, idem="dec-auth-1"
+        )
+
+        class AuthFailed(_ScriptedAdapter):
+            def send_request(self, request, *, cancel_event=None, **_kwargs):
+                raise ProviderError("provider auth failed with status 401")
+
+        sleeps: list[float] = []
+        decomposer = TaskDecomposer(
+            providers=AuthFailed(VALID_GRAPH),
+            transport_retries=2,
+            sleeper=sleeps.append,
+        )
+        graph = decomposer.decompose(
+            project_id=project.id,
+            actor_id=owner.id,
+            revision_id=revision.id.value,
+            revision_content=revision.content,
+            provider="fake",
+            model_name="fake-standard",
+        )
+        assert graph is None
+        assert sleeps == []  # no transport retries for definitive rejections
 
 
 class TestSchedulerIntegration:

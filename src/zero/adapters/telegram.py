@@ -28,6 +28,31 @@ from .telegram_render import chunk_telegram_text, render_telegram_html
 logger = logging.getLogger(__name__)
 
 
+def _callback_outcome_text(result: Any) -> str:
+    """Map a dispatch result onto the button-press toast text.
+
+    Hermes parity (``test_telegram_approval_buttons.py`` asserts the
+    answer TEXT): the Telegram client shows this string as a toast on
+    the pressed button, so it must say what HAPPENED — not just stop
+    the spinner. The dispatch result is the durable event log entry
+    (``processing_result`` + ``processing_detail``); unknown shapes
+    degrade to a neutral acknowledgment.
+    """
+    outcome = str(getattr(result, "processing_result", "") or "")
+    detail = str(getattr(result, "processing_detail", "") or "").lower()
+    if outcome == "processed":
+        if "approve" in detail:
+            return "✅ Plan approved"
+        if "reject" in detail:
+            return "✖️ Plan rejected"
+        return "✅ Done"
+    if outcome == "denied":
+        return "⛔ Not allowed"
+    if outcome == "error":
+        return "⚠️ Failed — see logs"
+    return "✅ Done"
+
+
 def _extract_media(message: Mapping[str, Any]) -> list[MediaAttachment]:
     """Pull media references off a raw Telegram message payload.
 
@@ -191,6 +216,9 @@ class TelegramAdapter(BaseMessagingAdapter):
                 event_kind="callback_query",
                 content=str(data or ""),
                 callback_token=str(data) if data is not None else None,
+                callback_query_id=(
+                    str(callback["id"]) if callback.get("id") is not None else None
+                ),
             )
         if not isinstance(message, Mapping):
             return None
@@ -245,22 +273,66 @@ class TelegramAdapter(BaseMessagingAdapter):
         event = self.normalize_update(update)
         if event is None:
             return None
-        callback = update.get("callback_query")
+        try:
+            result = self._dispatch(event)
+        except Exception:
+            # A crashed dispatch must still stop the client's spinner —
+            # answer with an honest failure toast, then re-raise so the
+            # intake boundary records the exception as before.
+            self._answer_callback_failure(event)
+            raise
+        self._answer_callback_outcome(event, result)
+        return result
+
+    def _answer_callback(self, event: NormalizedEvent, text: str) -> None:
+        """Answer a button press ONCE with an explicit toast text.
+
+        Best-effort in the STRONGEST sense: the durable event log remains
+        authoritative, and NO answer failure may ever break intake —
+        including a real Bot API 400 (``QUERY_ID_INVALID``) for a stale
+        or already-answered query, which surfaces as a plain RuntimeError
+        from ``_call_api`` (ok=false), NOT as an AdapterError. Letting it
+        escape killed the whole polling worker (round-7 live finding) —
+        one expired button press would have taken the bot offline.
+        An adapter WITHOUT a bot token (the webhook composition holds
+        none — tokens are per-binding secrets) must SKIP instead: the
+        transport service owns the webhook-path answer
+        (``_answer_callback_for_binding``), while token-holding adapters
+        (the polling worker) answer inline.
+        """
         if (
-            callback
-            and self._acknowledge_callbacks
-            and self._transport is not None
-            and isinstance(callback, Mapping)
-            and callback.get("id") is not None
+            not self._acknowledge_callbacks
+            or event.event_kind != "callback_query"
+            or not event.callback_query_id
+            or self._transport is None
+            or not self._bot_token
         ):
-            # A callback acknowledgement must be attempted before slow domain
-            # work. It remains best-effort because the durable event is still
-            # authoritative if Telegram is unavailable.
-            try:
-                self.answer_callback_query(str(callback["id"]))
-            except AdapterError as exc:
-                logger.debug("Telegram callback acknowledgement failed: %s", type(exc).__name__)
-        return self._dispatch(event)
+            return
+        try:
+            self.answer_callback_query(event.callback_query_id, text=text)
+        except Exception as exc:  # noqa: BLE001 - acknowledgement is best-effort
+            logger.debug(
+                "Telegram callback acknowledgement skipped: %s", type(exc).__name__
+            )
+
+    def _answer_callback_outcome(self, event: NormalizedEvent, result: Any) -> None:
+        """Answer a button press AFTER processing, with the outcome.
+
+        Hermes parity (``test_telegram_approval_buttons.py``): every
+        callback query is answered with visible feedback — success,
+        denial, or failure — so the Telegram client never leaves the
+        loading clock spinning on the button. Both intake paths (webhook
+        and polling) share this single acknowledge point.
+        """
+        self._answer_callback(event, _callback_outcome_text(result))
+
+    def _answer_callback_failure(self, event: NormalizedEvent) -> None:
+        """Answer a press whose processing CRASHED, honestly.
+
+        The spinner must stop on EVERY path — including exceptions —
+        with feedback that does not pretend success.
+        """
+        self._answer_callback(event, "⚠️ Failed — see logs")
 
     def _api_url(self, method: str) -> str:
         if not self._bot_token:
@@ -462,7 +534,19 @@ class TelegramAdapter(BaseMessagingAdapter):
                 logger.warning("Telegram polling skipped malformed update: %s", type(exc).__name__)
                 continue
             if event is not None:
-                result = self._dispatch(event)
+                try:
+                    result = self._dispatch(event)
+                except Exception:
+                    # A crashed dispatch must still stop the client's
+                    # spinner (same invariant as the webhook path).
+                    self._answer_callback_failure(event)
+                    raise
+                # Hermes parity: a button press that arrives via POLLING
+                # gets the same outcome feedback as one arriving via
+                # webhook — otherwise the client shows a loading clock
+                # on the pressed button until Telegram times the query
+                # out (~10s) with no feedback at all.
+                self._answer_callback_outcome(event, result)
                 if getattr(result, "processing_result", None) == "error":
                     # The durable event log already captured the failure and
                     # this update owns a durable offset. Record it and advance

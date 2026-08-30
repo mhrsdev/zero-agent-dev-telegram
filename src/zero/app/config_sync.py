@@ -614,6 +614,27 @@ def _sync_planner(services: Services, cfg) -> None:
             primary,
         )
 
+    # Round-7 live fix: the SCHEDULER TICK (task execution + LLM
+    # decomposition) also resolved its model from ``settings.openai_model``
+    # — the routing table never reached the tasks. The operator's gateway
+    # then stopped serving the gpt-4o-mini default outright (every
+    # decomposition/task call died with a CDN-edge 403 while the aligned
+    # planner and chat kept succeeding), so approved plans could never
+    # execute. Pin the tick to the SAME routing truth.
+    scheduler = getattr(services, "scheduler", None)
+    if scheduler is not None:
+        scheduler.set_tick_routing(
+            provider=(
+                "anthropic" if provider_protocol == "anthropic" else "openai-compatible"
+            ),
+            model_name=primary,
+        )
+        logger.info(
+            "config sync: scheduler tick (tasks + decomposition) aligned "
+            "with routing.primary_model=%s",
+            primary,
+        )
+
 
 def _ensure_web_search_tool(services: Services, project, owner_id) -> None:
     """Make the keyless ``web_search`` tool real and granted (round 5).

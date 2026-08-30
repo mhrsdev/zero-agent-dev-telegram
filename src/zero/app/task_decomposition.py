@@ -51,6 +51,24 @@ _SUPPORTED_EVIDENCE_LABELS = frozenset(
     }
 )
 
+#: Transient provider failures that a bounded same-prompt retry can
+#: survive (round-7 live finding: ONE CDN edge 403 on the decomposer's
+#: single provider call silently degraded every graph to the single-task
+#: fallback — the two prompt attempts escalate OUTPUT QUALITY, they are
+#: not transport retries). Auth failures and malformed provider output
+#: stay fail-fast: retrying cannot fix them.
+_TRANSIENT_PROVIDER_MARKERS = (
+    "transient CDN edge 403",
+    "provider temporarily unavailable",
+    "provider rate limit hit",
+)
+
+
+def _is_transient_provider_error(exc: BaseException) -> bool:
+    """True for gateway/edge classes where an identical retry succeeds."""
+    text = str(exc)
+    return any(marker in text for marker in _TRANSIENT_PROVIDER_MARKERS)
+
 logger = logging.getLogger(__name__)
 
 MAX_TASKS = 256
@@ -613,10 +631,28 @@ class TaskDecomposer:
     instead of hiding in log lines.
     """
 
-    def __init__(self, *, providers, analytics=None) -> None:
+    def __init__(
+        self,
+        *,
+        providers,
+        analytics=None,
+        transport_retries: int = 4,
+        sleeper=time.sleep,
+        retry_backoff_seconds: tuple[float, ...] = (5.0, 15.0, 30.0, 60.0),
+    ) -> None:
         self._providers = providers
         self._analytics = analytics
         self._cache: dict[str, DecompositionGraph | None] = {}
+        # Bounded transport retry budget for TRANSIENT gateway classes
+        # (CDN edge 403 / 429 / 503). 0 keeps the historical fail-fast.
+        # The backoff curve spans ~110s: the operator's gateway flaps in
+        # multi-minute 403 storms (round-7 live evidence), so second-
+        # scale retries never outlive one.
+        self._transport_retries = max(0, int(transport_retries))
+        self._retry_backoff = tuple(
+            max(0.0, float(s)) for s in retry_backoff_seconds
+        ) or (5.0,)
+        self._sleeper = sleeper
 
     def decompose(
         self,
@@ -774,53 +810,86 @@ class TaskDecomposer:
                 tool_choice={"type": "function", "name": DECOMPOSITION_TOOL_NAME},
                 system_message=system_prompt,
             )
-            try:
-                _request, response = self._providers.send_request(
-                    project_id=project_id,
-                    actor_id=actor_id,
-                    request=request,
-                    idempotency_key=f"decompose:{revision_id}:t{attempt_index}",
-                    source=source,
-                )
-            except ValueError as exc:
-                if "native tools" in str(exc):
-                    # Registered model lacks the native_tools capability;
-                    # forcing would fail every time. Degrade once to the
-                    # legacy text contract instead of burning attempts.
-                    logger.info(
-                        "task decomposition: model %s:%s lacks native tools; "
-                        "using legacy text path for revision %s",
-                        provider,
-                        model_name,
-                        revision_id,
+            transport_attempt = 0
+            while True:
+                try:
+                    _request, response = self._providers.send_request(
+                        project_id=project_id,
+                        actor_id=actor_id,
+                        request=request,
+                        idempotency_key=f"decompose:{revision_id}:t{attempt_index}",
+                        source=source,
                     )
-                    native_unsupported = True
                     break
-                raise
-            except Exception as exc:  # noqa: BLE001 - fallback is mandatory behavior
-                rejection = _forced_tool_choice_rejection_reason(exc)
-                if rejection is not None:
-                    # The gateway itself refused the forced tool-call
-                    # shape (non-transient 4xx). One silent degradation
-                    # keeps decomposition alive there; never re-send the
-                    # same poison payload.
-                    logger.info(
-                        "task decomposition: provider rejected forced tool-call "
-                        "(%s); using legacy text path for revision %s",
-                        rejection,
+                except ValueError as exc:
+                    if "native tools" in str(exc):
+                        # Registered model lacks the native_tools capability;
+                        # forcing would fail every time. Degrade once to the
+                        # legacy text contract instead of burning attempts.
+                        logger.info(
+                            "task decomposition: model %s:%s lacks native tools; "
+                            "using legacy text path for revision %s",
+                            provider,
+                            model_name,
+                            revision_id,
+                        )
+                        native_unsupported = True
+                        break
+                    raise
+                except Exception as exc:  # noqa: BLE001 - fallback is mandatory behavior
+                    rejection = _forced_tool_choice_rejection_reason(exc)
+                    if rejection is not None:
+                        # The gateway itself refused the forced tool-call
+                        # shape (non-transient 4xx). One silent degradation
+                        # keeps decomposition alive there; never re-send the
+                        # same poison payload.
+                        logger.info(
+                            "task decomposition: provider rejected forced tool-call "
+                            "(%s); using legacy text path for revision %s",
+                            rejection,
+                            revision_id,
+                        )
+                        native_unsupported = True
+                        break
+                    if (
+                        _is_transient_provider_error(exc)
+                        and transport_attempt < self._transport_retries
+                    ):
+                        # Round-7 fix: a transient CDN edge 403 / 429 / 503
+                        # used to silently degrade the graph to the
+                        # single-task fallback — the prompt attempts are
+                        # output-quality escalation, NOT transport
+                        # retries. Burn the bounded transport budget
+                        # first; an identical request verifiably succeeds
+                        # seconds later on this gateway.
+                        transport_attempt += 1
+                        backoff = self._retry_backoff[
+                            min(transport_attempt - 1, len(self._retry_backoff) - 1)
+                        ]
+                        self._sleeper(backoff)
+                        logger.warning(
+                            "task decomposition: transient provider error "
+                            "(transport retry %d/%d) for revision %s: %s: %s",
+                            transport_attempt,
+                            self._transport_retries,
+                            revision_id,
+                            type(exc).__name__,
+                            redact_sensitive_text(str(exc))[:200] or "<no detail>",
+                        )
+                        continue
+                    logger.warning(
+                        "task decomposition provider call failed (attempt %d) for revision %s: %s: %s",
+                        attempt_index,
                         revision_id,
+                        type(exc).__name__,
+                        redact_sensitive_text(str(exc))[:300] or "<no detail>",
                     )
-                    native_unsupported = True
-                    break
-                logger.warning(
-                    "task decomposition provider call failed (attempt %d) for revision %s: %s: %s",
-                    attempt_index,
-                    revision_id,
-                    type(exc).__name__,
-                    redact_sensitive_text(str(exc))[:300] or "<no detail>",
-                )
-                meta["outcome"] = OUTCOME_TRANSPORT_ERROR
-                return None, meta
+                    meta["outcome"] = OUTCOME_TRANSPORT_ERROR
+                    return None, meta
+            if native_unsupported:
+                # The degrade paths above broke the TRANSPORT retry loop;
+                # escalate out of the prompt loop to the legacy text path.
+                break
             meta["attempts"] = attempt_index
             tasks = extract_task_graph_payload(response)
             graph = None

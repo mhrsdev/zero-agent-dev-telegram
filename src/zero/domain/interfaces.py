@@ -266,6 +266,13 @@ class NormalizedEvent:
             message (Hermes reply-anchoring parity).
         reply_to_message_id: the platform message ID this event replies
             to, when the sender threaded it.
+        callback_query_id: the platform's callback-query acknowledgment
+            id (Telegram ``callback_query.id``). Hermes answers every
+            button press with visible outcome feedback
+            (``query.answer(text=...)``); carrying the id on the
+            envelope lets BOTH intake paths — webhook and polling —
+            acknowledge the press once, after processing, with the
+            outcome text.
     """
 
     platform: Platform
@@ -281,6 +288,7 @@ class NormalizedEvent:
     media: tuple[MediaAttachment, ...] = ()
     message_id: str | None = None
     reply_to_message_id: str | None = None
+    callback_query_id: str | None = None
 
 
 # ----------------------------------------------------------------------

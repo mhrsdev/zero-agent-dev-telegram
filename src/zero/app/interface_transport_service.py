@@ -20,7 +20,7 @@ from zero.adapters.messaging import (
     RetryPolicy,
     TransportError,
 )
-from zero.adapters.telegram import TelegramAdapter
+from zero.adapters.telegram import TelegramAdapter, _callback_outcome_text
 from zero.app.secret_service import SecretService
 from zero.config import Settings
 from zero.domain.identity import ProjectId, UserId
@@ -124,7 +124,79 @@ class InterfaceTransportService:
         ):
             raise InterfaceScopeError("webhook payload does not match interface binding")
 
-        return adapter.handle_webhook(body, headers=headers)  # type: ignore[union-attr]
+        # Round-7 fix (inline keyboard FULLY): the webhook adapter holds
+        # NO bot credential — tokens are per-binding secrets resolved at
+        # action time — so the adapter's own answer attempt can never
+        # reach the Bot API. The transport service owns the webhook-path
+        # acknowledgement: after the durable dispatch, resolve the
+        # binding's token and answer the press with the outcome toast
+        # (Hermes ``query.answer(text=...)`` parity). The crash path is
+        # answered too, then the exception propagates unchanged.
+        try:
+            result = adapter.handle_webhook(body, headers=headers)  # type: ignore[union-attr]
+        except Exception:
+            self._answer_callback_for_binding(
+                platform=platform,
+                binding=binding,
+                event=event,
+                result=None,
+                failed=True,
+            )
+            raise
+        self._answer_callback_for_binding(
+            platform=platform, binding=binding, event=event, result=result
+        )
+        return result
+
+    def _answer_callback_for_binding(
+        self,
+        *,
+        platform: Platform,
+        binding,
+        event,
+        result: Any,
+        failed: bool = False,
+    ) -> None:
+        """Answer a webhook-delivered button press with its outcome.
+
+        Best-effort (mirrors send_typing): any failure — missing
+        credential, disabled binding, provider hiccup — is swallowed at
+        DEBUG because the durable event log remains authoritative.
+        Presses from UNRESOLVED actors (strangers denied at the identity
+        gate have ``resolved_user_id=None``) are not answered — the
+        durable denial is the authoritative record and the Telegram
+        client clears its own spinner after the query timeout.
+        """
+        if platform != "telegram" or event is None:
+            return
+        if event.event_kind != "callback_query" or not event.callback_query_id:
+            return
+        if self._secret_service is None or self._transport is None:
+            return
+        actor_id = getattr(result, "resolved_user_id", None)
+        if actor_id is None:
+            logger.debug(
+                "callback answer skipped: press has no resolved actor "
+                "(callback_query_id=%s)",
+                event.callback_query_id,
+            )
+            return
+        text = (
+            "⚠️ Failed — see logs" if failed else _callback_outcome_text(result)
+        )
+        try:
+            answerer = self.build_telegram_adapter(
+                project_id=binding.project_id,
+                binding_id=binding.id,
+                actor_id=actor_id,
+            )
+            answerer.answer_callback_query(event.callback_query_id, text=text)
+        except Exception as exc:  # noqa: BLE001 - acknowledgement is best-effort
+            logger.debug(
+                "callback answer skipped: %s (callback_query_id=%s)",
+                type(exc).__name__,
+                event.callback_query_id,
+            )
 
     def send_message(
         self,

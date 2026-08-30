@@ -21,7 +21,8 @@ HOME = Path("/home/z/my-project/zero-e2e-home")
 DB_PATH = HOME / "e2e.db"
 SECRET_KEY = "e" * 64
 
-PROVIDER_BASE = "https://api.justwoker.icu/v1"
+import os as _os
+PROVIDER_BASE = _os.environ.get("E2E_PROVIDER_BASE", "https://api.justwoker.icu/v1")
 PROVIDER_KEY = "sk-BlwjB2GhsGBwFLjQBBAhKK7FpmfJYP9usqGfrImaLaA1JOKW"
 PROVIDER_MODEL = "claude-opus-5"
 BOT_TOKEN = "8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8"
@@ -127,6 +128,14 @@ def main() -> int:
         external_username="e2e_owner",
         verified=True,
     )
+
+    # NOTE (round-7): NO repository is registered on the e2e project.
+    # Registering one makes EVERY task workspace-bound (repository_id is
+    # not None → worktree creation → git commands), and command execution
+    # is architecturally unavailable in this sandbox (GAP-3 fail-closed:
+    # no docker/firejail isolation backend). With no repository, tasks
+    # carrying provider_response evidence run the real agent loop while
+    # file-editing tasks fail closed — the honest environmental boundary.
 
     print(
         json.dumps(

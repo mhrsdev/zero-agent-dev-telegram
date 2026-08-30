@@ -56,7 +56,12 @@ def main() -> int:
             cwd=str(REPO),
             capture_output=True,
             text=True,
-            timeout=600,
+            # Round 7: the drive now includes the FULL approval boundary
+            # matrix (second actionable intake + reject + forged token +
+            # stranger + replay) on top of the real execution/decomposition
+            # waits — 600s was too tight for two real planner runs plus a
+            # real multi-task agent execution.
+            timeout=1800,
         )
         tail = (drive.stdout or "").splitlines()[-30:]
         print("\n".join(tail), flush=True)

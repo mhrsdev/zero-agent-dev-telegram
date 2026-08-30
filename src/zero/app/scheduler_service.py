@@ -106,6 +106,16 @@ class SchedulerService:
         if decomposition_enabled is None:
             decomposition_enabled = _env_flag("ZERO_DECOMPOSITION_ENABLED")
         self._decomposition_enabled = bool(decomposition_enabled)
+        # Round-7 routing alignment seam: the tick's LLM routing (task
+        # execution + decomposition) used to come from
+        # ``settings.openai_model`` (gpt-4o-mini default) — the routing
+        # table never reached the tasks. config_sync now overrides this
+        # with ``routing.primary_model`` at boot (live evidence: the
+        # operator's gateway stopped serving the gpt-4o-mini default
+        # outright — every task/decomposition call edge-403'd — while
+        # the aligned planner and chat bridge kept working).
+        self._tick_provider: str | None = None
+        self._tick_model: str | None = None
         # GAP 8b/G3 (Hermes segment-planning lite): bounded cross-execution
         # parallelism inside one tick. Independent executions (separate
         # plans) dispatch concurrently; within a single execution the
@@ -206,6 +216,20 @@ class SchedulerService:
         except Exception:
             logger.warning("could not resolve default agent type", exc_info=True)
         return None
+
+    def set_tick_routing(self, *, provider: str, model_name: str) -> None:
+        """config_sync alignment seam: pin the tick's LLM routing.
+
+        Every scheduler-driven LLM call (decomposition, task execution)
+        must call exactly the model the operator configured in
+        ``routing.primary_model`` — one routing truth, Hermes parity.
+        """
+        self._tick_provider = provider
+        self._tick_model = model_name
+
+    def tick_routing_override(self) -> tuple[str | None, str | None]:
+        """(provider, model) pinned by config_sync, or (None, None)."""
+        return self._tick_provider, self._tick_model
 
     @staticmethod
     def _retry_delay_elapsed(task: Task, *, now: datetime | None = None) -> bool:

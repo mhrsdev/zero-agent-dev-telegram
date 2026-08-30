@@ -1,74 +1,54 @@
-2026-08-29T17:43:21Z INFO zero.app.services MCP extension tools registered: ['mcp_e2e_echo_add']
-2026-08-29T17:43:22Z INFO zero.app.services conversational chat bridge wired (provider=openai-compatible, model=gpt-4o-mini) — non-actionable chat now answers in the chat
-2026-08-29T17:43:22Z INFO zero.app.config_sync config sync: registered provider primary-llm (openai-compatible, base_url=https://api.justwoker.icu/v1)
-2026-08-29T17:43:22Z INFO zero.app.config_sync config sync: created telegram binding for chat -1004406039396
-2026-08-29T17:43:22Z INFO zero.app.config_sync config sync: planner wired (provider=openai-compatible, model=claude-opus-5)
-2026-08-29T17:43:22Z INFO zero.app.config_sync config sync: conversational chat bridge aligned with routing.primary_model=claude-opus-5
-2026-08-29T17:43:22Z INFO zero.app.config_sync config sync: web_search tool registered (id=tool_3jmdxivlqyyf2bn9389ubowl)
-2026-08-29T17:43:22Z INFO zero.app.config_sync config sync: web_search granted to main_worker (project p_p5nqn4al08651z4skgzzyrsb)
-2026-08-29T17:43:22Z INFO zero.app.config_sync config sync: auto-link-owner enabled for project p_p5nqn4al08651z4skgzzyrsb (first sender becomes the owner)
-INFO:     Started server process [15260]
+2026-08-29T23:09:09Z INFO zero.app.services MCP extension tools registered: ['mcp_e2e_echo_add']
+2026-08-29T23:09:09Z INFO zero.app.services conversational chat bridge wired (provider=openai-compatible, model=gpt-4o-mini) — non-actionable chat now answers in the chat
+2026-08-29T23:09:09Z INFO zero.app.config_sync config sync: registered provider primary-llm (openai-compatible, base_url=https://api.justwoker.icu/v1)
+2026-08-29T23:09:09Z INFO zero.app.config_sync config sync: created telegram binding for chat -1004406039396
+2026-08-29T23:09:09Z INFO zero.app.config_sync config sync: planner wired (provider=openai-compatible, model=claude-opus-5)
+2026-08-29T23:09:09Z INFO zero.app.config_sync config sync: conversational chat bridge aligned with routing.primary_model=claude-opus-5
+2026-08-29T23:09:09Z INFO zero.app.config_sync config sync: scheduler tick (tasks + decomposition) aligned with routing.primary_model=claude-opus-5
+2026-08-29T23:09:09Z INFO zero.app.config_sync config sync: web_search tool registered (id=tool_2idqpcp0ci2y33hdatewbpq0)
+2026-08-29T23:09:09Z INFO zero.app.config_sync config sync: web_search granted to main_worker (project p_00qo0f4on5v8oz0y1hmk4014)
+2026-08-29T23:09:09Z INFO zero.app.config_sync config sync: auto-link-owner enabled for project p_00qo0f4on5v8oz0y1hmk4014 (first sender becomes the owner)
+INFO:     Started server process [19879]
 INFO:     Waiting for application startup.
-2026-08-29T17:43:22Z INFO zero.workers background workers started
+2026-08-29T23:09:09Z INFO zero.workers background workers started
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8010 (Press CTRL+C to quit)
-2026-08-29T17:43:22Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/getUpdates "HTTP/1.1 200 OK"
-INFO:     127.0.0.1:46716 - "GET /healthz HTTP/1.1" 200 OK
-2026-08-29T17:44:09Z INFO zero.app.services MCP extension tools registered: ['mcp_e2e_echo_add']
-2026-08-29T17:44:09Z INFO zero.app.services conversational chat bridge wired (provider=openai-compatible, model=gpt-4o-mini) — non-actionable chat now answers in the chat
-2026-08-29T17:44:09Z INFO zero.app.config_sync config sync: registered provider primary-llm (openai-compatible, base_url=https://api.justwoker.icu/v1)
-2026-08-29T17:44:09Z INFO zero.app.config_sync config sync: planner wired (provider=openai-compatible, model=claude-opus-5)
-2026-08-29T17:44:09Z INFO zero.app.config_sync config sync: conversational chat bridge aligned with routing.primary_model=claude-opus-5
-2026-08-29T17:44:09Z INFO zero.app.config_sync config sync: auto-link-owner enabled for project p_p5nqn4al08651z4skgzzyrsb (first sender becomes the owner)
-INFO:     Started server process [15321]
-INFO:     Waiting for application startup.
-2026-08-29T17:44:09Z INFO zero.workers background workers started
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8010 (Press CTRL+C to quit)
-INFO:     127.0.0.1:58252 - "GET /healthz HTTP/1.1" 200 OK
-INFO:     127.0.0.1:58264 - "GET /healthz HTTP/1.1" 200 OK
-INFO:     127.0.0.1:58274 - "GET /capabilities HTTP/1.1" 200 OK
-2026-08-29T17:44:10Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 200 OK"
-INFO:     127.0.0.1:58276 - "POST /webhooks/telegram/p_p5nqn4al08651z4skgzzyrsb/ib_hpodsvhyrfpfwkcch2jj7tv7 HTTP/1.1" 200 OK
-2026-08-29T17:44:10Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/getUpdates "HTTP/1.1 200 OK"
-2026-08-29T17:44:20Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
-2026-08-29T17:44:21Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendChatAction "HTTP/1.1 200 OK"
-2026-08-29T17:44:22Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
-2026-08-29T17:44:23Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 200 OK"
-2026-08-29T17:44:31Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
-2026-08-29T17:44:31Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 400 Bad Request"
-2026-08-29T17:44:31Z WARNING zero.adapters.telegram Telegram rejected the reply anchor (400) — re-sending the chunk without it (thread-not-found fallback)
-2026-08-29T17:44:32Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 200 OK"
-INFO:     127.0.0.1:58280 - "POST /webhooks/telegram/p_p5nqn4al08651z4skgzzyrsb/ib_hpodsvhyrfpfwkcch2jj7tv7 HTTP/1.1" 200 OK
-INFO:     127.0.0.1:38706 - "POST /webhooks/telegram/p_p5nqn4al08651z4skgzzyrsb/ib_hpodsvhyrfpfwkcch2jj7tv7 HTTP/1.1" 200 OK
-2026-08-29T17:44:34Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 403 Forbidden"
-2026-08-29T17:44:35Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 403 Forbidden"
-2026-08-29T17:44:35Z WARNING zero.app.task_decomposition task decomposition provider call failed (attempt 1) for revision pr_yyc67odv8nkxjxsi12x8urdp: ProviderError: provider gateway edge protection blocked the request (transient CDN edge 403 with an empty body; identical requests succeed on retry)
-2026-08-29T17:44:36Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 403 Forbidden"
-2026-08-29T17:44:36Z WARNING zero.app.agent_runtime ready task task_gul31pl1nonrndhmzzds3yf0 in execution exec_kar0b1jig7uvxtyd5art7191 failed without blocking siblings: provider HTTP request failed with status 403
-2026-08-29T17:44:36Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 200 OK"
-2026-08-29T17:44:42Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
-2026-08-29T17:44:42Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendChatAction "HTTP/1.1 200 OK"
-2026-08-29T17:44:43Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
-2026-08-29T17:44:44Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 400 Bad Request"
-2026-08-29T17:44:44Z WARNING zero.adapters.telegram Telegram rejected the reply anchor (400) — re-sending the chunk without it (thread-not-found fallback)
-2026-08-29T17:44:44Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 200 OK"
-INFO:     127.0.0.1:38708 - "POST /webhooks/telegram/p_p5nqn4al08651z4skgzzyrsb/ib_hpodsvhyrfpfwkcch2jj7tv7 HTTP/1.1" 200 OK
-2026-08-29T17:44:45Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
-2026-08-29T17:44:45Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/getMe "HTTP/1.1 200 OK"
-2026-08-29T17:44:45Z INFO zero.workers polling:ib_hpodsvhyrfpfwkcch2jj7tv7: Telegram bot online: @SandboxEnvironmentBot (id=8753924431)
-2026-08-29T17:44:45Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/getUpdates "HTTP/1.1 200 OK"
-2026-08-29T17:44:54Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
-2026-08-29T17:44:55Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendChatAction "HTTP/1.1 200 OK"
-2026-08-29T17:44:55Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/getFile "HTTP/1.1 400 Bad Request"
-2026-08-29T17:44:55Z INFO zero.app.telegram_chat document download failed: PermanentTransportError
-2026-08-29T17:44:56Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
-2026-08-29T17:44:56Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 400 Bad Request"
-2026-08-29T17:44:56Z WARNING zero.adapters.telegram Telegram rejected the reply anchor (400) — re-sending the chunk without it (thread-not-found fallback)
-2026-08-29T17:44:57Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 200 OK"
-INFO:     127.0.0.1:38316 - "POST /webhooks/telegram/p_p5nqn4al08651z4skgzzyrsb/ib_hpodsvhyrfpfwkcch2jj7tv7 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37758 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37766 - "GET /healthz HTTP/1.1" 200 OK
+INFO:     127.0.0.1:37778 - "GET /capabilities HTTP/1.1" 200 OK
+2026-08-29T23:09:11Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 200 OK"
+INFO:     127.0.0.1:37788 - "POST /webhooks/telegram/p_00qo0f4on5v8oz0y1hmk4014/ib_0sdh4tmrs2u4me9kcobp81jy HTTP/1.1" 200 OK
+2026-08-29T23:09:34Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/getUpdates "HTTP/1.1 200 OK"
+2026-08-29T23:09:35Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/getMe "HTTP/1.1 200 OK"
+2026-08-29T23:09:35Z INFO zero.workers polling:ib_0sdh4tmrs2u4me9kcobp81jy: Telegram bot online: @SandboxEnvironmentBot (id=8753924431)
+2026-08-29T23:09:45Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-29T23:09:46Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 400 Bad Request"
+2026-08-29T23:09:46Z WARNING zero.adapters.telegram Telegram rejected the reply anchor (400) — re-sending the chunk without it (thread-not-found fallback)
+2026-08-29T23:09:46Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 200 OK"
+INFO:     127.0.0.1:37796 - "POST /webhooks/telegram/p_00qo0f4on5v8oz0y1hmk4014/ib_0sdh4tmrs2u4me9kcobp81jy HTTP/1.1" 200 OK
+2026-08-29T23:09:46Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/answerCallbackQuery "HTTP/1.1 400 Bad Request"
+INFO:     127.0.0.1:53532 - "POST /webhooks/telegram/p_00qo0f4on5v8oz0y1hmk4014/ib_0sdh4tmrs2u4me9kcobp81jy HTTP/1.1" 200 OK
+2026-08-29T23:10:01Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/getUpdates "HTTP/1.1 200 OK"
+2026-08-29T23:10:09Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-29T23:10:09Z INFO zero.app.scheduler_service plan revision pr_zlbgp8fo88hxfsqqnqchdy74 decomposed into 11 tasks / 15 edges
+2026-08-29T23:10:11Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-29T23:10:25Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-29T23:10:27Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/getUpdates "HTTP/1.1 200 OK"
+2026-08-29T23:10:30Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-29T23:10:31Z INFO httpx HTTP Request: POST https://api.justwoker.icu/v1/chat/completions "HTTP/1.1 200 OK"
+2026-08-29T23:10:32Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 400 Bad Request"
+2026-08-29T23:10:32Z WARNING zero.adapters.telegram Telegram rejected the reply anchor (400) — re-sending the chunk without it (thread-not-found fallback)
+2026-08-29T23:10:32Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/sendMessage "HTTP/1.1 200 OK"
+INFO:     127.0.0.1:39142 - "POST /webhooks/telegram/p_00qo0f4on5v8oz0y1hmk4014/ib_0sdh4tmrs2u4me9kcobp81jy HTTP/1.1" 200 OK
+2026-08-29T23:10:32Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/answerCallbackQuery "HTTP/1.1 400 Bad Request"
+INFO:     127.0.0.1:47432 - "POST /webhooks/telegram/p_00qo0f4on5v8oz0y1hmk4014/ib_0sdh4tmrs2u4me9kcobp81jy HTTP/1.1" 200 OK
+2026-08-29T23:10:32Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/answerCallbackQuery "HTTP/1.1 400 Bad Request"
+INFO:     127.0.0.1:47438 - "POST /webhooks/telegram/p_00qo0f4on5v8oz0y1hmk4014/ib_0sdh4tmrs2u4me9kcobp81jy HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47452 - "POST /webhooks/telegram/p_00qo0f4on5v8oz0y1hmk4014/ib_0sdh4tmrs2u4me9kcobp81jy HTTP/1.1" 200 OK
+2026-08-29T23:10:33Z INFO httpx HTTP Request: POST https://api.telegram.org/bot8753924431:AAHc3lP-lVFqSuFhm1qMgkqoQqkLVEsOEb8/answerCallbackQuery "HTTP/1.1 400 Bad Request"
+INFO:     127.0.0.1:47456 - "POST /webhooks/telegram/p_00qo0f4on5v8oz0y1hmk4014/ib_0sdh4tmrs2u4me9kcobp81jy HTTP/1.1" 200 OK
 INFO:     Shutting down
 INFO:     Waiting for application shutdown.
-2026-08-29T17:44:57Z INFO zero.workers background workers stopped
+2026-08-29T23:10:33Z INFO zero.workers background workers stopped
 INFO:     Application shutdown complete.
-INFO:     Finished server process [15321]
+INFO:     Finished server process [19879]

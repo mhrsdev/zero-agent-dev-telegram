@@ -247,6 +247,35 @@ def test_config_sync_recovers_provider_key_from_env(
     assert providers, "recovered provider key must register an adapter"
 
 
+def test_config_sync_pins_scheduler_tick_to_routing_primary_model(
+    zero_home, tmp_path, monkeypatch
+):
+    """Round-7 live fix: the scheduler tick (task execution + LLM
+    decomposition) resolved its model from ``settings.openai_model``
+    (gpt-4o-mini default) — ``routing.primary_model`` never reached the
+    tasks. On the operator's gateway the gpt-4o-mini default stopped
+    being served outright (every decomposition/task call edge-403'd)
+    while the aligned planner and chat kept working. config_sync must
+    pin the tick to the SAME routing truth."""
+    dir_engine = tmp_path / "engine-cwd"
+    dir_engine.mkdir()
+    monkeypatch.chdir(dir_engine)
+
+    settings, services = _engine_for(zero_home)
+    _project_id, refs = _wizard_store_secrets(services)
+    _write_config(zero_home, bot_ref=refs[0], api_refs=["sec_" + "y" * 24])
+
+    # Before the sync, no routing override is pinned.
+    assert services.scheduler.tick_routing_override() == (None, None)
+
+    monkeypatch.setenv("ZERO_OPENAI_API_KEY", "sk-RECOVERED")
+    _svc, _bindings, providers = _sync(zero_home)
+    assert providers, "provider must register for the alignment to fire"
+    provider, model = _svc.scheduler.tick_routing_override()
+    assert provider == "openai-compatible"
+    assert model == "test-model"  # routing.primary_model written by _write_config
+
+
 def test_config_sync_fails_loud_without_recovery_path(
     zero_home, tmp_path, monkeypatch, caplog
 ):

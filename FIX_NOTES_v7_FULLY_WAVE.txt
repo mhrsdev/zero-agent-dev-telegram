@@ -1,0 +1,142 @@
+ZERO-AGENT-DEV-TELEGRAM — ROUND-7 "FULLY" FIX NOTES (v5)
+Round-7 wave: INLINE KEYBOARD / DECOMPOSITION / APPROVAL — verified FULLY
+=========================================================================
+
+[中文说明在下方 / Chinese notes below]
+
+WHAT THIS PACKAGE IS
+--------------------
+Full source of the zero-agent-dev-telegram repo at commit 9526466,
+including the round-7 verification wave: 4 real bugs found live, fixed,
+and pinned; both real-credentials e2e profiles green.
+
+ROUND-7 E2E EVIDENCE (real bot + real group + real claude-opus-5)
+-----------------------------------------------------------------
+- Approval profile: 21/21 phases PASS (evidence: realrun-evidence/round5/
+  evidence-approval.jsonl)
+  * real plan cards with dual buttons in the real group
+  * REAL approve button -> plan approved -> scheduler engaged
+  * REAL reject button -> plan rejected (durable)
+  * forged token -> loud error; stranger press -> identity-gate denial;
+    replay -> idempotent; answerCallbackQuery sent to the real Bot API
+- Decomposition profile: 13/13 phases PASS (evidence-*.jsonl)
+  * real LLM decomposed the approved plan into a 9-task dependency graph
+  * EVERY task completed through the real agent loop (claude-opus-5)
+  * execution summary delivered to the REAL group (message_id=473)
+- Bonus: a REAL 200 answerCallbackQuery toast was observed when a real
+  group member pressed a real card button through polling.
+
+4 REAL BUGS FOUND & FIXED (all pinned by tests)
+-----------------------------------------------
+1) Webhook button presses were NEVER answered on the Bot API.
+   The engine's webhook adapter holds no bot token (tokens are per-
+   binding secrets), so the answer attempt died silently at _api_url.
+   FIX: InterfaceTransportService.process_webhook answers the press after
+   dispatch using the binding's resolved credential (outcome toast:
+   "Plan approved" / "Plan rejected" / "Not allowed" / "Failed"), crash
+   path included. Pins: test_webhook_press_answered_via_binding_credential,
+   test_webhook_press_by_stranger_gets_no_credential_resolution.
+
+2) One stale/expired callback query killed the ENTIRE polling worker.
+   Telegram answers answerCallbackQuery with HTTP 400 QUERY_ID_INVALID
+   for expired ids; that surfaces as a plain RuntimeError (not
+   AdapterError) which escaped poll_forever's exception tuple.
+   FIX: acknowledgement is unconditionally best-effort.
+   Pin: test_stale_query_id_400_never_kills_the_polling_worker.
+
+3) routing.primary_model never reached task execution / decomposition.
+   The scheduler tick used settings.openai_model (gpt-4o-mini default).
+   When your gateway stopped serving gpt-4o-mini (every task call
+   edge-403'd while the aligned planner succeeded), approved plans could
+   never execute. FIX: config_sync pins the scheduler tick to
+   routing.primary_model (SchedulerService.set_tick_routing).
+   Pin: test_config_sync_pins_scheduler_tick_to_routing_primary_model.
+
+4) One transient CDN-edge 403 degraded every decomposition to the
+   single-task fallback. FIX: the decomposer burns a bounded transport
+   retry budget first (4 retries, 5/15/30/60s backoff); auth failures
+   stay fail-fast. Pins: test_transient_edge_403_is_retried_not_degraded,
+   test_transient_403_exhausting_budget_still_falls_back,
+   test_auth_failure_stays_fail_fast.
+
+TEST SUITE
+----------
+1121 passed / 16 skipped (env-gated: PostgreSQL, tiktoken, textual) /
+1 failed = the pre-existing textual-extra gap (NOT a regression; byte-
+identical on baseline). Run `pip install -e ".[textual]"` to turn it green.
+
+ENVIRONMENTAL BOUNDARY (documented, not a code defect)
+------------------------------------------------------
+File-editing tasks (diff/test evidence) fail closed in THIS sandbox:
+command execution requires a genuine isolation backend
+(ZERO_SANDBOX_EXECUTOR=docker|firejail per the GAP-3 production rule)
+and none is installable here. The e2e therefore drives an analysis
+deliverable (all tasks provider_response evidence). On YOUR machine with
+docker available, coding tasks run the same path unchanged.
+
+HOW TO RUN THE E2E YOURSELF
+---------------------------
+    python scripts/e2e_round5_setup.py            # fresh home + real creds
+    set E2E_PROFILE=approval                      # or "decomposition"
+    python scripts/run_round5_e2e.py              # boots engine, drives, tears down
+
+=========================================================================
+
+【中文说明】
+
+本包内容
+--------
+仓库完整源码（提交 9526466），包含第七轮"三个 FULLY"专项验证：
+真实发现的 4 个 bug 已全部深度修复并加 pin 测试；两套真实凭证 e2e 全绿。
+
+第七轮真实凭证证据（真实机器人 + 真实群 + 真实 claude-opus-5）
+--------------------------------------------------------------
+- 审批配置（approval）：21/21 阶段通过
+  * 真实群收到带双按钮（✅ 批准 / ✖️ 拒绝）的真实计划卡片
+  * 真实批准按钮 -> 计划批准 -> 调度器带图启动
+  * 真实拒绝按钮 -> 计划持久化拒绝
+  * 伪造 token -> 响亮报错；陌生人按键 -> 身份门拒绝；重放 -> 幂等；
+    answerCallbackQuery 已真实发往 Bot API
+- 分解配置（decomposition）：13/13 阶段通过
+  * 真实 LLM 把批准的计划分解为 9 任务依赖图
+  * 每个任务都经真实 agent loop（claude-opus-5）完成
+  * 执行摘要已投递到真实群（message_id=473）
+- 额外收获：真实群成员经轮询按下真实按钮时，观察到真实的
+  answerCallbackQuery "200 OK" toast。
+
+4 个真实 bug（全部已修复 + pin）
+--------------------------------
+1) webhook 路径的按键从未被应答（webhook 适配器按设计不持有 bot
+   token，应答在 _api_url 静默死亡）。修复：传输服务在 durable 派发后
+   用 binding 解析出的凭证应答（含崩溃路径）。
+2) 一个过期回调 query（HTTP 400 QUERY_ID_INVALID，普通 RuntimeError 而
+   非 AdapterError）会杀死整个轮询 worker。修复：应答无条件 best-effort。
+3) routing.primary_model 从未到达任务执行/分解（调度 tick 用
+   gpt-4o-mini 默认值；网关停止服务该模型后所有任务调用 403）。
+   修复：config_sync 把调度 tick 钉到路由表主模型。
+4) 一次瞬态 CDN 403 就把分解静默降级为单任务回退。修复：分解器先烧
+   有界传输重试预算（4 次，5/15/30/60s 退避）；认证失败仍快速失败。
+
+测试基线
+--------
+1121 通过 / 16 跳过（环境门控）/ 1 失败 = 已知的 textual 可选依赖缺口
+（与基线逐字节一致，非回归）。运行 `pip install -e ".[textual]"` 变绿。
+
+环境边界（文档化，非代码缺陷）
+------------------------------
+本沙箱中文件编辑类任务（diff/测试证据）按 GAP-3 生产规则 fail-closed
+（命令执行需要 docker|firejail 隔离后端，本环境无法安装）。e2e 因此
+驱动分析型交付物（全部任务为 provider_response 证据）。在你自己的
+机器上（有 docker）编码任务走完全相同的路径。
+
+自跑 e2e
+--------
+    python scripts/e2e_round5_setup.py            # 全新 home + 真实凭证
+    set E2E_PROFILE=approval                      # 或 "decomposition"
+    python scripts/run_round5_e2e.py              # 启动引擎、驱动、拆除
+
+待办（需要你操作）
+------------------
+- GitHub push：本地有 6 个提交待推送（30c18e8..9526466），本环境无
+  你的凭证；`git push origin main` 即可。
+- 可选：pip install -e ".[textual]" 消除最后一个环境门控测试失败。

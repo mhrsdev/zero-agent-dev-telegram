@@ -106,6 +106,73 @@ def _rate_limit_detail(response: httpx.Response) -> str:
     return f" (retry_after={retry_after})" if retry_after else ""
 
 
+_EDGE_403_EMPTY_BODY = (
+    "provider gateway edge protection blocked the request "
+    "(transient CDN edge 403 with an empty body; identical "
+    "requests succeed on retry)"
+)
+_EDGE_403_CHALLENGE_BODY = (
+    "provider gateway edge protection blocked the request "
+    "(transient CDN edge 403 with a non-JSON challenge body; "
+    "identical requests succeed on retry)"
+)
+
+
+def _read_response_body(response: Any) -> str:
+    """Best-effort read of an error response body.
+
+    Inside an ``httpx`` streaming context the body is not fetched
+    unless ``read()`` is called; every other response shape exposes
+    ``.text`` directly. Reading a challenge page is safe — it never
+    carries credentials (error bodies are never logged either).
+    """
+    try:
+        read = getattr(response, "read", None)
+        if callable(read):
+            read()
+    except Exception:  # noqa: BLE001 - body read must never mask the status
+        pass
+    try:
+        return str(getattr(response, "text", "") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _header_value(response: Any, name: str) -> str:
+    """Header lookup tolerant of both httpx responses and test doubles."""
+    try:
+        return str(response.headers.get(name) or "")
+    except AttributeError:
+        return ""
+
+
+def _auth_status_error(response: Any, status_code: int) -> ProviderError:
+    """Classify a 401/403 response into the exception to raise.
+
+    Hermes classification principle (``bedrock_adapter.classify_
+    bedrock_error``): classify by body pattern, retry transient
+    classes, fail fast only on definitive rejections.
+
+    The operator's gateway sits behind Cloudflare, which intermittently
+    answers 403 with either an EMPTY body plus CF edge headers, or a
+    NON-JSON challenge/block page — identical requests succeed seconds
+    later on both shapes (proven live: chat got 403→403→200 within 4s).
+    Those are TRANSIENT edge blocks. A JSON error object is a definitive
+    application-level rejection → auth_failure (fail fast, escalate to
+    the fallback chain). 401 is always definitive.
+    """
+    if status_code == 403:
+        body = _read_response_body(response)
+        if not body:
+            server = _header_value(response, "server")
+            cf_ray = _header_value(response, "cf-ray")
+            if "cloudflare" in server.lower() or cf_ray:
+                return ProviderError(_EDGE_403_EMPTY_BODY)
+        elif not body.startswith("{"):
+            return ProviderError(_EDGE_403_CHALLENGE_BODY)
+    return ProviderError(f"provider auth failed with status {status_code}")
+
+
 def _render_openai_tool_choice(value) -> dict[str, Any] | str:
     """Render a canonical tool_choice for OpenAI-compatible endpoints.
 
@@ -532,34 +599,10 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
             # adapter's generic message made a bad/expired primary API key
             # look like a request defect, silently skipping fallback.
             if response.status_code in (401, 403):
-                # Live-run fix (round 5): the operator's gateway sits
-                # behind Cloudflare, which intermittently answers 403
-                # with an EMPTY body and CF edge headers (server:
-                # cloudflare, cf-ray) — identical payloads succeed
-                # before and after the blip. That is an edge block, not
-                # a key failure: raise the dedicated edge-protection
-                # message (classified TRANSIENT with bounded same-
-                # provider retry) instead of the auth message.
-                if not str(getattr(response, "text", "") or "").strip():
-                    server = ""
-                    try:
-                        server = str(response.headers.get("server") or "")
-                    except AttributeError:
-                        server = ""
-                    cf_ray = ""
-                    try:
-                        cf_ray = str(response.headers.get("cf-ray") or "")
-                    except AttributeError:
-                        cf_ray = ""
-                    if "cloudflare" in server.lower() or cf_ray:
-                        raise ProviderError(
-                            "provider gateway edge protection blocked the request "
-                            "(transient CDN edge 403 with an empty body; identical "
-                            "requests succeed on retry)"
-                        )
-                raise ProviderError(
-                    f"provider auth failed with status {response.status_code}"
-                )
+                # Shared classifier (round 6): empty CF edge body AND
+                # non-JSON challenge pages → transient edge block;
+                # JSON rejection → auth failure. See _auth_status_error.
+                raise _auth_status_error(response, response.status_code)
             detail = _rate_limit_detail(response) if response.status_code == 429 else ""
             raise ProviderError(
                 f"provider HTTP request failed with status {response.status_code}{detail}"
@@ -700,8 +743,29 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
             json=payload,
         ) as response:
             if response.status_code >= 400:
+                # Live-run fix (round 6): task execution streams, and
+                # this branch used to raise the generic status message
+                # for EVERY error — a transient CDN-edge 403 was then
+                # classified invalid_request and killed the task with
+                # no retry (observed live: ready task failed in 21ms
+                # while identical requests succeeded seconds later).
+                # Classify exactly like the non-stream path: 401/403
+                # via the shared auth/edge classifier, 429 with
+                # Retry-After, 503/529 as temporary unavailability.
+                status_code = response.status_code
+                if status_code in (401, 403):
+                    raise _auth_status_error(response, status_code)
+                if status_code == 429:
+                    detail = _rate_limit_detail(response)
+                    raise ProviderError(
+                        f"provider rate limit hit with status {status_code}{detail}"
+                    )
+                if status_code in {503, 529}:
+                    raise ProviderError(
+                        f"provider temporarily unavailable ({status_code})"
+                    )
                 raise ProviderError(
-                    f"provider HTTP request failed with status {response.status_code}"
+                    f"provider HTTP request failed with status {status_code}"
                 )
             tool_call_ids_by_index: dict[int, str] = {}
             saw_message_end = False
@@ -1349,7 +1413,9 @@ class AnthropicMessagesProviderAdapter(ProviderAdapter):
         if response.status_code >= 400:
             status_code = response.status_code
             if status_code == 401 or status_code == 403:
-                raise ProviderError(f"provider auth failed with status {status_code}")
+                # Shared classifier (round 6): CDN edge 403 shapes are
+                # transient, JSON rejections are auth failures.
+                raise _auth_status_error(response, status_code)
             if status_code == 429:
                 retry_after = response.headers.get("retry-after")
                 detail = f" (retry_after={retry_after})" if retry_after else ""

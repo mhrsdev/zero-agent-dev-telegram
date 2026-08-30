@@ -403,6 +403,22 @@ class BackgroundWorkerHost:
         provider_names = services.providers.registered_provider_names
         provider = provider_names[0] if provider_names else "openai-compatible"
         model_name = self._settings.openai_model
+        # Round-7 routing alignment (live fix): config_sync pins the tick
+        # to ``routing.primary_model`` — the scheduler's LLM calls
+        # (decomposition + task execution) must call the configured
+        # model, not the ``settings.openai_model`` default. On the
+        # operator's gateway the gpt-4o-mini default stopped being served
+        # outright (every task call edge-403'd) while the aligned planner
+        # and chat bridge kept working — this override makes the tasks
+        # follow the SAME routing truth.
+        try:
+            tick_provider, tick_model = services.scheduler.tick_routing_override()
+        except Exception:  # noqa: BLE001 - scheduler optional in some compositions
+            tick_provider, tick_model = None, None
+        if tick_provider:
+            provider = tick_provider
+        if tick_model:
+            model_name = tick_model
         combined_command = self._settings.combined_test_command
         for project in services.identity.list_projects():
             try:

@@ -308,17 +308,23 @@ def test_telegram_poll_advances_cursor_past_malformed_addressable_update():
     assert cursor_store.values == {("telegram", "scope"): "12"}
 
 
-def test_telegram_callback_acknowledges_before_domain_dispatch():
+def test_telegram_callback_answered_after_dispatch_with_outcome():
+    """Round-7 revision of ``test_telegram_callback_acknowledges_before_
+    domain_dispatch``: the acknowledgement now rides AFTER dispatch so
+    the toast can carry the OUTCOME (Hermes ``query.answer(text=...)``
+    parity). The original invariant — the client's spinner always stops
+    — is preserved and strengthened: the answer now fires on the crash
+    path too (pinned in test_telegram_approval_buttons.py)."""
     TelegramAdapter = _load_adapter("zero.adapters.telegram", "TelegramAdapter")
     order = []
 
     class OrderedTransport(FakeTransport):
         def request(self, method, url, *, headers=None, json=None, timeout=None):
-            order.append("ack")
+            order.append(("ack", json))
             return super().request(method, url, headers=headers, json=json, timeout=timeout)
 
     def domain_handler(event):
-        order.append("dispatch")
+        order.append(("dispatch", None))
         return event
 
     adapter = TelegramAdapter(
@@ -341,7 +347,12 @@ def test_telegram_callback_acknowledges_before_domain_dispatch():
         headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
     )
 
-    assert order == ["ack", "dispatch"]
+    # Dispatch FIRST (the toast needs the outcome), THEN the answer.
+    assert [kind for kind, _ in order] == ["dispatch", "ack"]
+    ack_payload = order[1][1]
+    assert ack_payload["callback_query_id"] == "callback-1"
+    # Unknown handler shape → neutral acknowledgment (spinner stops).
+    assert "text" in ack_payload
 
 
 def test_discord_interaction_signature_and_callback_normalization():
