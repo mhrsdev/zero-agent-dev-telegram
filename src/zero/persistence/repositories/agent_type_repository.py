@@ -405,6 +405,46 @@ class AgentTypeRepository:
             conn.commit()
         return released
 
+    def release_stale_running_instances(
+        self,
+        new_state: AgentInstanceState = "cancelled",
+        *,
+        commit: bool = True,
+    ) -> int:
+        """Release every ``running`` instance whose task is no longer running.
+
+        Live-run fix (2026-08-31): an engine kill between
+        :meth:`lease_instance_for_task` and the runtime's
+        ``finish_instance`` left ``agent_instances`` rows in ``running``
+        forever. Per-execution ``recover_after_restart`` only releases
+        leases for tasks it transitions, so instances whose task already
+        reached a terminal state (or whose execution failed while the
+        instance lived) kept consuming the type's
+        ``max_concurrent_instances`` budget across restarts — every new
+        task then failed with ``ConcurrencyLimitExceededError`` until an
+        operator hit ``/recover`` by hand.
+
+        The invariant is simple: an instance lease is valid only while
+        its task is in ``running`` state. This sweep releases every
+        ``running`` instance whose task is missing, NULL, or in any
+        non-running state. Safe to call at every boot; it can never
+        release the lease of a genuinely running task.
+        """
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "UPDATE agent_instances SET state = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE state = 'running' AND ("
+            "  task_id IS NULL"
+            "  OR task_id NOT IN (SELECT id FROM tasks WHERE state = 'running')"
+            ")",
+            (new_state,),
+        )
+        released = int(cursor.rowcount)
+        if commit:
+            conn.commit()
+        return released
+
     def update_instance_state(
         self,
         instance_id: AgentInstanceId,

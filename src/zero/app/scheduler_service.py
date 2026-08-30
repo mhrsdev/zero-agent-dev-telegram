@@ -555,7 +555,14 @@ class SchedulerService:
         integration_review_ids: list[str] = []
         merge_proposal_ids: list[str] = []
         result_delivery_ids: list[str] = []
-        if self._integration is not None and repository_id is not None:
+        # Bug fix (2026-08-31, Hermes parity audit): this gate used the RAW
+        # caller argument `repository_id`, not `effective_repository_id` —
+        # but the drain path (and the task evidence selection above) use the
+        # resolver-resolved repository. Managed ticks (BackgroundWorkerHost)
+        # pass repository_id=None and rely on the resolver, so integration
+        # reviews, combined tests, and merge proposals were silently skipped
+        # for every autonomous tick even when a real repository existed.
+        if self._integration is not None and effective_repository_id is not None:
             for execution in runnable:
                 try:
                     current = self._worker.get_execution(

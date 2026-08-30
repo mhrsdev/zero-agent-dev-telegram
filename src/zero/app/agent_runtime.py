@@ -139,6 +139,22 @@ def _message_to_record(message: CanonicalMessage) -> dict[str, object]:
     return record
 
 
+def _failure_detail(exc: BaseException) -> str:
+    """Redacted ``Class: message`` detail for durable failure records.
+
+    Live-run fix (2026-08-31): the runtime's failure wrappers used to
+    record only ``type(exc).__name__`` (e.g. "evidence/postcondition
+    failed: RuntimeEvidenceError"), which hid the actual cause an
+    operator needed. The message is redacted (the same gateway key that
+    once leaked into a public repo proves messages can carry secrets)
+    and bounded before it reaches the durable task error.
+    """
+    from zero.domain.audit import redact_sensitive_text
+
+    detail = str(exc).strip() or "(no detail)"
+    return f"{type(exc).__name__}: {redact_sensitive_text(detail)}"[:400]
+
+
 @dataclass(frozen=True)
 class RuntimeTaskResult:
     """Durable result of one task attempt."""
@@ -254,7 +270,13 @@ class AgentRuntime:
         if audit_repo is None:
             return
         try:
-            from zero.app.tool_service import _now_utc_iso
+            # Bug fix (regression found 2026-08-31): this import named a
+            # private symbol that does not exist (`tool_service` exports
+            # `now_utc_iso` via zero.app.clock), so EVERY delegation audit
+            # write died on ImportError and was swallowed by the broad
+            # handler below — delegate calls left ZERO durable trace and
+            # the round-9 GAP L regressions failed.
+            from zero.app.clock import now_utc_iso
             from zero.domain.audit import AuditEvent, AuditEventId, redact_sensitive_text
             from zero.domain.ids import generate_audit_event_id
 
@@ -273,7 +295,7 @@ class AgentRuntime:
                         f"Invoked tool {DELEGATE_TOOL_NAME!r} "
                         f"(status={result}, {redact_sensitive_text(detail)[:400]})"
                     ),
-                    created_at=_now_utc_iso(),
+                    created_at=now_utc_iso(),
                 )
             )
         except Exception as exc:  # noqa: BLE001 - audit loss must not crash delegation
@@ -325,6 +347,45 @@ class AgentRuntime:
                 "tasks can only run on active agent types"
             )
         return ResolvedAgentPolicy(agent_type=agent_type)
+
+    def agent_type_at_capacity(
+        self,
+        *,
+        project_id: ProjectId,
+        task: Task,
+        explicit_agent_type_id: AgentTypeId | None = None,
+    ) -> bool:
+        """True when the task's agent type has no free instance slot.
+
+        Live-run fix (2026-08-31): ``run_ready_tasks`` used to claim and
+        then instantly FAIL any task whose agent type was at its
+        ``max_concurrent_instances`` limit — one busy worker of a
+        max_concurrent_instances=1 type meant every sibling task died
+        with "agent type concurrency limit reached" and blocked the
+        whole graph. Capacity is now checked BEFORE the claim: an
+        at-capacity task is left ``ready`` for a later tick instead of
+        being consumed. The atomic lease inside ``run_task`` remains the
+        race-safety net for the rare claim-time overlap.
+        """
+        if self._agent_type_repo is None:
+            return False
+        try:
+            policy = self.resolve_agent_policy(
+                project_id=project_id,
+                task=task,
+                explicit_agent_type_id=explicit_agent_type_id,
+            )
+        except RuntimeEvidenceError:
+            # Policy problems are surfaced by run_task itself; capacity
+            # pre-checking must never change that failure mode.
+            return False
+        if policy.type_id is None:
+            return False
+        try:
+            running = self._agent_type_repo.count_running_instances(policy.type_id)
+        except Exception:  # noqa: BLE001 - degraded: let run_task decide
+            return False
+        return running >= policy.agent_type.max_concurrent_instances
 
     def run_ready_tasks(
         self,
@@ -378,6 +439,25 @@ class AgentRuntime:
         results: list[RuntimeTaskResult] = []
         errors: list[BaseException] = []
         for task in ready:
+            # Live-run fix (2026-08-31): defer at-capacity tasks BEFORE
+            # claiming. Claim-then-fail turned a full instance slot into
+            # a terminal task failure ("agent type concurrency limit
+            # reached"); waiting for a later tick is the correct
+            # queueing semantics.
+            if self.agent_type_at_capacity(
+                project_id=project_id,
+                task=task,
+                explicit_agent_type_id=agent_type_id,
+            ):
+                emit_task_event(
+                    {
+                        "type": "task_deferred",
+                        "task_id": task.id.value,
+                        "objective": task.objective or "",
+                        "detail": "agent type at capacity; task stays ready",
+                    }
+                )
+                continue
             emit_task_event(
                 {
                     "type": "task_started",
@@ -776,12 +856,19 @@ class AgentRuntime:
                         type(cleanup_exc).__name__,
                     )
             finish_instance("failed")
+            # Live-run fix (2026-08-31): the wrapper used to record only
+            # the exception CLASS ("workspace/context setup failed:
+            # IntegrityError"), which hid the actual constraint/message
+            # an operator needed to diagnose the failure.
             self._worker.fail_task(
                 execution_id=execution_id,
                 project_id=project_id,
                 task_id=task.id,
                 attempt_id=attempt.id,
-                error_message=f"workspace/context setup failed: {type(exc).__name__}"[:500],
+                error_message=(
+                    "workspace/context setup failed: "
+                    f"{_failure_detail(exc)}"
+                )[:500],
                 actor_id=actor_id,
                 lease_owner=lease_owner,
                 source=source,
@@ -945,7 +1032,9 @@ class AgentRuntime:
                 project_id=project_id,
                 task_id=task.id,
                 attempt_id=attempt.id,
-                error_message=f"{type(exc).__name__}: runtime execution failed"[:500],
+                error_message=(
+                    f"runtime execution failed: {_failure_detail(exc)}"
+                )[:500],
                 actor_id=actor_id,
                 lease_owner=lease_owner,
                 source=source,
@@ -1036,12 +1125,18 @@ class AgentRuntime:
                         type(cleanup_exc).__name__,
                     )
             finish_instance("failed")
+            # Live-run fix (2026-08-31): "evidence/postcondition failed:
+            # RuntimeEvidenceError" carried no cause — the durable record
+            # now includes the redacted exception message so the failure
+            # is diagnosable from the task error alone.
             self._worker.fail_task(
                 execution_id=execution_id,
                 project_id=project_id,
                 task_id=task.id,
                 attempt_id=attempt.id,
-                error_message=f"evidence/postcondition failed: {type(exc).__name__}"[:500],
+                error_message=(
+                    f"evidence/postcondition failed: {_failure_detail(exc)}"
+                )[:500],
                 actor_id=actor_id,
                 lease_owner=lease_owner,
                 source=source,

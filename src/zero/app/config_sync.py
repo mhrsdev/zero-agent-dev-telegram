@@ -67,7 +67,23 @@ def sync_management_config(settings: Settings, services: Services) -> None:
     home = zero_home()
     cfgsvc = ConfigService(home)
     if not cfgsvc.exists():
-        return
+        # GAP 9 fix (2026-08-31, Hermes parity audit): an env-driven
+        # deployment (ZERO_OPENAI_API_KEY / ZERO_TELEGRAM_BOT_TOKEN in the
+        # environment, no config.yaml) used to boot with NO management
+        # project, NO telegram binding and NO routing pin — the polling
+        # worker found zero targets and the bot could never receive or
+        # reply to a single message even though every credential was
+        # present. When the operator's environment carries credentials,
+        # synthesize a config.yaml from them once, then fall through to
+        # the battle-tested config.yaml sync below.
+        if _bootstrap_config_from_env(settings, home, cfgsvc):
+            logger.info(
+                "config sync: synthesized %s from environment credentials "
+                "(GAP 9 env bootstrap)",
+                home / "config.yaml",
+            )
+        else:
+            return
     try:
         cfg = cfgsvc.load()
     except Exception as exc:  # noqa: BLE001 - config errors must not crash boot
@@ -80,6 +96,15 @@ def sync_management_config(settings: Settings, services: Services) -> None:
 
     project = _ensure_management_project(services)
     owner_id = project.owner_user_id
+
+    # GAP 9: swap ENV: sentinel references (written by the env bootstrap)
+    # for durable encrypted secret rows before the provider/binding sync
+    # resolves them.
+    if (
+        any((p.api_key_ref or "").startswith("ENV:") for p in cfg.providers)
+        or (cfg.telegram.bot_token_ref or "").startswith("ENV:")
+    ):
+        _resolve_env_sentinel_refs(services, project, owner_id, cfg, cfgsvc)
 
     # Bootstrap: persist the management project id into config.yaml so
     # the policy gate (which reads config.yaml on every call) can
@@ -121,7 +146,7 @@ def sync_management_config(settings: Settings, services: Services) -> None:
             )
 
     _sync_providers(settings, services, project, owner_id, cfg, cfgsvc)
-    _sync_telegram_bindings(services, project, owner_id, cfg, cfgsvc)
+    _sync_telegram_bindings(services, project, owner_id, cfg, cfgsvc, settings)
     _sync_planner(services, cfg)
     _ensure_web_search_tool(services, project, owner_id)
 
@@ -142,6 +167,141 @@ def sync_management_config(settings: Settings, services: Services) -> None:
 # ----------------------------------------------------------------------
 # Internals
 # ----------------------------------------------------------------------
+
+
+def _bootstrap_config_from_env(settings: Settings, home, cfgsvc) -> bool:
+    """Synthesize ``config.yaml`` from environment credentials (GAP 9).
+
+    Called ONLY when no config.yaml exists. Builds the same shape the
+    setup wizard writes — providers from the env API keys, the Telegram
+    bot token, groups from ``ZERO_TELEGRAM_GROUP_IDS`` (comma-separated
+    chat ids), and routing pinned to ``ZERO_OPENAI_MODEL`` — so an
+    env-only deployment boots fully wired. Idempotent by construction:
+    once the file exists the normal sync path owns everything.
+    """
+    import yaml as _yaml
+
+    from zero.manage.core.config import GroupPolicy, ProviderCfg, ZeroConfig
+
+    env_token = os.environ.get("ZERO_TELEGRAM_BOT_TOKEN", "").strip()
+    env_openai_key = os.environ.get("ZERO_OPENAI_API_KEY", "").strip()
+    env_anthropic_key = os.environ.get("ZERO_ANTHROPIC_API_KEY", "").strip()
+    if not (env_token or env_openai_key or env_anthropic_key):
+        return False
+
+    cfg = ZeroConfig()
+    primary_model = settings.openai_model
+
+    if env_openai_key:
+        cfg.providers.append(
+            ProviderCfg(
+                id="openai",
+                protocol="openai_compatible",
+                base_url=settings.openai_base_url,
+                api_key_ref="ENV:ZERO_OPENAI_API_KEY",
+                models=[settings.openai_model],
+                enabled=True,
+            )
+        )
+        primary_model = settings.openai_model
+    if env_anthropic_key:
+        cfg.providers.append(
+            ProviderCfg(
+                id="anthropic",
+                protocol="anthropic",
+                base_url=settings.anthropic_base_url,
+                api_key_ref="ENV:ZERO_ANTHROPIC_API_KEY",
+                models=[settings.anthropic_model],
+                enabled=True,
+            )
+        )
+    cfg.routing.primary_model = primary_model
+
+    if env_token:
+        cfg.telegram.bot_token_ref = "ENV:ZERO_TELEGRAM_BOT_TOKEN"
+    group_ids = [
+        part.strip()
+        for part in os.environ.get("ZERO_TELEGRAM_GROUP_IDS", "").split(",")
+        if part.strip()
+    ]
+    for chat_id in group_ids:
+        cfg.access.groups.append(
+            GroupPolicy(
+                chat_id=str(int(chat_id)),
+                title=f"chat {chat_id}",
+                kind="supergroup",
+                enabled=True,
+            )
+        )
+
+    home.mkdir(parents=True, exist_ok=True)
+    payload = cfg.model_dump(mode="json")
+    # The ENV: prefix is the sentinel the sync step resolves below; the
+    # file intentionally stores NO raw secret value.
+    try:
+        with open(home / "config.yaml", "w", encoding="utf-8") as handle:
+            _yaml.safe_dump(payload, handle, sort_keys=False, allow_unicode=True)
+        return True
+    except OSError as exc:
+        logger.error("config sync: could not write synthesized config.yaml: %s", exc)
+        return False
+
+
+def _resolve_env_sentinel_refs(services, project, owner_id, cfg, cfgsvc) -> None:
+    """Resolve ``ENV:VAR`` sentinel references into real secret rows.
+
+    The env bootstrap writes ``api_key_ref: ENV:ZERO_OPENAI_API_KEY`` and
+    ``bot_token_ref: ENV:ZERO_TELEGRAM_BOT_TOKEN``. This helper swaps
+    each sentinel for a durable encrypted secret reference (idempotent:
+    existing resolving rows are reused), so restarts without the env
+    keep working.
+    """
+    for prov in cfg.providers:
+        ref = prov.api_key_ref or ""
+        if not ref.startswith("ENV:"):
+            continue
+        env_name = ref[4:]
+        env_value = os.environ.get(env_name, "").strip()
+        if not env_value:
+            continue
+        new_ref = _recover_secret_from_env(
+            services,
+            project,
+            owner_id,
+            name=f"{prov.id}-api-key",
+            secret_type="api_key",
+            env_value=env_value,
+            label=f"provider {prov.id} api key",
+        )
+        if new_ref:
+            cfg.providers = [
+                p if p.id != prov.id else p.model_copy(update={"api_key_ref": new_ref})
+                for p in cfg.providers
+            ]
+    token_ref = cfg.telegram.bot_token_ref or ""
+    if token_ref.startswith("ENV:"):
+        env_name = token_ref[4:]
+        env_value = os.environ.get(env_name, "").strip()
+        if env_value:
+            new_ref = _recover_secret_from_env(
+                services,
+                project,
+                owner_id,
+                name="telegram-bot-token",
+                secret_type="token",
+                env_value=env_value,
+                label="telegram bot token",
+            )
+            if new_ref:
+                cfg.telegram.bot_token_ref = new_ref
+    try:
+        cfgsvc.save(cfg)
+    except Exception as exc:  # noqa: BLE001 - boot must survive
+        logger.warning(
+            "config sync: could not persist resolved sentinel refs: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
 
 
 def _recover_secret_from_env(
@@ -385,6 +545,7 @@ def _sync_telegram_bindings(
     owner_id,
     cfg,
     cfgsvc=None,
+    settings: Settings | None = None,
 ) -> None:
     """Create/refresh enabled Telegram bindings from config.yaml.
 
@@ -403,6 +564,61 @@ def _sync_telegram_bindings(
     ``zero telegram groups add --chat-id <id>``.
     """
     token_ref = cfg.telegram.bot_token_ref
+    # GAP 4 (2026-08-31): user-session mode binds the personal account —
+    # NO bot token. Create the same bindings (token-less) so scope,
+    # policy, and the outbound session-adapter path all engage; polling
+    # is owned by the MTProto worker, not getUpdates.
+    if getattr(settings, "telegram_mode", "bot_api") == "user_session":
+        existing = {
+            (b.platform, b.chat_id): b
+            for b in services.interfaces.list_bindings(project.id)
+        }
+        targets = [
+            (str(g.chat_id), g.topic_id)
+            for g in cfg.access.groups
+            if g.enabled
+        ]
+        if not targets:
+            targets.append(("0", None))
+            logger.warning(
+                "config sync: user-session mode with no groups configured — "
+                "created a session-only binding (chat_id='0')"
+            )
+        for chat_id, topic_id in targets:
+            existing_binding = existing.get(("telegram", chat_id))
+            if existing_binding is not None:
+                if not existing_binding.is_enabled:
+                    services.interfaces.enable_binding(
+                        project_id=project.id,
+                        binding_id=existing_binding.id,
+                        actor_id=owner_id,
+                        source="system",
+                    )
+                continue
+            try:
+                services.interfaces.create_binding(
+                    project_id=project.id,
+                    actor_id=owner_id,
+                    platform="telegram",
+                    chat_id=chat_id,
+                    topic_id=topic_id,
+                    bot_token_ref=None,
+                    is_enabled=True,
+                    source="system",
+                )
+                logger.info(
+                    "config sync: created user-session binding for chat %s",
+                    chat_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "config sync: user-session binding create failed for "
+                    "chat %s: %s: %s",
+                    chat_id,
+                    type(exc).__name__,
+                    exc,
+                )
+        return
     if not token_ref:
         logger.warning(
             "config sync: no telegram.bot_token_ref in config.yaml — "
@@ -717,6 +933,20 @@ def _ensure_web_search_tool(services: Services, project, owner_id) -> None:
         )
         logger.info(
             "config sync: internet_search tool registered (id=%s)", tool.id.value
+        )
+    else:
+        # Handler-rebind fix (live-run 2026-08-31): the tool row persists
+        # across restarts but handlers are process-local callables. Without
+        # this rebind every restart after the first left internet_search
+        # with NO handler — HTTP invokes 500'd and agent tool rounds failed
+        # with "No handler registered" until the row was deleted by hand.
+        from zero.app.tools_websearch import make_web_search_handler
+
+        services.tools.rebind_server_handler(
+            tool, handler=make_web_search_handler(), inline=True
+        )
+        logger.debug(
+            "config sync: internet_search handler rebound (id=%s)", tool.id.value
         )
     try:
         existing_grants = [

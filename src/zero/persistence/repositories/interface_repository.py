@@ -26,6 +26,9 @@ from zero.domain.interfaces import (
     InterfaceEventLogEntry,
     Platform,
     ResultDelivery,
+    ToolApprovalToken,
+    ToolApprovalTokenId,
+    ToolApprovalTokenNotFoundError,
 )
 from zero.domain.plans import PlanId
 from zero.persistence.connection import Database
@@ -91,6 +94,19 @@ def _row_to_callback_token(row: sqlite3.Row) -> CallbackToken:
         project_id=ProjectId(row["project_id"]),
         plan_id=PlanId(row["plan_id"]),
         revision_number=row["revision_number"],
+        action=row["action"],  # type: ignore[arg-type]
+        expires_at=row["expires_at"],
+        used_at=row["used_at"],
+        created_by=UserId(row["created_by"]) if row["created_by"] else None,
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_tool_approval_token(row: sqlite3.Row) -> ToolApprovalToken:
+    return ToolApprovalToken(
+        id=ToolApprovalTokenId(row["id"]),
+        project_id=ProjectId(row["project_id"]),
+        approval_id=row["approval_id"],
         action=row["action"],  # type: ignore[arg-type]
         expires_at=row["expires_at"],
         used_at=row["used_at"],
@@ -800,3 +816,87 @@ class InterfaceRepository:
             (project_id.value, plan_id.value),
         )
         return [_row_to_callback_token(row) for row in cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Tool approval tokens (Hermes-parity inline buttons, 2026-08-31)
+    # ------------------------------------------------------------------
+
+    def insert_tool_approval_token(
+        self, token: ToolApprovalToken, *, commit: bool = True
+    ) -> None:
+        conn = self._database.connect()
+        try:
+            conn.execute(
+                "INSERT INTO tool_approval_tokens "
+                "(id, project_id, approval_id, action, expires_at, used_at, "
+                "created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    token.id.value,
+                    token.project_id.value,
+                    token.approval_id,
+                    token.action,
+                    token.expires_at,
+                    token.used_at,
+                    token.created_by.value if token.created_by else None,
+                    token.created_at,
+                ),
+            )
+            if commit:
+                conn.commit()
+        except sqlite3.IntegrityError:
+            if commit:
+                conn.rollback()
+            raise
+
+    def get_tool_approval_token(
+        self, token_id: ToolApprovalTokenId
+    ) -> ToolApprovalToken:
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "SELECT id, project_id, approval_id, action, expires_at, used_at, "
+            "created_by, created_at "
+            "FROM tool_approval_tokens WHERE id = ?",
+            (token_id.value,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise ToolApprovalTokenNotFoundError(
+                f"Tool approval token {token_id} not found"
+            )
+        return _row_to_tool_approval_token(row)
+
+    def mark_tool_approval_token_used(
+        self,
+        token_id: ToolApprovalTokenId,
+        used_at: str,
+        *,
+        commit: bool = True,
+    ) -> bool:
+        """Mark a tool-approval token used (one-shot, idempotent)."""
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "UPDATE tool_approval_tokens SET used_at = ? "
+            "WHERE id = ? AND used_at IS NULL",
+            (used_at, token_id.value),
+        )
+        if commit:
+            conn.commit()
+        return cursor.rowcount > 0
+
+    def list_live_tool_approval_tokens(
+        self,
+        project_id: ProjectId,
+        approval_id: str,
+    ) -> list[ToolApprovalToken]:
+        """Unused tokens for one approval request (dedup card resends)."""
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "SELECT id, project_id, approval_id, action, expires_at, used_at, "
+            "created_by, created_at "
+            "FROM tool_approval_tokens "
+            "WHERE project_id = ? AND approval_id = ? AND used_at IS NULL "
+            "ORDER BY created_at DESC",
+            (project_id.value, approval_id),
+        )
+        return [_row_to_tool_approval_token(row) for row in cursor.fetchall()]

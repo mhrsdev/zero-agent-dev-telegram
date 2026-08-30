@@ -288,6 +288,30 @@ class WorktreeRepository:
         )
         return [_row_to_worktree(row) for row in cursor.fetchall()]
 
+    def list_worktrees_in_states(
+        self, states: tuple[str, ...] = ("allocated", "active", "interrupted")
+    ) -> list[Worktree]:
+        """List worktrees currently in the given states (no project filter).
+
+        Boot-recovery companion (live-run fix 2026-08-31): worktrees left
+        in the partial-unique states by a killed process permanently
+        occupy ``idx_worktrees_task_active``, so the task's next attempt
+        died with ``UNIQUE constraint failed: worktrees.task_id``. The
+        service uses this to find and abandon them.
+        """
+        if not states:
+            return []
+        placeholders = ", ".join("?" for _ in states)
+        conn = self._database.connect()
+        cursor = conn.execute(
+            "SELECT id, project_id, repository_id, execution_id, task_id, "
+            "branch_name, worktree_path, base_revision, state, "
+            "cleanup_eligible_at, created_at, updated_at FROM worktrees "
+            f"WHERE state IN ({placeholders}) ORDER BY created_at ASC",
+            tuple(states),
+        )
+        return [_row_to_worktree(row) for row in cursor.fetchall()]
+
     def update_worktree_state(
         self,
         worktree_id: WorktreeId,

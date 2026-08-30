@@ -24,6 +24,7 @@ from zero.app.audit_service import AuditService
 from zero.app.auth_service import AuthService
 from zero.app.authorization_service import AuthorizationService
 from zero.app.chat_service import ChatService
+from zero.app.chat_history_repository import ChatHistoryRepository
 from zero.app.compaction_service import CompactionService
 from zero.app.decomposition_analytics import DecompositionAnalytics
 from zero.app.identity_service import IdentityService
@@ -125,6 +126,8 @@ class Services:
     #: Optional per-call tool approval gate; present only when
     #: ZERO_TOOL_APPROVAL_MODE != off.
     approval_gate: ToolApprovalGate | None = None
+    #: Durable per-scope chat transcript (the /new command clears it).
+    chat_history: "ChatHistoryRepository | None" = None
 
 
 def _build_messaging_http_client(settings: Settings) -> httpx.Client:
@@ -740,4 +743,5 @@ def build_services(
         interface_transports=interface_transport_service,
         decomposition_analytics=decomposition_analytics,
         approval_gate=approval_gate,
+        chat_history=chat_history_repo,
     )

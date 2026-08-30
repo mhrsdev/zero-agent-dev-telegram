@@ -908,6 +908,20 @@ class ProviderService:
         Per GAP 5: usage events stay internal (accounting only); text
         deltas, resolved tool calls, and the terminal marker are
         forwarded. Observer failures never break the provider stream.
+
+        Live-run fix (2026-08-31): the tap used to fire one ``tool_call``
+        observer event per streaming delta fragment. With arguments
+        streamed in chunks (the normal path for every OpenAI-compatible
+        gateway), the Telegram live bubble accumulated one garbled line
+        per fragment — observed live as ``🔧 ?(and")`` / ``🔧 ?(: "ls")``
+        instead of ``🔧 run_command({"command": "ls"})``. Fragments are
+        now accumulated per call id: the FIRST id-bearing fragment emits
+        ``replace=False`` (a new progress line) and every later fragment
+        of the SAME call emits ``replace=True`` with the arguments
+        accumulated so far, so the preview converges to the full call
+        instead of duplicating garbage lines. Name-only fragments that
+        arrive before the call id (some gateways) are buffered and
+        attached to the call, mirroring ``_collect_stream``.
         """
 
         def _safe_observe(payload: dict) -> None:
@@ -916,24 +930,42 @@ class ProviderService:
             except Exception:
                 logger.debug("stream observer raised; event dropped", exc_info=True)
 
+        pending_name: str | None = None
+        call_names: dict[str, str] = {}
+        call_arguments: dict[str, str] = {}
         for event in events:
             if event.kind == "text_delta":
                 _safe_observe({"type": "text_delta", "text": event.text})
             elif event.kind == "tool_call_delta" and event.tool_call is not None:
                 call = event.tool_call
-                if call.tool_call_id:
-                    arguments: Any = call.arguments
-                    try:
-                        arguments = json.loads(call.arguments)
-                    except (TypeError, ValueError):
-                        arguments = call.arguments
-                    _safe_observe(
-                        {
-                            "type": "tool_call",
-                            "name": call.tool_name,
-                            "arguments": arguments,
-                        }
-                    )
+                if not call.tool_call_id:
+                    if call.tool_name:
+                        pending_name = call.tool_name
+                    yield event
+                    continue
+                effective_name = call.tool_name or pending_name or ""
+                pending_name = None
+                existing_name = call_names.get(call.tool_call_id)
+                replace = call.tool_call_id in call_names
+                if effective_name and not existing_name:
+                    call_names[call.tool_call_id] = effective_name
+                display_name = call_names.get(call.tool_call_id) or effective_name or "tool"
+                call_arguments[call.tool_call_id] = (
+                    call_arguments.get(call.tool_call_id, "") + (call.arguments or "")
+                )
+                arguments: Any = call_arguments[call.tool_call_id]
+                try:
+                    arguments = json.loads(call_arguments[call.tool_call_id])
+                except (TypeError, ValueError):
+                    pass
+                _safe_observe(
+                    {
+                        "type": "tool_call",
+                        "name": display_name,
+                        "arguments": arguments,
+                        "replace": replace,
+                    }
+                )
             elif event.kind == "message_end":
                 _safe_observe({"type": "done", "finish_reason": event.finish_reason or "stop"})
             yield event

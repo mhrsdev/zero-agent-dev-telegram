@@ -99,7 +99,15 @@ class TestProviderStreamTap:
         ]
         assert seen[0]["text"] == "Hello "
         assert seen[1] == {"type": "text_delta", "text": "world"}
-        assert seen[2] == {"type": "tool_call", "name": "echo", "arguments": {"x": 1}}
+        # Wave-11 contract: tool_call events carry a `replace` flag so
+        # live views update the pending line per call instead of stacking
+        # one garbled line per streaming fragment (live: "🔧 ?(and\")").
+        assert seen[2] == {
+            "type": "tool_call",
+            "name": "echo",
+            "arguments": {"x": 1},
+            "replace": False,
+        }
         assert seen[3]["finish_reason"] == "stop"
         # Usage stayed internal; all events still flow to the collector.
         assert len(drained) == 5

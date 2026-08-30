@@ -1543,6 +1543,90 @@ class WorkerService:
     # Restart recovery
     # ------------------------------------------------------------------
 
+    def reconcile_expired_leases(
+        self,
+        *,
+        project_id: ProjectId,
+        actor_id: UserId,
+        source: AuditSource = "system",
+    ) -> int:
+        """Reconcile running tasks whose attempt lease has expired.
+
+        Live-run fix (2026-08-31): recovery ran ONLY at boot. A task
+        whose owner died mid-run kept its lease alive long enough to be
+        "authoritative" at boot, then the lease expired with nobody
+        watching — the task sat in ``running`` forever, its agent-type
+        instance slot stayed leased, and every sibling of the graph was
+        deferred (capacity) or blocked (dependencies) indefinitely.
+
+        Per ``zero-recovery-consistency``: an expired lease proves that
+        current ownership is ABSENT. Each scheduler tick therefore
+        reconciles executions that hold a running task with an expired
+        (or missing) lease by applying the same recovery contract as the
+        boot path: the attempt is marked ``unknown``, the task returns
+        to ``ready``, stale instance leases are released, and its
+        worktree is abandoned at the next attempt. A live worker keeps
+        its lease fresh via the heartbeat, so this can never steal
+        genuinely running work.
+        """
+        from zero.domain.execution import EXECUTION_TRANSITIONS
+
+        terminal_states = {
+            state for state, nxt in EXECUTION_TRANSITIONS.items() if not nxt
+        }
+        reconciled = 0
+        executions = self.list_project_executions(
+            project_id=project_id,
+            actor_id=actor_id,
+            source=source,
+        )
+        for execution in executions:
+            if execution.state in terminal_states:
+                continue
+            tasks = self._execution_repo.list_tasks_for_execution(
+                execution.id, project_id=project_id
+            )
+            needs_recovery = False
+            for task in tasks:
+                if task.state != "running":
+                    continue
+                attempts = self._execution_repo.list_attempts_for_task(
+                    task.id, project_id=project_id
+                )
+                running_attempts = [a for a in attempts if a.state == "running"]
+                if not running_attempts:
+                    # A running task with no running attempt cannot make
+                    # progress; recover it.
+                    needs_recovery = True
+                    break
+                latest = running_attempts[-1]
+                if not latest.lease_expires_at:
+                    needs_recovery = True
+                    break
+                try:
+                    expires = datetime.fromisoformat(latest.lease_expires_at)
+                except ValueError:
+                    needs_recovery = True
+                    break
+                if expires <= datetime.now(UTC):
+                    needs_recovery = True
+                    break
+            if needs_recovery:
+                try:
+                    self.recover_after_restart(
+                        execution_id=execution.id,
+                        project_id=project_id,
+                        actor_id=actor_id,
+                        source=source,
+                    )
+                    reconciled += 1
+                except Exception:  # noqa: BLE001 - per-execution isolation
+                    logger.debug(
+                        "expired-lease reconciliation failed for execution %s",
+                        execution.id.value,
+                    )
+        return reconciled
+
     def recover_after_restart(
         self,
         *,

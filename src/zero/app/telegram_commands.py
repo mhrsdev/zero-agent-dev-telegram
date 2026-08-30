@@ -51,6 +51,8 @@ class TelegramCommandBook:
         project_id: Any,
         actor_id: Any,
         source: str = "telegram",
+        chat_id: str | None = None,
+        topic_id: str | None = None,
     ) -> str | None:
         """Return the reply text for a dynamic command, or None."""
         handlers = {
@@ -58,12 +60,24 @@ class TelegramCommandBook:
             "/tasks": self.tasks_reply,
             "/model": self.model_reply,
             "/approvals": self.approvals_reply,
+            "/new": self.new_reply,
+            "/id": self.id_reply,
         }
         handler = handlers.get(first_token.lower())
         if handler is None:
             return None
         try:
-            return handler(project_id=project_id, actor_id=actor_id, source=source)
+            import inspect
+
+            kwargs: dict[str, Any] = {
+                "project_id": project_id,
+                "actor_id": actor_id,
+                "source": source,
+            }
+            if "chat_id" in inspect.signature(handler).parameters:
+                kwargs["chat_id"] = chat_id
+                kwargs["topic_id"] = topic_id
+            return handler(**kwargs)
         except Exception as exc:  # noqa: BLE001 - commands never crash intake
             logger.warning(
                 "command %s failed: %s: %s",
@@ -221,6 +235,64 @@ class TelegramCommandBook:
             return gate.list_pending(project_id=str(project_id.value))
         except Exception:  # noqa: BLE001
             return []
+
+    # ------------------------------------------------------------------
+    # /new — clear the conversational session (Hermes /new parity)
+    # ------------------------------------------------------------------
+
+    def new_reply(
+        self,
+        *,
+        project_id,
+        actor_id,
+        source: str = "telegram",
+        chat_id: str | None = None,
+        topic_id: str | None = None,
+    ) -> str:
+        """Forget this chat scope's durable conversational history.
+
+        Hermes ``/new`` parity: ``ChatHistoryRepository.clear`` existed
+        since the chat bridge landed ("for a future /reset command") but
+        no command ever called it, so a topic drift polluted every
+        following answer forever. The PLAN pipeline is untouched — plan
+        and execution state is durable domain truth, not chat memory.
+        """
+        history = getattr(self._services, "chat_history", None)
+        if history is None:
+            return "No conversational history store is wired; nothing to reset."
+        if chat_id is None:
+            return "/new works inside a chat scope (send it in the chat)."
+        removed = history.clear(
+            platform=source,
+            chat_id=str(chat_id),
+            topic_id=str(topic_id) if topic_id else None,
+        )
+        return (
+            f"🧹 Fresh start — cleared {removed} stored turn(s) for this "
+            "conversation. Plan and execution state are untouched."
+        )
+
+    # ------------------------------------------------------------------
+    # /id — scope introspection for operators
+    # ------------------------------------------------------------------
+
+    def id_reply(
+        self,
+        *,
+        project_id,
+        actor_id,
+        source: str = "telegram",
+        chat_id: str | None = None,
+        topic_id: str | None = None,
+    ) -> str:
+        """Report the raw scope ids (binding setup helper)."""
+        lines = [
+            f"chat_id: `{chat_id or '?'}`",
+            f"topic_id: `{topic_id or '-'}`",
+            f"project_id: `{project_id.value if hasattr(project_id, 'value') else project_id}`",
+            f"platform: `{source}`",
+        ]
+        return "\n".join(lines)[:800]
 
 
 __all__ = ["TelegramCommandBook"]

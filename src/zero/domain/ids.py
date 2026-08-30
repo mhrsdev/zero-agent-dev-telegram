@@ -207,6 +207,11 @@ def generate_callback_token_id() -> str:
     return f"ct_{_generate_token()}"
 
 
+def generate_tool_approval_token_id() -> str:
+    """Opaque callback id for one tool-approval inline button."""
+    return f"tat_{_generate_token()}"
+
+
 def generate_chat_message_id() -> str:
     """Stable ID for one durable conversational transcript turn."""
     return f"chm_{_generate_token()}"

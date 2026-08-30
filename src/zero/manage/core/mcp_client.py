@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import re
 import subprocess
 import threading
@@ -65,6 +66,14 @@ def parse_server_config(raw_json: str | None) -> list[dict]:
 class MCPServerProcess:
     """One MCP stdio server child process."""
 
+    #: Default deadline for one JSON-RPC request. The MCP handshake runs
+    #: at BOOT inside ``_load_extensions`` — a server that never answers
+    #: used to block startup FOREVER (blocking ``readline()``); every
+    #: request is now bounded and a wedged server is shut down.
+    DEFAULT_REQUEST_TIMEOUT = 10.0
+    #: Tool calls may legitimately take longer (searches, builds).
+    TOOL_CALL_TIMEOUT = 120.0
+
     def __init__(self, *, name: str, command: list[str]) -> None:
         self.name = name
         self._command = [str(part) for part in command]
@@ -72,6 +81,8 @@ class MCPServerProcess:
         self._lock = threading.Lock()
         self._next_id = 1
         self.tools: list[dict] = []
+        self._reader_queue: "queue.Queue[dict | None]" = queue.Queue()
+        self._reader_thread: threading.Thread | None = None
 
     def connect(self) -> bool:
         """Spawn the process and perform the initialize handshake."""
@@ -87,6 +98,14 @@ class MCPServerProcess:
         except OSError as exc:
             logger.warning("MCP server %r failed to start: %s", self.name, exc)
             return False
+        # Boot-resilience fix (2026-08-31): stdout is pumped by a daemon
+        # reader thread into a queue so ``_read_message`` can time out.
+        # A server that starts but never answers the initialize handshake
+        # now costs the boot one bounded timeout, not forever.
+        self._reader_thread = threading.Thread(
+            target=self._pump_stdout, daemon=True, name=f"mcp-reader-{self.name}"
+        )
+        self._reader_thread.start()
         result = self._request(
             "initialize",
             {
@@ -108,9 +127,32 @@ class MCPServerProcess:
         ]
         return True
 
+    def _pump_stdout(self) -> None:
+        """Move parsed stdout lines into a queue (bounded-read enabler)."""
+        assert self._proc is not None and self._proc.stdout is not None
+        try:
+            for line in self._proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(message, dict) and "id" in message:
+                    self._reader_queue.put(message)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._reader_queue.put(None)
+
     def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Invoke one remote tool; returns joined text content."""
-        result = self._request("tools/call", {"name": tool_name, "arguments": dict(arguments)})
+        result = self._request(
+            "tools/call",
+            {"name": tool_name, "arguments": dict(arguments)},
+            timeout=self.TOOL_CALL_TIMEOUT,
+        )
         if not isinstance(result, dict):
             raise TypeError(f"MCP tool {tool_name!r} returned no result")
         if result.get("isError"):
@@ -126,18 +168,24 @@ class MCPServerProcess:
         self._proc = None
         if proc is None:
             return
+        # Deadlock fix (2026-08-31): closing stdout while the reader
+        # thread sits inside blocking ``readline()`` deadlocks forever
+        # (close() needs the buffered-reader lock the reader holds).
+        # Terminate the child FIRST so the pipe hits EOF and the reader
+        # unblocks; only then close the descriptors (and never join —
+        # the reader is a daemon).
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except OSError:
+                pass
         for stream in (proc.stdin, proc.stdout):
             try:
                 if stream is not None:
                     stream.close()
-            except OSError:
-                pass
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                proc.kill()
             except OSError:
                 pass
 
@@ -154,23 +202,22 @@ class MCPServerProcess:
         except (OSError, ValueError) as exc:
             raise BrokenPipeError(str(exc)) from exc
 
-    def _read_message(self) -> dict | None:
-        assert self._proc is not None and self._proc.stdout is not None
-        while True:
-            line = self._proc.stdout.readline()
-            if not line:
-                return None
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(message, dict) and "id" in message:
-                return message
+    def _read_message(self, timeout: float) -> dict | None:
+        """Read one id-bearing message, bounded by ``timeout`` seconds.
 
-    def _request(self, method: str, params: dict) -> dict | None:
+        Timeout fix (2026-08-31): the previous implementation called the
+        blocking ``readline()`` directly, so a hung MCP server blocked
+        the request (and, at boot, the whole application start) with no
+        deadline. Responses now arrive through the reader-thread pump;
+        on timeout the caller shuts the server down.
+        """
+        try:
+            return self._reader_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def _request(self, method: str, params: dict, *, timeout: float | None = None) -> dict | None:
+        deadline = timeout if timeout is not None else self.DEFAULT_REQUEST_TIMEOUT
         with self._lock:
             if self._proc is None:
                 return None
@@ -188,8 +235,17 @@ class MCPServerProcess:
                 deadline_guard = 0
                 while deadline_guard < 64:
                     deadline_guard += 1
-                    message = self._read_message()
+                    message = self._read_message(timeout=deadline)
                     if message is None:
+                        if deadline_guard > 1 or self._reader_queue.empty():
+                            logger.warning(
+                                "MCP server %r timed out after %.1fs waiting for %s — "
+                                "shutting the server down",
+                                self.name,
+                                deadline,
+                                method,
+                            )
+                            self.shutdown()
                         return None
                     if message.get("id") == request_id:
                         if "error" in message:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Mapping
 from threading import Event
 from typing import Any
@@ -154,6 +155,63 @@ class TelegramConflictError(AdapterError):
     """
 
 
+# ----------------------------------------------------------------------
+# Hermes-parity gating (2026-08-31): bot-sender filter + group mention
+# gating, ported from the reference gateway's
+# `{PLATFORM}_ALLOW_BOTS` / `TELEGRAM_REQUIRE_MENTION` behavior.
+# ----------------------------------------------------------------------
+
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _allow_bots_setting() -> str:
+    """``ZERO_TELEGRAM_ALLOW_BOTS``: ``none`` (default) or ``all``.
+
+    ``none`` mirrors the Hermes default: messages authored by other bots
+    never trigger a turn. Without this filter a second bot in the group
+    can drag this agent into an automated bot-to-bot reply loop.
+    """
+    raw = os.environ.get("ZERO_TELEGRAM_ALLOW_BOTS", "none").strip().lower()
+    return raw if raw in {"none", "all"} else "none"
+
+
+def _require_mention_default() -> bool:
+    """``ZERO_TELEGRAM_REQUIRE_MENTION`` global default (groups only).
+
+    Default ``true`` (Hermes parity): in group chats the bot answers
+    when addressed (mention, reply-to-bot, or command) instead of every
+    message. Private chats are never gated.
+    """
+    raw = os.environ.get("ZERO_TELEGRAM_REQUIRE_MENTION", "true").strip().lower()
+    if raw in _FALSY:
+        return False
+    return True
+
+
+def _mention_exempt_chats() -> frozenset[str]:
+    """Chats where every message is processed regardless of addressing.
+
+    ``ZERO_TELEGRAM_MENTION_EXEMPT_CHATS`` — comma-separated chat ids.
+    Per-group overrides come from ``config.yaml`` ``access.groups[]
+    .require_mention`` wired through the polling worker.
+    """
+    raw = os.environ.get("ZERO_TELEGRAM_MENTION_EXEMPT_CHATS", "")
+    return frozenset(
+        part.strip() for part in raw.split(",") if part.strip()
+    )
+
+
+def _message_entities(message: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """All entities of a message (text entities + caption entities)."""
+    entities: list[Mapping[str, Any]] = []
+    for key in ("entities", "caption_entities"):
+        chunk = message.get(key)
+        if isinstance(chunk, list):
+            entities.extend(e for e in chunk if isinstance(e, Mapping))
+    return entities
+
+
 class TelegramAdapter(BaseMessagingAdapter):
     """Normalize Telegram updates and dispatch durable application events.
 
@@ -180,6 +238,11 @@ class TelegramAdapter(BaseMessagingAdapter):
         retry_attempts: int | None = None,
         retry_backoff_seconds: float | None = None,
         sleeper=None,
+        bot_username: str | None = None,
+        bot_id: str | None = None,
+        require_mention: bool | None = None,
+        mention_exempt_chats: frozenset[str] | set[str] | None = None,
+        allow_bots: str | None = None,
     ) -> None:
         if poll_timeout_seconds < 0 or poll_timeout_seconds > 50:
             raise ValueError("poll_timeout_seconds must be between 0 and 50")
@@ -198,6 +261,101 @@ class TelegramAdapter(BaseMessagingAdapter):
         self._api_base_url = api_base_url.rstrip("/")
         self._poll_timeout_seconds = poll_timeout_seconds
         self._acknowledge_callbacks = acknowledge_callbacks
+        # Hermes-parity gating inputs. ``bot_username``/``bot_id`` come
+        # from getMe (the polling worker resolves them once per token);
+        # unknown identity fails OPEN on mention detection so a probe
+        # failure can never deafen the bot (commands still route).
+        self._bot_username = (bot_username or "").lstrip("@").lower() or None
+        self._bot_id = str(bot_id) if bot_id is not None else None
+        self._require_mention = (
+            _require_mention_default() if require_mention is None else bool(require_mention)
+        )
+        self._mention_exempt_chats = (
+            _mention_exempt_chats()
+            if mention_exempt_chats is None
+            else frozenset(str(c) for c in mention_exempt_chats)
+        )
+        self._allow_bots = (_allow_bots_setting() if allow_bots is None else allow_bots).lower()
+
+    # ------------------------------------------------------------------
+    # Hermes-parity gating decisions
+    # ------------------------------------------------------------------
+
+    def _skip_reason(
+        self,
+        *,
+        message: Mapping[str, Any],
+        actor: Mapping[str, Any],
+        chat: Mapping[str, Any],
+        content: str,
+    ) -> str | None:
+        """Return a skip reason for a message event, or None to process.
+
+        Two independent Hermes-parity filters, both fail-closed against
+        runaway loops but fail-open for the operator's own reachability:
+
+        1. Bot senders are ignored (``ZERO_TELEGRAM_ALLOW_BOTS=none`` is
+           the default) — a second bot in the group must not be able to
+           drive this agent into an automated loop.
+        2. Group messages are processed only when the bot is ADDRESSED:
+           a private chat, a command, an @mention / text_mention entity,
+           or a reply to one of the bot's own messages. When the bot
+           identity is not yet resolved (no getMe yet) mention detection
+           fails OPEN so a probe failure cannot deafen the bot.
+        """
+        chat_id = str(chat.get("id") or "")
+        chat_type = str((chat.get("type") or "")).lower()
+
+        # 1. Bot-sender filter (message path only; callbacks are ours).
+        if actor.get("is_bot") is True and self._allow_bots != "all":
+            return "sender_is_bot"
+
+        # 2. Mention gating (groups only; DMs always pass).
+        if chat_type == "private" or chat_type == "":
+            return None
+        if chat_id in self._mention_exempt_chats:
+            return None
+        if not self._require_mention:
+            return None
+
+        # Commands are explicit intents — always processed.
+        if content.startswith("/"):
+            return None
+
+        if self._bot_username or self._bot_id:
+            for entity in _message_entities(message):
+                kind = str(entity.get("type") or "")
+                if kind == "mention" and self._bot_username:
+                    value = str(message.get("text") or message.get("caption") or "")
+                    offset = int(entity.get("offset") or 0)
+                    length = int(entity.get("length") or 0)
+                    fragment = value[offset : offset + length].lstrip("@").lower()
+                    if fragment == self._bot_username:
+                        return None
+                elif kind == "text_mention" and self._bot_id:
+                    user = entity.get("user")
+                    if isinstance(user, Mapping) and str(user.get("id") or "") == self._bot_id:
+                        return None
+            reply_anchor = message.get("reply_to_message")
+            if isinstance(reply_anchor, Mapping):
+                replier = reply_anchor.get("from")
+                if isinstance(replier, Mapping):
+                    if self._bot_id and str(replier.get("id") or "") == self._bot_id:
+                        return None
+                    if (
+                        self._bot_username
+                        and str(replier.get("username") or "").lstrip("@").lower()
+                        == self._bot_username
+                    ):
+                        return None
+            return "group_message_not_addressed_to_bot"
+
+        # Identity unresolved: fail OPEN (never deafen the bot).
+        logger.debug(
+            "telegram mention gating skipped: bot identity unresolved — "
+            "processing group message fail-open"
+        )
+        return None
 
     def verify_webhook(self, headers: Mapping[str, str]) -> None:
         if self._webhook_secret is None:
@@ -264,6 +422,20 @@ class TelegramAdapter(BaseMessagingAdapter):
         if content is None:
             content = ""
         content = str(content)
+        # Hermes-parity gating: skip messages from other bots and
+        # unaddressed group messages BEFORE any durable claim is minted.
+        # A skipped event simply advances its offset (same contract as a
+        # poison update) and is logged — it never reaches intake.
+        skip = self._skip_reason(
+            message=message, actor=actor, chat=chat, content=content
+        )
+        if skip is not None:
+            logger.debug(
+                "telegram update %s skipped: %s",
+                update_id,
+                skip,
+            )
+            return None
         kind = "command" if content.startswith("/") else "message"
         media = _extract_media(message)
         reply_anchor = message.get("reply_to_message")
@@ -599,6 +771,23 @@ class TelegramAdapter(BaseMessagingAdapter):
             payload["text"] = safe_render_text(text, platform="telegram", limit=200)
         return self._call_api("answerCallbackQuery", payload)
 
+    @staticmethod
+    def _is_mergeable_text(event: Any) -> bool:
+        """A plain-text message that may coalesce with its neighbours.
+
+        Hermes text batching (`_enqueue_text_event`): Telegram clients
+        split long messages at 4096 chars, and humans double-send
+        fragments within a second. Consecutive PLAIN-TEXT messages from
+        the same (chat, topic, actor) inside one polling batch are
+        newline-joined into ONE turn. Commands, media, and callbacks
+        always stay separate events.
+        """
+        return (
+            getattr(event, "event_kind", None) == "message"
+            and not getattr(event, "media", None)
+            and bool(str(getattr(event, "content", "") or "").strip())
+        )
+
     def poll_once(self, *, scope_key: str = "default", background_dispatch=None) -> list[Any]:
         """Fetch one bounded polling batch and persist the next offset.
 
@@ -610,11 +799,28 @@ class TelegramAdapter(BaseMessagingAdapter):
         are fast, durable, and their answer toast must not be delayed
         behind a queued turn. The durable event claim still serializes
         duplicate deliveries, so at-least-once offsets remain safe.
+
+        Hermes parity (text batching): consecutive plain-text messages
+        from the same sender within one batch are merged into a single
+        event BEFORE dispatch. The merge is deterministic — a crash
+        redelivery of the same batch reproduces the same merged turn —
+        and the merged event keeps the FIRST update's external id, so
+        the durable claim stays unique and idempotent.
         """
         cursor = _cursor_get(self._cursor_store, "telegram", scope_key)
         payload: dict[str, Any] = {
             "timeout": self._poll_timeout_seconds,
-            "allowed_updates": ["message", "edited_message", "callback_query"],
+            # Hermes parity (2026-08-31): request channel posts too — the
+            # normalizer has always handled channel_post/edited_channel_post
+            # but polling never asked for them, so channel-scope bindings
+            # could never receive a single update.
+            "allowed_updates": [
+                "message",
+                "edited_message",
+                "callback_query",
+                "channel_post",
+                "edited_channel_post",
+            ],
         }
         if cursor is not None:
             payload["offset"] = int(cursor)
@@ -623,8 +829,74 @@ class TelegramAdapter(BaseMessagingAdapter):
         updates = data.get("result") if isinstance(data, Mapping) else None
         if not isinstance(updates, list):
             raise UnsupportedUpdateError("Telegram getUpdates result is not a list")
+
+        merged: dict[tuple[str, str, str], list[Any]] = {}
+        merged_dates: dict[tuple[str, str, str], int] = {}
+        merged_order: list[tuple[str, str, str]] = []
+        seen_event_ids: set[str] = set()
         results: list[Any] = []
         max_update_id: int | None = None
+
+        def _dispatch_event(event: Any) -> None:
+            if background_dispatch is not None and event.event_kind != "callback_query":
+                self._submit_background(background_dispatch, event, None)
+                results.append({"dispatched": "background"})
+                return
+            try:
+                result = self._dispatch(event)
+            except Exception:
+                # A crashed dispatch must still stop the client's
+                # spinner (same invariant as the webhook path).
+                self._answer_callback_failure(event)
+                raise
+            # Hermes parity: a button press that arrives via POLLING
+            # gets the same outcome feedback as one arriving via
+            # webhook — otherwise the client shows a loading clock
+            # on the pressed button until Telegram times the query
+            # out (~10s) with no feedback at all.
+            self._answer_callback_outcome(event, result)
+            if getattr(result, "processing_result", None) == "error":
+                # The durable event log already captured the failure and
+                # this update owns a durable offset. Record it and advance
+                # so one poisoned event cannot stall the whole polling
+                # batch or kill the polling loop; recovery replays claims
+                # through the same durable boundary.
+                logger.warning(
+                    "Telegram polling recorded an errored inbound event; continuing"
+                )
+            results.append(result)
+
+        def _flush_merge(key: tuple[str, str, str]) -> None:
+            parts = merged.pop(key, None)
+            merged_dates.pop(key, None)
+            if parts is None:
+                return
+            merged_order.remove(key)
+            head = parts[0]
+            if len(parts) == 1:
+                _dispatch_event(head)
+                return
+            from zero.domain.interfaces import NormalizedEvent as _NE
+
+            merged_event = _NE(
+                platform=head.platform,
+                external_event_id=head.external_event_id,
+                external_actor_id=head.external_actor_id,
+                chat_id=head.chat_id,
+                topic_id=head.topic_id,
+                event_kind="message",
+                content="\n".join(str(p.content) for p in parts),
+                message_id=head.message_id,
+                reply_to_message_id=head.reply_to_message_id,
+            )
+            logger.info(
+                "telegram burst coalesced: %s text messages from chat %s "
+                "dispatched as one turn",
+                len(parts),
+                head.chat_id,
+            )
+            _dispatch_event(merged_event)
+
         for update in updates:
             if not isinstance(update, Mapping):
                 continue
@@ -646,38 +918,78 @@ class TelegramAdapter(BaseMessagingAdapter):
                 # one malformed payload cannot stall polling forever.
                 logger.warning("Telegram polling skipped malformed update: %s", type(exc).__name__)
                 continue
-            if event is not None:
-                if background_dispatch is not None and event.event_kind != "callback_query":
-                    self._submit_background(
-                        background_dispatch, event, numeric_update_id
-                    )
-                    results.append({"dispatched": "background", "update_id": numeric_update_id})
-                    continue
+            if event is None:
+                continue
+            # Telegram replays an update WITHIN one batch until the offset
+            # is acked. A same-batch duplicate must never be concatenated
+            # into a merged turn (that would bake the replay into the
+            # durable content) — skip it; the offset still advances.
+            if str(event.external_event_id) in seen_event_ids:
+                logger.debug(
+                    "telegram update %s is a same-batch replay — skipped",
+                    event.external_event_id,
+                )
+                continue
+            seen_event_ids.add(str(event.external_event_id))
+            if self._is_mergeable_text(event):
+                key = (
+                    str(event.chat_id),
+                    str(event.topic_id),
+                    str(event.external_actor_id),
+                )
+                raw_message = (
+                    update.get("message")
+                    or update.get("edited_message")
+                    or update.get("channel_post")
+                    or update.get("edited_channel_post")
+                )
                 try:
-                    result = self._dispatch(event)
-                except Exception:
-                    # A crashed dispatch must still stop the client's
-                    # spinner (same invariant as the webhook path).
-                    self._answer_callback_failure(event)
-                    raise
-                # Hermes parity: a button press that arrives via POLLING
-                # gets the same outcome feedback as one arriving via
-                # webhook — otherwise the client shows a loading clock
-                # on the pressed button until Telegram times the query
-                # out (~10s) with no feedback at all.
-                self._answer_callback_outcome(event, result)
-                if getattr(result, "processing_result", None) == "error":
-                    # The durable event log already captured the failure and
-                    # this update owns a durable offset. Record it and advance
-                    # so one poisoned event cannot stall the whole polling
-                    # batch or kill the polling loop; recovery replays claims
-                    # through the same durable boundary.
-                    logger.warning(
-                        "Telegram polling recorded an errored inbound event "
-                        "(update_id=%s); continuing",
-                        numeric_update_id,
+                    message_date = (
+                        int(raw_message.get("date"))
+                        if isinstance(raw_message, Mapping)
+                        and raw_message.get("date") is not None
+                        else None
                     )
-                results.append(result)
+                except (TypeError, ValueError):
+                    message_date = None
+                buffered_date = merged_dates.get(key)
+                # Merge ONLY split-message signatures: both messages carry
+                # a date and the gap is tiny (Telegram clients split long
+                # texts within seconds). Missing dates or a real time gap
+                # keeps the legacy separate-dispatch behavior.
+                same_burst = (
+                    buffered_date is not None
+                    and message_date is not None
+                    and abs(message_date - buffered_date) <= 120
+                )
+                if key in merged and not same_burst:
+                    _flush_merge(key)
+                if key not in merged:
+                    merged[key] = [event]
+                    merged_order.append(key)
+                else:
+                    merged[key].append(event)
+                if message_date is not None:
+                    current = merged_dates.get(key)
+                    merged_dates[key] = (
+                        message_date
+                        if current is None
+                        else max(message_date, current)
+                    )
+                continue
+            # A non-mergeable event flushes its own scope's text buffer
+            # first so per-chat ordering is preserved (text before the
+            # photo/command that followed it).
+            _flush_merge(
+                (
+                    str(event.chat_id),
+                    str(event.topic_id),
+                    str(event.external_actor_id),
+                )
+            )
+            _dispatch_event(event)
+        for key in list(merged_order):
+            _flush_merge(key)
         if max_update_id is not None:
             _cursor_set(self._cursor_store, "telegram", scope_key, str(max_update_id + 1))
         return results

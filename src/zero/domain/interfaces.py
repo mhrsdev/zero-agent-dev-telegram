@@ -46,6 +46,7 @@ INTERFACE_BINDING_ID_PREFIX = "ib_"
 INTERFACE_EVENT_ID_PREFIX = "iev_"
 INTERFACE_DELIVERY_ID_PREFIX = "idl_"
 CALLBACK_TOKEN_ID_PREFIX = "ct_"
+TOOL_APPROVAL_TOKEN_ID_PREFIX = "tat_"
 
 # ----------------------------------------------------------------------
 # Platform and scope types
@@ -64,6 +65,13 @@ ProcessingResult = Literal[
 ]
 
 CallbackAction = Literal["approve", "reject", "edit"]
+
+#: Tool-approval button actions (2026-08-31, Hermes parity): the inline
+#: keyboard on a pending tool-approval card resolves the durable gate
+#: decision. ``allow_always`` writes the standing always-allow row;
+#: ``deny`` records a denial (escalating to a tool-wide wildcard per
+#: the gate's coarse-deny design).
+ToolApprovalTokenAction = Literal["allow_once", "allow_always", "deny"]
 
 
 # ----------------------------------------------------------------------
@@ -115,6 +123,23 @@ class CallbackTokenId:
         if not self.value.startswith(CALLBACK_TOKEN_ID_PREFIX):
             raise ValueError(
                 f"CallbackTokenId must start with {CALLBACK_TOKEN_ID_PREFIX!r}; got {self.value!r}"
+            )
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True)
+class ToolApprovalTokenId:
+    value: str
+
+    def __post_init__(self) -> None:
+        if not self.value or not isinstance(self.value, str):
+            raise ValueError("ToolApprovalTokenId must be a non-empty string")
+        if not self.value.startswith(TOOL_APPROVAL_TOKEN_ID_PREFIX):
+            raise ValueError(
+                f"ToolApprovalTokenId must start with "
+                f"{TOOL_APPROVAL_TOKEN_ID_PREFIX!r}; got {self.value!r}"
             )
 
     def __str__(self) -> str:
@@ -401,6 +426,53 @@ class CallbackToken:
         return expires <= now
 
 
+@dataclass(frozen=True)
+class ToolApprovalToken:
+    """One-shot opaque reference that resolves a pending tool approval.
+
+    Mirrors :class:`CallbackToken` for the tool-approval surface: the
+    Telegram card carries the token ID as ``callback_data``; the server
+    re-resolves the gate state, actor permission, and pending status at
+    press time (UI controls are not authority), then consumes the token.
+
+    Attributes:
+        id: stable server-issued ID (``tat_``-prefixed).
+        project_id: the project the approval belongs to.
+        approval_id: the ``tool_approval_decisions`` row it resolves.
+        action: allow once / allow always / deny.
+        expires_at: when this token expires.
+        used_at: when this token was used (None if unused).
+        created_by: the user who minted the card.
+        created_at: ISO-8601 timestamp.
+    """
+
+    id: ToolApprovalTokenId
+    project_id: ProjectId
+    approval_id: str
+    action: ToolApprovalTokenAction
+    expires_at: str
+    used_at: str | None
+    created_by: UserId | None
+    created_at: str = ""
+
+    @property
+    def is_used(self) -> bool:
+        return self.used_at is not None
+
+    def is_expired_at(self, now: datetime) -> bool:
+        """Whether the token's expiry has passed at ``now``."""
+        from datetime import UTC
+        from datetime import datetime as _datetime
+
+        try:
+            expires = _datetime.fromisoformat(self.expires_at)
+        except ValueError:
+            return True
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=UTC)
+        return expires <= now
+
+
 # ----------------------------------------------------------------------
 # Typed failures
 # ----------------------------------------------------------------------
@@ -408,6 +480,10 @@ class CallbackToken:
 
 class InterfaceError(RuntimeError):
     """Base class for interface-adapter-domain typed failures."""
+
+
+class ToolApprovalTokenNotFoundError(InterfaceError):
+    """The referenced tool-approval callback token does not exist."""
 
 
 class InterfaceBindingNotFoundError(InterfaceError):

@@ -1,12 +1,22 @@
 """Direct gateway probe: does claude-opus-5 call tools when streamed?"""
 
 import json
+import os
 
 import httpx
 
-BASE = "https://api.justwoker.icu/v1"
-KEY = "sk-BlwjB2GhsGBwFLjQBBAhKK7FpmfJYP9usqGfrImaLaA1JOKW"
-MODEL = "claude-opus-5"
+BASE = os.environ.get("PROBE_GATEWAY_BASE_URL", "https://api.justwoker.icu/v1")
+# SECURITY fix (2026-08-31): this file previously hardcoded a LIVE API key,
+# which tripped test_no_live_credentials_in_tracked_files. The key was also
+# already committed to a public repository and MUST be rotated. Credentials
+# are now read from the environment and never stored in tracked files.
+KEY = os.environ.get("PROBE_GATEWAY_API_KEY", "").strip()
+if not KEY:
+    raise SystemExit(
+        "set PROBE_GATEWAY_API_KEY (and optionally PROBE_GATEWAY_BASE_URL / "
+        "PROBE_GATEWAY_MODEL) in the environment - keys are never committed"
+    )
+MODEL = os.environ.get("PROBE_GATEWAY_MODEL", "claude-opus-5")
 
 payload = {
     "model": MODEL,

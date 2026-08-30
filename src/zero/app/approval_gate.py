@@ -82,10 +82,19 @@ class ToolApprovalGate:
         # (project_id, execution_id or '', tool_name)
         self._session_grants: set[tuple[str, str, str]] = set()
         self._lock = threading.Lock()
+        # Hermes-parity notify hook (2026-08-31): fired when a NEW pending
+        # request is minted so the messaging surface can push the approval
+        # card (inline buttons) instead of waiting for the model to give up
+        # or the operator to poll /approvals.
+        self._notify: Any = None
 
     @property
     def mode(self) -> str:
         return self._mode
+
+    def attach_notifier(self, callback: Any) -> None:
+        """Register the pending-request notifier (best-effort by design)."""
+        self._notify = callback
 
     # ------------------------------------------------------------------
     # helpers
@@ -231,7 +240,19 @@ class ToolApprovalGate:
             self._db.commit()
         except sqlite3.Error as exc:
             raise ApprovalError(f"pending insert failed: {exc}") from exc
-        return ApprovalVerdict(state="pending", request=self.get(request_id))
+        request = self.get(request_id)
+        if self._notify is not None and request is not None:
+            # Notification is presentation, never authority: a failing
+            # sink must not change the verdict the runtime acts on.
+            try:
+                self._notify(request)
+            except Exception:  # noqa: BLE001 - notify must never break the gate
+                import logging
+
+                logging.getLogger(__name__).debug(
+                    "tool approval notifier failed", exc_info=True
+                )
+        return ApprovalVerdict(state="pending", request=request)
 
     def _request_fresh(self, request: ToolApprovalRequest) -> bool:
         try:

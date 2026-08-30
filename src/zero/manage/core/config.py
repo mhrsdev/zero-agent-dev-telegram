@@ -44,7 +44,10 @@ class WebhookCfg(_Strict):
 
 
 class TelegramCfg(_Strict):
-    mode: Literal["bot_api"] = "bot_api"
+    # GAP 4 (2026-08-31): "user_session" accepted — the mode was previously
+    # locked to "bot_api" here while Settings allowed it, so the wizard and
+    # config layer silently reverted any user-session configuration.
+    mode: Literal["bot_api", "user_session"] = "bot_api"
     bot_token_ref: str | None = None
     bot_username: str | None = None
     webhook: WebhookCfg = WebhookCfg()
@@ -63,6 +66,11 @@ class GroupPolicy(_Strict):
     daily_token_budget: int = Field(200_000, ge=0)
     added_by: str | None = None
     added_at: float | None = None
+    # Hermes-parity mention gating override (2026-08-31): when set, this
+    # group processes EVERY message (false) or only addressed ones (true)
+    # regardless of the global ZERO_TELEGRAM_REQUIRE_MENTION default.
+    # None keeps the global default (mention required in groups).
+    require_mention: bool | None = None
 
 
 class AccessCfg(_Strict):

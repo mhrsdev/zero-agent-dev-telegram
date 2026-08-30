@@ -373,7 +373,9 @@ class TelegramChatBridge:
             live.on_text_reset()
         elif kind == "tool_call":
             live.on_tool_call(
-                str(payload.get("name") or "tool"), payload.get("arguments")
+                str(payload.get("name") or "tool"),
+                payload.get("arguments"),
+                replace=bool(payload.get("replace")),
             )
         elif kind == "tool_result":
             live.on_tool_result(

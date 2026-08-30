@@ -39,6 +39,7 @@ import html
 import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from zero.app.clock import now_utc_iso
 
@@ -56,6 +57,7 @@ from zero.domain.ids import (
     generate_callback_token_id,
     generate_interface_binding_id,
     generate_interface_event_id,
+    generate_tool_approval_token_id,
 )
 from zero.domain.interfaces import (
     CallbackAction,
@@ -68,6 +70,11 @@ from zero.domain.interfaces import (
     InterfaceEventLogEntry,
     NormalizedEvent,
     Platform,
+    ToolApprovalToken,
+    ToolApprovalTokenAction,
+    ToolApprovalTokenId,
+    ToolApprovalTokenNotFoundError,
+    TOOL_APPROVAL_TOKEN_ID_PREFIX,
 )
 from zero.domain.plans import (
     DuplicateConversationEventError,
@@ -940,11 +947,15 @@ class InterfaceAdapterService:
             "\u2022 /status \u2014 engine status, worker loops, pending work\n"
             "\u2022 /tasks \u2014 recent executions and task states\n"
             "\u2022 /model \u2014 the provider/model currently routed\n"
-            "\u2022 /approvals \u2014 pending tool approvals\n\n"
+            "\u2022 /approvals \u2014 pending tool approvals\n"
+            "\u2022 /new \u2014 clear this conversation's memory (plans are kept)\n"
+            "\u2022 /id \u2014 show the chat/topic/project ids\n\n"
             "Anything else you send is treated as engineering work: I draft "
             "an actionable plan, you review it, and approve/reject it via "
             "the inline buttons. Casual chat and questions are answered "
-            "live (streamed into the chat) but never executed."
+            "live (streamed into the chat) but never executed. In groups, "
+            "@mention me (or reply to one of my messages) to get my "
+            "attention."
         ),
     }
 
@@ -983,6 +994,8 @@ class InterfaceAdapterService:
                 project_id=binding.project_id,
                 actor_id=user_id,
                 source=binding.platform,
+                chat_id=str(event.chat_id),
+                topic_id=str(event.topic_id) if event.topic_id else None,
             )
             if dynamic is not None:
                 reply = dynamic
@@ -1162,7 +1175,7 @@ class InterfaceAdapterService:
         event: NormalizedEvent,
         user_id: UserId,
     ) -> InterfaceEventLogEntry:
-        """Process a callback query (approve/reject/edit).
+        """Process a callback query (approve/reject/edit or tool approval).
 
         Per PLAN.md M13: "Edited or stale approval messages cannot
         approve a newer revision."
@@ -1172,6 +1185,12 @@ class InterfaceAdapterService:
         reference; the server still resolves current state and
         permission.
         """
+        # Tool-approval buttons (2026-08-31, Hermes parity) carry
+        # ``tat_``-prefixed token ids; plan callbacks keep ``ct_``.
+        if (event.callback_token or "").startswith(TOOL_APPROVAL_TOKEN_ID_PREFIX):
+            return self._process_tool_callback(
+                binding=binding, event=event, user_id=user_id
+            )
         if not event.callback_token:
             entry = InterfaceEventLogEntry(
                 id=InterfaceEventId(generate_interface_event_id()),
@@ -1455,6 +1474,322 @@ class InterfaceAdapterService:
 
     def get_callback_token(self, token_id: CallbackTokenId) -> CallbackToken:
         return self._repo.get_callback_token(token_id)
+
+    # ------------------------------------------------------------------
+    # Tool approval surface (Hermes-parity inline buttons, 2026-08-31)
+    # ------------------------------------------------------------------
+
+    def create_tool_approval_token(
+        self,
+        *,
+        project_id: ProjectId,
+        approval_id: str,
+        action: ToolApprovalTokenAction,
+        created_by: UserId,
+        expires_in_hours: int = 24,
+    ) -> ToolApprovalToken:
+        """Mint one opaque one-shot button reference for an approval.
+
+        The token carries NO authority: the callback path re-checks the
+        actor's ``tool.manage`` permission, the gate's current decision
+        state, and expiry before consuming it.
+        """
+        self._authz.require_permission(
+            actor_id=created_by,
+            project_id=project_id,
+            permission="tool.manage",
+            source="web",
+        )
+        if action not in ("allow_once", "allow_always", "deny"):
+            raise ValueError("action must be allow_once, allow_always, or deny")
+        if expires_in_hours <= 0 or expires_in_hours > 168:
+            raise ValueError("expires_in_hours must be between 1 and 168")
+        expires_at = (
+            datetime.now(UTC) + timedelta(hours=expires_in_hours)
+        ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        token = ToolApprovalToken(
+            id=ToolApprovalTokenId(generate_tool_approval_token_id()),
+            project_id=project_id,
+            approval_id=approval_id,
+            action=action,
+            expires_at=expires_at,
+            used_at=None,
+            created_by=created_by,
+            created_at=now_utc_iso(),
+        )
+        self._repo.insert_tool_approval_token(token)
+        return token
+
+    def send_tool_approval_card(self, request: Any) -> str:
+        """Push one pending tool-approval card to every Telegram binding.
+
+        Hermes parity: the approval prompt reaches the chat as a message
+        with inline buttons (allow once / always / deny) whose callback
+        ids are opaque one-shot tokens. Idempotent: unused live tokens
+        for the SAME approval short-circuit the resend. Never raises.
+        """
+        transport = getattr(self, "direct_reply_transport", None)
+        if transport is None:
+            return "tool approval card skipped (no outbound transport)"
+        project_id = ProjectId(request.project_id)
+        try:
+            live = self._repo.list_live_tool_approval_tokens(
+                project_id, request.id
+            )
+            if live:
+                return "tool approval buttons already exist; not re-sent"
+            owner = self._identity_repo.get_project(project_id).owner_user_id
+            allow_once = self.create_tool_approval_token(
+                project_id=project_id,
+                approval_id=request.id,
+                action="allow_once",
+                created_by=owner,
+            )
+            allow_always = self.create_tool_approval_token(
+                project_id=project_id,
+                approval_id=request.id,
+                action="allow_always",
+                created_by=owner,
+            )
+            deny = self.create_tool_approval_token(
+                project_id=project_id,
+                approval_id=request.id,
+                action="deny",
+                created_by=owner,
+            )
+            markup = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "✅ Allow once",
+                            "callback_data": allow_once.id.value,
+                        },
+                        {
+                            "text": "🔓 Always",
+                            "callback_data": allow_always.id.value,
+                        },
+                        {"text": "✖️ Deny", "callback_data": deny.id.value},
+                    ]
+                ]
+            }
+            execution_value = str(getattr(request, "execution_id", "") or "")
+            # Live-run fix (2026-08-31): the card used to show
+            # "Execution: -" with no way to identify the request. The
+            # durable approval id is always shown (resolvable via
+            # /approvals or the HTTP surface), and ad-hoc/chat-scoped
+            # requests (no execution) are labeled as such instead of a
+            # bare "-".
+            execution = execution_value or "(ad-hoc / chat — no execution scope)"
+            text = (
+                "🔧 Tool approval needed\n\n"
+                f"Tool: {html.escape(str(request.tool_name))}\n"
+                f"Approval: {html.escape(str(request.id))}\n"
+                f"Execution: {html.escape(execution)}\n\n"
+                "Approve once, grant for this tool (durable), or deny."
+            )
+            targets = [
+                b
+                for b in self._repo.list_bindings_for_project(project_id)
+                if b.platform == "telegram" and b.is_enabled
+            ]
+            if not targets:
+                return "tool approval card skipped (no enabled telegram binding)"
+            delivered = 0
+            for binding in targets:
+                try:
+                    transport.send_message(
+                        project_id=project_id,
+                        binding_id=binding.id,
+                        actor_id=owner,
+                        text=text,
+                        chat_id=str(binding.chat_id),
+                        topic_id=(
+                            str(binding.topic_id) if binding.topic_id else None
+                        ),
+                        reply_markup=markup,
+                    )
+                    delivered += 1
+                except Exception as exc:  # noqa: BLE001 - per-binding isolation
+                    logger.info(
+                        "tool approval card delivery failed for binding %s: %s",
+                        binding.id.value,
+                        type(exc).__name__,
+                    )
+            return f"tool approval card sent to {delivered} binding(s)"
+        except Exception as exc:  # noqa: BLE001 - notify must never raise
+            logger.info(
+                "tool approval card dispatch failed: %s", type(exc).__name__
+            )
+            return f"tool approval card failed ({type(exc).__name__})"
+
+    def _process_tool_callback(
+        self,
+        *,
+        binding: InterfaceBinding,
+        event: NormalizedEvent,
+        user_id: UserId,
+    ) -> InterfaceEventLogEntry:
+        """Resolve a pending tool approval from an inline button press.
+
+        Same durable contract as plan callbacks: opaque token → scope
+        check → permission → state re-resolution → one-shot consumption
+        → durable decision via the gate.
+        """
+        gate = getattr(self, "tool_approval_gate", None)
+        if gate is None:
+            entry = self._callback_entry(
+                binding=binding,
+                event=event,
+                user_id=user_id,
+                result="error",
+                detail="tool approval gate is not wired",
+            )
+            return self._record_event(entry)
+        try:
+            token = self._repo.get_tool_approval_token(
+                ToolApprovalTokenId(event.callback_token)
+            )
+        except (ToolApprovalTokenNotFoundError, ValueError):
+            entry = self._callback_entry(
+                binding=binding,
+                event=event,
+                user_id=user_id,
+                result="error",
+                detail="tool approval token not found",
+            )
+            return self._record_event(entry)
+
+        if token.project_id != binding.project_id:
+            entry = self._callback_entry(
+                binding=binding,
+                event=event,
+                user_id=user_id,
+                result="denied",
+                detail="tool approval token belongs to another project",
+            )
+            return self._record_event(entry)
+
+        try:
+            self._authz.require_permission(
+                actor_id=user_id,
+                project_id=token.project_id,
+                permission="tool.manage",
+                source=binding.platform,  # type: ignore[arg-type]
+            )
+        except AuthorizationError:
+            entry = self._callback_entry(
+                binding=binding,
+                event=event,
+                user_id=user_id,
+                result="denied",
+                detail="callback actor is not authorized for tool approvals",
+            )
+            return self._record_event(entry)
+
+        if token.is_used:
+            entry = self._callback_entry(
+                binding=binding,
+                event=event,
+                user_id=user_id,
+                result="processed",
+                detail="tool approval token already used (idempotent)",
+            )
+            return self._record_event(entry)
+
+        now = datetime.now(UTC)
+        if token.is_expired_at(now):
+            entry = self._callback_entry(
+                binding=binding,
+                event=event,
+                user_id=user_id,
+                result="error",
+                detail="tool approval token expired",
+            )
+            return self._record_event(entry)
+
+        request = gate.get(token.approval_id)
+        if request is None:
+            entry = self._callback_entry(
+                binding=binding,
+                event=event,
+                user_id=user_id,
+                result="error",
+                detail="tool approval request no longer exists",
+            )
+            return self._record_event(entry)
+        if request.decision is not None:
+            entry = self._callback_entry(
+                binding=binding,
+                event=event,
+                user_id=user_id,
+                result="processed",
+                detail="tool approval already resolved (idempotent)",
+            )
+            return self._record_event(entry)
+
+        decision_map = {
+            "allow_once": ("allow", "once"),
+            "allow_always": ("allow", "always"),
+            "deny": ("deny", "once"),
+        }
+        decision, grain = decision_map[token.action]
+        try:
+            gate.resolve(
+                token.approval_id,
+                decision=decision,
+                decided_by_user_id=user_id.value,
+                grain=grain,
+                reason=f"telegram:{token.action}",
+            )
+            result = "processed"
+            detail = (
+                f"tool approval {token.action} recorded for {request.tool_name}"
+            )
+        except Exception as exc:  # noqa: BLE001 - typed by the gate
+            result = "error"
+            detail = f"tool approval resolve failed: {type(exc).__name__}"
+
+        if result == "processed":
+            used = self._repo.mark_tool_approval_token_used(
+                token.id, now_utc_iso()
+            )
+            if not used:
+                detail = "tool approval was already finalized by another process"
+
+        entry = self._callback_entry(
+            binding=binding,
+            event=event,
+            user_id=user_id,
+            result=result,  # type: ignore[arg-type]
+            detail=detail,
+        )
+        return self._record_event(entry, succeeded=result != "error")
+
+    def _callback_entry(
+        self,
+        *,
+        binding: InterfaceBinding,
+        event: NormalizedEvent,
+        user_id: UserId | None,
+        result: str,
+        detail: str,
+    ) -> InterfaceEventLogEntry:
+        """One durable event-log entry for a callback outcome."""
+        return InterfaceEventLogEntry(
+            id=InterfaceEventId(generate_interface_event_id()),
+            project_id=binding.project_id,
+            platform=event.platform,
+            external_event_id=event.external_event_id,
+            external_actor_id=event.external_actor_id,
+            resolved_user_id=user_id,
+            chat_id=event.chat_id,
+            topic_id=event.topic_id,
+            event_kind=event.event_kind,
+            event_content="[tool approval callback]",
+            processing_result=result,  # type: ignore[arg-type]
+            processing_detail=detail,
+            created_at=now_utc_iso(),
+        )
 
     # ------------------------------------------------------------------
     # Read operations

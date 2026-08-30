@@ -708,6 +708,18 @@ class WorktreeService:
             created_at=now_utc_iso(),
             updated_at=now_utc_iso(),
         )
+        # Live-run fix (2026-08-31): a task re-attempt used to die with
+        # "UNIQUE constraint failed: worktrees.task_id" /
+        # "workspace/context setup failed: IntegrityError" whenever a
+        # previous attempt left its worktree in one of the
+        # partial-unique states (allocated/active/interrupted) — the
+        # engine was killed mid-task, the attempt was requeued, and the
+        # stale row permanently occupied idx_worktrees_task_active.
+        # Abandon the stale worktree (best-effort git cleanup, row moved
+        # out of the index states) BEFORE creating the fresh one.
+        stale = self._repo.get_worktree_for_task(task_id, project_id=project_id)
+        if stale is not None:
+            self._abandon_worktree(stale, reason="task re-attempt")
         try:
             self._repo.insert_worktree(worktree)
         except WorktreeAlreadyExistsError:
@@ -764,6 +776,88 @@ class WorktreeService:
             os.chmod(ignore, 0o600)
         except OSError as exc:
             logger.debug("worktree .gitignore write failed: %s", exc)
+
+    def _abandon_worktree(self, worktree, *, reason: str) -> Worktree:
+        """Move a stale in-flight worktree out of the partial-unique states.
+
+        Live-run fix (2026-08-31): rows stuck in ``allocated`` /
+        ``active`` / ``interrupted`` permanently occupy
+        ``idx_worktrees_task_active`` and poisoned every re-attempt of
+        the owning task with
+        ``UNIQUE constraint failed: worktrees.task_id``. Abandonment
+        best-effort removes the git worktree + directory (the owning
+        task is provably not running anymore) and transitions the row
+        through a legal transition to ``failed``/``cancelled`` —
+        evidence states preserved for audit, index freed for the fresh
+        worktree the re-attempt creates.
+        """
+        current_state = worktree.state
+        # Legal exits from the index states per WORKTREE_TRANSITIONS:
+        # allocated -> cancelled; active -> failed; interrupted -> cancelled.
+        target: WorktreeState
+        if current_state == "active":
+            target = "failed"
+        else:
+            target = "cancelled"
+        try:
+            self._git_worktree_remove(worktree.worktree_path, force=True)
+        except Exception:  # noqa: BLE001 - git state must not block recovery
+            shutil.rmtree(worktree.worktree_path, ignore_errors=True)
+        if not is_valid_worktree_transition(current_state, target):
+            logger.warning(
+                "worktree %s cannot be abandoned from %r to %r",
+                worktree.id.value,
+                current_state,
+                target,
+            )
+            return worktree
+        self._repo.update_worktree_state(worktree.id, target)
+        # System-path record: the audit repository requires a real actor
+        # id (prefix-validated), so the boot sweep is logged instead of
+        # written to the audit log. The state transition itself is the
+        # durable record.
+        logger.warning(
+            "worktree %s (task %s) abandoned: state %r -> %r (%s)",
+            worktree.id.value,
+            worktree.task_id.value,
+            current_state,
+            target,
+            reason,
+        )
+        return self._repo.get_worktree(worktree.project_id, worktree.id)
+
+    def abandon_stale_worktrees(self) -> int:
+        """Abandon every in-flight worktree whose task is not running.
+
+        Boot-recovery sweep (see BackgroundWorkerHost._startup_recovery).
+        The invariant mirrors the agent-instance lease: an in-flight
+        worktree is valid only while its owning task is ``running``. A
+        missing task row or any non-running task state means the
+        worktree was left behind by a dead process; it can never be
+        resumed (each attempt creates a fresh worktree), so keeping it
+        in the partial-unique states only poisons future attempts.
+        Returns the number of abandoned worktrees.
+        """
+        abandoned = 0
+        for worktree in self._repo.list_worktrees_in_states():
+            try:
+                task = self._execution_repo.get_task(
+                    worktree.task_id, project_id=worktree.project_id
+                )
+            except Exception:  # noqa: BLE001 - missing task row = stale
+                task = None
+            if task is not None and task.state == "running":
+                continue
+            try:
+                self._abandon_worktree(worktree, reason="boot recovery")
+                abandoned += 1
+            except Exception as exc:  # noqa: BLE001 - per-worktree isolation
+                logger.debug(
+                    "worktree %s abandonment failed: %s",
+                    worktree.id.value,
+                    type(exc).__name__,
+                )
+        return abandoned
 
     def activate_worktree(
         self,

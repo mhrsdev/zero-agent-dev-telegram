@@ -54,6 +54,13 @@ _TOOL_LINE_LIMIT = 160
 _MAX_TOOL_LINES = 6
 #: Tool summary footer kept on finalize when tools ran.
 _TOOL_SUMMARY_LIMIT = 6
+#: Hermes stream-consumer parity (``_MAX_FLOOD_STRIKES``): after this many
+#: consecutive flood-controlled edit failures, progressive editing is
+#: disabled for the stream (each edit would sleep up to the bounded 15s,
+#: stalling the turn for minutes on a chat-level flood penalty). The
+#: finalize edit is still attempted once; the durable send path owns the
+#: final content either way.
+_MAX_FLOOD_STRIKES = 3
 
 
 def _truncate_preview(text: str) -> str:
@@ -120,6 +127,8 @@ class TelegramLiveStream:
         self._last_edit_at = 0.0
         self._last_frame: str | None = None
         self._finalized = False
+        self._flood_strikes = 0
+        self._edits_disabled = False
 
     # ------------------------------------------------------------------
     # Event handlers (called from the streaming callbacks)
@@ -140,10 +149,25 @@ class TelegramLiveStream:
             self._text = ""
             self._flush_locked(force=False)
 
-    def on_tool_call(self, name: str, arguments: Any) -> None:
-        """Show one tool invocation as a progress line."""
+    def on_tool_call(self, name: str, arguments: Any, *, replace: bool = False) -> None:
+        """Show one tool invocation as a progress line.
+
+        ``replace=True`` (live-run fix 2026-08-31): the stream tap emits
+        one event per accumulated fragment of the SAME call while
+        arguments stream in; the pending line for that call is updated
+        in place so the preview converges to the full call instead of
+        stacking duplicate/garbled lines.
+        """
         with self._lock:
-            self._tool_lines.append(_tool_line(name, arguments))
+            line = _tool_line(name, arguments)
+            if (
+                replace
+                and self._tool_lines
+                and self._tool_lines[-1].startswith(f"🔧 {name}(")
+            ):
+                self._tool_lines[-1] = line
+            else:
+                self._tool_lines.append(line)
             del self._tool_lines[:-_MAX_TOOL_LINES]
             self._flush_locked(force=True)
 
@@ -174,6 +198,8 @@ class TelegramLiveStream:
     def _flush_locked(self, *, force: bool) -> None:
         if self._finalized:
             return
+        if self._edits_disabled:
+            return
         now = self._sleeper()
         if not force and (now - self._last_edit_at) < self._min_edit_interval:
             return
@@ -191,8 +217,20 @@ class TelegramLiveStream:
                 topic_id=self._topic_id,
             )
         except Exception as exc:  # noqa: BLE001 - preview must never fail the turn
+            if "retry after" in str(exc).lower():
+                self._flood_strikes += 1
+                if self._flood_strikes >= _MAX_FLOOD_STRIKES:
+                    self._edits_disabled = True
+                    logger.warning(
+                        "live stream edits disabled after %s flood strikes "
+                        "(chat=%s) — final answer will be delivered by the "
+                        "durable send path",
+                        self._flood_strikes,
+                        self._chat_id,
+                    )
             logger.debug("live stream edit skipped: %s", type(exc).__name__)
             return
+        self._flood_strikes = 0
         self._last_edit_at = now
         self._last_frame = frame
 
@@ -368,8 +406,22 @@ class TelegramExecutionProgress:
                     self._current_tool.clear()
                     self._flush_locked(force=False)
             elif kind == "tool_call":
-                line = _tool_line(str(payload.get("name") or "?"), payload.get("arguments"))
-                self._current_tool.append(line)
+                # Live-run fix (2026-08-31): the tap emits one event per
+                # accumulated fragment of the SAME call (replace=True)
+                # while arguments stream in. Appending every event used
+                # to stack garbled fragment lines — observed live as
+                # "🔧 ?(and\")" / "🔧 ?(: \"ls\")". Replace the pending
+                # line instead so the preview converges to the call.
+                name = str(payload.get("name") or "tool")
+                line = _tool_line(name, payload.get("arguments"))
+                if (
+                    payload.get("replace")
+                    and self._current_tool
+                    and self._current_tool[-1].startswith(f"🔧 {name}(")
+                ):
+                    self._current_tool[-1] = line
+                else:
+                    self._current_tool.append(line)
                 del self._current_tool[:-_MAX_TOOL_LINES]
                 self._flush_locked(force=True)
 

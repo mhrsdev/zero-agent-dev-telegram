@@ -1,0 +1,28 @@
+{"name": "health.readyz", "ok": true, "detail": "{\"status\": \"ok\", \"version\": \"0.9.0\", \"environment\": \"development\", \"database\": \"ok\", \"migration_count\": 35}", "ts": "20:43:08"}
+{"name": "health.capabilities", "ok": true, "detail": "{\"environment\": \"development\", \"capabilities\": {\"database_backend\": {\"status\": \"available\", \"detail\": \"sqlite (file)\"}, \"worktree_execution\": {\"status\": \"available\", \"detail\": \"host_bounded (test/development isolation mode)\"}, \"planner_provider\": {\"status\": \"available\", \"detail\": \"openai-compatible:", "ts": "20:43:08"}
+{"name": "health.metrics", "ok": true, "detail": "metrics bytes=248", "ts": "20:43:08"}
+{"name": "telegram.getMe", "ok": true, "detail": "@SandboxEnvironmentBot id=8753924431", "ts": "20:43:08"}
+{"name": "telegram.send_message_to_group", "ok": true, "detail": "message_id=664", "ts": "20:43:09"}
+{"name": "telegram.mark_commands", "ok": true, "detail": "commands registered on Bot API", "ts": "20:43:09"}
+{"name": "provider.real_completion", "ok": true, "detail": "content='ENGINE-PROVIDER-OK'", "ts": "20:43:10"}
+{"name": "provider.real_streaming", "ok": true, "detail": "deltas=1 text='One, two, three, four, five.'", "ts": "20:43:13"}
+{"name": "provider.real_tool_call_round", "ok": true, "detail": "native tool-call ok: internet_search('Nous Research Hermes agent')", "ts": "20:43:15"}
+{"name": "engine.identity_link_verify", "ok": true, "detail": "identity ei_ptu70wmfz2o2t9k1r19t8ln8 linked+verified for user zu_yyq3ajdzdgg", "ts": "20:43:15"}
+{"name": "plan.create_and_revise", "ok": true, "detail": "plan=plan_ondsp6qvaxp rev=1", "ts": "20:43:15"}
+{"name": "agent_types.lifecycle_and_knowledge", "ok": true, "detail": "types=['live-keeper']", "ts": "20:43:15"}
+{"name": "tools.echo_isolated_runner", "ok": true, "detail": "echo tool ran through the subprocess-isolated runner", "ts": "20:43:15"}
+{"name": "tools.websearch_real_via_engine_http", "ok": true, "detail": "engine HTTP invoke ok: first result='GitHub - NousResearch/hermes-agent: The agent that grows with you \u00b7 GitHub'", "ts": "20:43:16"}
+{"name": "mcp.real_stdio_server_roundtrip", "ok": true, "detail": "tools=['add'] call->'sum=0'", "ts": "20:43:16"}
+{"name": "tool_approval.pending_card_resolve", "ok": true, "detail": "pending \u2192 card(tool approval card sent to 1 binding(s)) \u2192 resolved=allow", "ts": "20:43:20"}
+{"name": "chat.live_stream_turn_real_telegram", "ok": true, "detail": "conversational reply sent", "ts": "20:43:58"}
+{"name": "planner.real_proposal", "ok": true, "detail": "revision 1: 'Add a Python module `greeting.py` exposing a single function `greet(name)` that returns the string `Hello, <name>!`, tog'", "ts": "20:44:21"}
+{"name": "decomposition.real_llm_split", "ok": true, "detail": "7 tasks: ['survey_repo_layout', 'confirm_test_framework', 'implement_greeting_module', 'add_greeting_tests', 'verify_no_new_dependencies_and_lint', 'run_full_test_suite', 'capture_final_diff'] deps=7", "ts": "20:44:21"}
+{"name": "scheduler.tick_full_pipeline", "ok": true, "detail": "approved=10 handoffs_claimed=1 tasks_run=0 deliveries=8 errors=[]", "ts": "20:44:32"}
+{"name": "agent_runtime.real_task_with_tools", "ok": true, "detail": "all decomposed tasks already reached terminal state (prior ticks drained them)", "ts": "20:44:32"}
+{"name": "rag.ingest_search_retrieve", "ok": true, "detail": "doc=approved fts_hits=1 retrieval_candidates=1 ledger=yes", "ts": "20:44:32"}
+{"name": "compaction.real_llm_summary", "ok": true, "detail": "compaction already recorded for this execution+context version (4 record(s), latest state=activated) \u2014 durable one-record-per-version contract held", "ts": "20:44:32"}
+{"name": "polling.single_poller_guarantee", "ok": true, "detail": "engine (pid 7582) owns the poll lock \u2014 this process is correctly refused a second getUpdates consumer; real polling is proven by the engine log 'Telegram bot online' + getUpdates 200s", "ts": "20:44:32"}
+{"name": "provider.usage_ledger", "ok": true, "detail": "provider_requests=60 latest=claude-opus-5", "ts": "20:44:32"}
+{"name": "auth.bootstrap_http_and_token", "ok": true, "detail": "bootstrap already completed (409) \u2014 one-time contract enforced", "ts": "20:44:32"}
+{"name": "http.interface_bindings_and_deliveries", "ok": true, "detail": "bindings=[('-1004406039396', True)] pending_deliveries=0", "ts": "20:44:32"}
+{"name": "plan_card.callback_tokens", "ok": true, "detail": "callback token ct_foutssmj9ry... minted (24h TTL)", "ts": "20:44:32"}

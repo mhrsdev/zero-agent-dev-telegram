@@ -71,11 +71,24 @@ class InterfaceTransportService:
         self._secret_service = secret_service
         self._transport = transport
         self._adapters: dict[str, TelegramAdapter | DiscordAdapter] = {}
+        # GAP 4 (2026-08-31): when the user-session worker connects, its
+        # adapter is attached here so bindings WITHOUT a bot token (the
+        # user-session scope) can still deliver replies — through the
+        # personal account, rate-limited by the adapter's token bucket.
+        self._session_adapter: Any = None
         if settings.telegram_webhook_secret is not None:
             self._adapters["telegram"] = TelegramAdapter(
                 event_handler=interface_service.process_inbound_event,
                 transport=transport,
                 webhook_secret=settings.telegram_webhook_secret.get_secret_value(),
+                # Uniformity fix (2026-08-31): the verifier adapter never
+                # calls the Bot API itself (no token), but every OTHER
+                # adapter construction honors ZERO_TELEGRAM_API_BASE — the
+                # webhook path now does too, so a self-hosted Bot API
+                # gateway behaves identically on both intake paths.
+                api_base_url=os.environ.get(
+                    "ZERO_TELEGRAM_API_BASE", "https://api.telegram.org"
+                ).rstrip("/"),
             )
         if settings.discord_application_public_key is not None:
             self._adapters["discord"] = DiscordAdapter(
@@ -198,6 +211,10 @@ class InterfaceTransportService:
                 event.callback_query_id,
             )
 
+    def attach_session_adapter(self, adapter: Any) -> None:
+        """Attach the MTProto user-session adapter as an outbound path."""
+        self._session_adapter = adapter
+
     def send_message(
         self,
         *,
@@ -237,6 +254,36 @@ class InterfaceTransportService:
             raise InterfaceScopeError("interface binding is not available") from exc
         if not binding.is_enabled:
             raise InterfaceScopeError("interface binding is not enabled")
+        # GAP 4 outbound (2026-08-31): a user-session binding stores NO bot
+        # token. When the MTProto adapter is attached, its replies flow
+        # through the personal account (rate-limited by the adapter's token
+        # bucket); without it the historical error is honest.
+        if (
+            binding.platform == "telegram"
+            and binding.bot_token_ref is None
+        ):
+            if self._session_adapter is None:
+                raise InterfaceTransportNotConfigured(
+                    "telegram binding has no bot credential and no "
+                    "user-session adapter is attached"
+                )
+            try:
+                sent = self._session_adapter.send_message(
+                    chat_id=str(
+                        chat_id if chat_id is not None else binding.chat_id
+                    ),
+                    text=text,
+                )
+            except Exception as exc:
+                raise InterfaceTransportError(
+                    f"user-session outbound send failed: {type(exc).__name__}"
+                ) from exc
+            message_id = getattr(sent, "id", None)
+            if message_id is None:
+                raise InterfaceTransportUnknownOutcome(
+                    "user-session send returned no message id"
+                )
+            return str(message_id)
         if binding.bot_token_ref is None:
             raise InterfaceTransportNotConfigured(
                 "interface binding has no bot credential reference"

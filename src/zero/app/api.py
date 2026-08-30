@@ -127,6 +127,23 @@ def create_app(settings: Settings) -> FastAPI:
             "telegram command book could not be wired", exc_info=True
         )
 
+    # Tool-approval inline buttons (Hermes parity, 2026-08-31): when the
+    # per-call gate runs in manual mode, a newly minted pending request is
+    # pushed to every enabled Telegram binding as a card with allow
+    # once / always / deny buttons; presses flow back through the durable
+    # callback pipeline into ToolApprovalGate.resolve.
+    if services.approval_gate is not None and services.approval_gate.mode == "manual":
+        try:
+            services.approval_gate.attach_notifier(
+                services.interfaces.send_tool_approval_card
+            )
+            services.interfaces.tool_approval_gate = services.approval_gate
+        except Exception:  # noqa: BLE001 - approval surface is optional
+            _logging.getLogger(__name__).warning(
+                "tool approval telegram surface could not be wired",
+                exc_info=True,
+            )
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         await worker_host.start()
@@ -304,7 +321,13 @@ def _register_auth_middleware(app: FastAPI, services: Services, settings: Settin
             token = request.cookies.get("zero_access_token", "")
             token_source = "cookie"
         try:
-            actor_id = services.auth.authenticate(token)
+            # Hardening wave 8: both reads below are synchronous SQLite
+            # queries. Inline execution in this coroutine serialized the
+            # event loop for every authenticated request; offload them to
+            # the request threadpool exactly like the routers/webhooks.
+            from starlette.concurrency import run_in_threadpool
+
+            actor_id = await run_in_threadpool(services.auth.authenticate, token)
         except AuthenticationError:
             return JSONResponse(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -326,13 +349,19 @@ def _register_auth_middleware(app: FastAPI, services: Services, settings: Settin
 
             match = _PROJECT_PATH.match(path)
             if match:
-                try:
+                project_id_value = match.group(1)
+
+                def _check_project_scope() -> None:
+                    """Synchronous scope check run via the threadpool."""
                     services.authorization.require_permission(
                         actor_id=actor_id,
-                        project_id=ProjectId(match.group(1)),
+                        project_id=ProjectId(project_id_value),
                         permission="project.view",
                         source="web",
                     )
+
+                try:
+                    await run_in_threadpool(_check_project_scope)
                 except (AuthorizationError, ValueError):
                     return JSONResponse(
                         status_code=status.HTTP_404_NOT_FOUND,

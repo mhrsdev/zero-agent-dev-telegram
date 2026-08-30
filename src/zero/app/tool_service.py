@@ -650,6 +650,27 @@ class ToolService:
             )
         return tuple(registered)
 
+    def rebind_server_handler(
+        self,
+        tool: Tool,
+        *,
+        handler: ToolHandler,
+        inline: bool = True,
+    ) -> None:
+        """Re-attach a process-local handler to an existing tool row.
+
+        Live-run fix (2026-08-31): tool rows persist across restarts but
+        handlers are intentionally process-local callables. The worktree
+        tools rebind their handlers on every composition start; config
+        sync's registered tools (e.g. ``internet_search``) did NOT — so
+        every restart after the first left the tool 500ing with
+        "No handler registered" until the row was deleted by hand.
+        """
+        if tool.handler_key not in self._handlers or self._handlers.get(tool.handler_key) is not handler:
+            self._handlers[tool.handler_key] = handler
+        if inline:
+            self._inline_handler_keys.add(tool.handler_key)
+
     def get_tool(self, tool_id: ToolId) -> Tool:
         return self._tool_repo.get_tool_by_id(tool_id)
 

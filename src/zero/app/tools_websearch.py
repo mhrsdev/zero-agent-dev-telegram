@@ -26,6 +26,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -138,11 +139,19 @@ def make_web_search_handler(
     endpoint: str = WEB_SEARCH_ENDPOINT,
     timeout_seconds: float = _WEB_SEARCH_TIMEOUT_SECONDS,
     fetcher=None,
+    fetch_attempts: int = 2,
 ):
     """Build the inline ``web_search`` handler.
 
     ``fetcher`` is a test seam: ``fetcher(query) -> html_text``. In
     production it performs the real HTTP GET through httpx.
+
+    Resilience (2026-08-31, live run): the DDG Lite backend proved
+    INTERMITTENTLY unreachable from a filtered network — one-shot
+    fetches flapped between real results and ConnectTimeout errors
+    within minutes. The fetch now retries transient failures
+    (connect/timeout/reset) with a short pause before reporting the
+    structured unreachable error to the model.
     """
 
     def _fetch(query: str) -> str:
@@ -160,13 +169,34 @@ def make_web_search_handler(
         response.raise_for_status()
         return response.text
 
+    def _fetch_with_retry(query: str) -> str:
+        attempts = max(1, int(fetch_attempts))
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return _fetch(query)
+            except Exception as exc:  # noqa: BLE001 - retryable fetch errors
+                transient = type(exc).__name__ in {
+                    "ConnectTimeout",
+                    "ReadTimeout",
+                    "ConnectError",
+                    "ReadError",
+                    "RemoteProtocolError",
+                    "PoolingTimeout",
+                }
+                last_exc = exc
+                if not transient or attempt == attempts - 1:
+                    raise
+                time.sleep(1.0 * (attempt + 1))
+        raise last_exc  # pragma: no cover - defensive
+
     def handler(input_data: dict[str, Any], context: Any) -> dict[str, Any]:
         query = str((input_data or {}).get("query", "")).strip()
         if not query:
             return {"query": "", "results": [], "error": "empty query"}
         query = query[:_MAX_QUERY_CHARS]
         try:
-            page = _fetch(query)
+            page = _fetch_with_retry(query)
         except Exception as exc:  # noqa: BLE001 - network failure is a result
             logger.info("web_search fetch failed: %s", type(exc).__name__)
             return {
