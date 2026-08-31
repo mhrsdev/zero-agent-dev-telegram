@@ -127,12 +127,14 @@ def create_app(settings: Settings) -> FastAPI:
             "telegram command book could not be wired", exc_info=True
         )
 
-    # Tool-approval inline buttons (Hermes parity, 2026-08-31): when the
-    # per-call gate runs in manual mode, a newly minted pending request is
-    # pushed to every enabled Telegram binding as a card with allow
-    # once / always / deny buttons; presses flow back through the durable
-    # callback pipeline into ToolApprovalGate.resolve.
-    if services.approval_gate is not None and services.approval_gate.mode == "manual":
+    # Tool-approval inline buttons (Hermes parity, 2026-08-31): a newly
+    # minted pending request is pushed to every enabled Telegram binding
+    # as a card with allow once / session / always / deny buttons; presses
+    # flow back through the durable callback pipeline into
+    # ToolApprovalGate.resolve. Fix 14: attached in EVERY mode — the gate
+    # only fires the notifier when it actually mints a pending row
+    # (manual mode), so off/auto deployments gain nothing but lose nothing.
+    if services.approval_gate is not None:
         try:
             services.approval_gate.attach_notifier(
                 services.interfaces.send_tool_approval_card

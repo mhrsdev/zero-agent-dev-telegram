@@ -13,7 +13,8 @@ import pytest
 from fastapi import FastAPI
 
 # Golden table captured from the un-split monolith at commit 6378ead
-# (93 distinct method+path pairs; see evidence/route-table-golden.json).
+# (93 pairs) + wave-14 fixes 17/21 (planner/propose, task reconcile):
+# 95 distinct method+path pairs; see evidence/route-table-golden.json.
 GOLDEN_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("DELETE", "/auth/tokens/current"),
@@ -76,6 +77,7 @@ GOLDEN_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/projects/{project_id}/executions/{execution_id}/recover"),
         ("POST", "/projects/{project_id}/executions/{execution_id}/run-ready"),
         ("POST", "/projects/{project_id}/handoffs/{handoff_id}/executions"),
+        ("POST", "/projects/{project_id}/executions/{execution_id}/tasks/{task_id}/reconcile"),
         ("POST", "/projects/{project_id}/integration/proposals"),
         ("POST", "/projects/{project_id}/integration/proposals/{proposal_id}/approve"),
         ("POST", "/projects/{project_id}/integration/proposals/{proposal_id}/execute"),
@@ -90,6 +92,7 @@ GOLDEN_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/projects/{project_id}/plans/{plan_id}/approve"),
         ("POST", "/projects/{project_id}/plans/{plan_id}/reject"),
         ("POST", "/projects/{project_id}/plans/{plan_id}/revisions"),
+        ("POST", "/projects/{project_id}/planner/propose"),
         ("POST", "/projects/{project_id}/providers/requests/{request_id}/reconcile"),
         ("GET", "/projects/{project_id}/tool-approvals"),
         ("POST", "/projects/{project_id}/rag"),

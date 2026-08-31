@@ -340,6 +340,19 @@ class MCPManager:
                             input_schema=schema,
                             output_schema={"type": "object"},
                         )
+                        # Live audit fix (2026-08-31): tool rows persist
+                        # across restarts, but handlers are process-local.
+                        # The existing-row path used to skip handler wiring
+                        # entirely, so on every engine restart after the
+                        # first the MCP tool stayed registered in the DB
+                        # while its invocation 500ed with "No handler
+                        # registered". Rebind the fresh child-process
+                        # handler exactly like the worktree tools do.
+                        tool_service.rebind_server_handler(
+                            existing,
+                            handler=make_handler(server, str(tool_name)),
+                            inline=True,
+                        )
                         names.append(registered_name)
                         continue
                     tool_service.register_tool(

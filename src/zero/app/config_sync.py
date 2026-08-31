@@ -148,6 +148,11 @@ def sync_management_config(settings: Settings, services: Services) -> None:
     _sync_providers(settings, services, project, owner_id, cfg, cfgsvc)
     _sync_telegram_bindings(services, project, owner_id, cfg, cfgsvc, settings)
     _sync_planner(services, cfg)
+    # Fix 14 (Hermes approvals parity): retune the live approval gate
+    # from config.yaml instead of requiring a rebuild to change posture.
+    _sync_approvals(services, cfg)
+    # Fix 16: scheduler/feature flags become operator config surfaces.
+    _sync_features(services, cfg)
     # M16 (2026-08-31, mega-run live-found): the per-project tool floors
     # (workspace tools + internet_search) used to be granted for the
     # MANAGEMENT project only. Operator-created projects — the entire
@@ -416,9 +421,16 @@ def _sync_providers(
     )
 
     registered = set(services.providers.registered_provider_names)
-    for prov in cfg.providers:
-        if not prov.enabled:
-            continue
+    # Fix 13 (Hermes fallback chain parity): operators control failover
+    # ORDER via ``fallback_priority`` (lower first, stable on ties) — the
+    # old code registered entries in file order and then set the chain
+    # from an ALPHABETICALLY SORTED registry view, so neither the file
+    # order nor the priority field ever influenced real failover.
+    ordered = sorted(
+        (p for p in cfg.providers if p.enabled),
+        key=lambda p: p.fallback_priority,
+    )
+    for prov in ordered:
         if not prov.api_key_ref:
             logger.warning(
                 "config sync: provider %s has no api_key_ref — skipped", prov.id
@@ -500,6 +512,12 @@ def _sync_providers(
                 api_key=api_key,
                 base_url=prov.base_url,
                 timeout_seconds=timeout,
+                # Fix 13: each config entry registers under its OWN id, so
+                # two OpenAI-compatible gateways (e.g. a primary and a
+                # cheaper backup) coexist and back each other up. The old
+                # protocol-level registry name collapsed them and the
+                # second entry was silently skipped forever.
+                name=prov.id,
             )
         else:
             timeout = settings.openai_timeout_seconds
@@ -507,29 +525,60 @@ def _sync_providers(
                 api_key=api_key,
                 base_url=prov.base_url,
                 timeout_seconds=timeout,
+                name=prov.id,
             )
 
         name = adapter.provider_name
         if name in registered:
+            # Idempotent re-sync: replace the adapter for this entry id
+            # (credentials or base_url may have been rotated) instead of
+            # skipping — config.yaml is the operator truth.
             logger.debug(
-                "config sync: provider %s already registered as %s — skipped",
+                "config sync: provider %s re-registered (adapter replaced)",
                 prov.id,
-                name,
             )
-            continue
         services.providers.register_adapter(adapter)
         registered.add(name)
         logger.info(
-            "config sync: registered provider %s (%s, base_url=%s)",
+            "config sync: registered provider %s (%s protocol, base_url=%s, "
+            "fallback_priority=%s)",
             prov.id,
-            name,
+            prov.protocol,
             prov.base_url,
+            prov.fallback_priority,
         )
 
-    # Multi-adapter fallback chain (Hermes parity).
-    names = services.providers.registered_provider_names
-    if len(names) > 1:
-        services.providers.set_fallback_chain(tuple(names))
+    # Per-provider retry budget + breaker from config.yaml (fix 13b).
+    # ``max_attempts_per_provider`` and ``routing.breaker`` used to be
+    # parsed-and-ignored config fiction; they now drive the live service.
+    services.providers.set_provider_max_attempts(cfg.routing.max_attempts_per_provider)
+    services.providers.set_breaker_policy(
+        failure_threshold=cfg.routing.breaker.failure_threshold,
+        cooldown_seconds=cfg.routing.breaker.cooldown_seconds,
+    )
+
+    # Multi-adapter fallback chain (Hermes parity, fix 13): config
+    # entries in priority order first (the entry serving
+    # ``routing.primary_model`` leads), then env-registered adapters.
+    order = services.providers.registered_provider_order
+    if len(order) > 1:
+        primary_instance = next(
+            (
+                p.id
+                for p in cfg.providers  # file order: the operator's first
+                # entry offering the primary model leads the chain
+                if p.enabled
+                and cfg.routing.primary_model in p.models
+                and p.id in set(order)
+            ),
+            None,
+        )
+        chain = [n for n in order if n in {p.id for p in ordered}]
+        chain += [n for n in order if n not in set(chain)]
+        if primary_instance and chain and chain[0] != primary_instance:
+            chain = [primary_instance] + [n for n in chain if n != primary_instance]
+        services.providers.set_fallback_chain(tuple(chain))
+        logger.info("config sync: provider fallback chain = %s", list(chain))
 
     # Model-level fallback routing from config.yaml.
     if cfg.routing.fallback_models:
@@ -781,30 +830,46 @@ def _sync_planner(services: Services, cfg) -> None:
     if not primary:
         return
 
-    # Find which protocol offers the primary model.
-    provider_protocol = None
-    for prov in cfg.providers:
-        if primary in prov.models:
-            provider_protocol = prov.protocol
-            break
-    if provider_protocol is None:
-        # Primary model not in any provider's catalog — still try with
-        # the first registered provider; the adapter will pass the
-        # model name through and the gateway will either accept it or
-        # return a clear error.
-        registered = services.providers.registered_provider_names
-        if not registered:
+    # Fix 13: find which configured provider INSTANCE offers the primary
+    # model. The old code resolved a protocol-level name ("openai-
+    # compatible" / "anthropic"), which stopped existing once adapters
+    # register under their config entry ids — and was wrong anyway when
+    # two providers offered overlapping model catalogs.
+    provider_instance = next(
+        (
+            p.id
+            for p in cfg.providers
+            if p.enabled and primary in p.models
+        ),
+        None,
+    )
+    registered = services.providers.registered_provider_names
+    if provider_instance is None or provider_instance not in set(registered):
+        # Primary model not in any provider's catalog (or its adapter
+        # failed to register) — fall back to the first registered adapter
+        # in operator order; the gateway will accept it or return a
+        # clear error. With NO adapter at all, keep the sync alive but
+        # warn: the planner stays effectively unroutable.
+        order = services.providers.registered_provider_order
+        if order:
+            provider_instance = order[0]
+            logger.warning(
+                "config sync: routing.primary_model=%s not found in any "
+                "enabled provider catalog — falling back to first "
+                "registered adapter %r",
+                primary,
+                provider_instance,
+            )
+        else:
             logger.warning(
                 "config sync: routing.primary_model=%s but no provider "
                 "is registered — planner stays disabled",
                 primary,
             )
             return
-        provider_protocol = "openai_compatible"
 
     # Create the planner on demand if it was not constructed at
     # build_services time (i.e. settings.openai_api_key was None).
-    registered = services.providers.registered_provider_names
     if not registered:
         logger.error(
             "config sync: planner wired to model %s but NO provider adapter is "
@@ -823,9 +888,7 @@ def _sync_planner(services: Services, cfg) -> None:
         except Exception:  # noqa: BLE001 - dataclass might be frozen-ish
             pass
 
-    services.interfaces._planner_provider = (
-        "anthropic" if provider_protocol == "anthropic" else "openai-compatible"
-    )
+    services.interfaces._planner_provider = provider_instance
     services.interfaces._planner_model = primary
     logger.info(
         "config sync: planner wired (provider=%s, model=%s)",
@@ -842,13 +905,20 @@ def _sync_planner(services: Services, cfg) -> None:
     # exactly what the planner calls.
     chat_bridge = getattr(services.interfaces, "chat_bridge", None)
     if chat_bridge is not None:
+        # Live audit fix (2026-08-31): realign the PROVIDER too, not
+        # just the model. The bridge was constructed at build_services
+        # time with provider="openai-compatible"; an Anthropic-primary
+        # deployment kept that name forever — no adapter is registered
+        # under it, so every conversational turn died while the planner
+        # succeeded on the same gateway.
+        chat_bridge.update_provider(services.interfaces._planner_provider)
         chat_bridge.update_model(primary)
         logger.info(
             "config sync: conversational chat bridge aligned with "
-            "routing.primary_model=%s",
+            "routing.primary_model=%s (provider=%s)",
             primary,
+            services.interfaces._planner_provider,
         )
-
     # Round-7 live fix: the SCHEDULER TICK (task execution + LLM
     # decomposition) also resolved its model from ``settings.openai_model``
     # — the routing table never reached the tasks. The operator's gateway
@@ -859,15 +929,14 @@ def _sync_planner(services: Services, cfg) -> None:
     scheduler = getattr(services, "scheduler", None)
     if scheduler is not None:
         scheduler.set_tick_routing(
-            provider=(
-                "anthropic" if provider_protocol == "anthropic" else "openai-compatible"
-            ),
+            provider=provider_instance,
             model_name=primary,
         )
         logger.info(
             "config sync: scheduler tick (tasks + decomposition) aligned "
-            "with routing.primary_model=%s",
+            "with routing.primary_model=%s (provider=%s)",
             primary,
+            provider_instance,
         )
 
     # GAP H (round-9 live fix): the compaction LLM summarizer was the
@@ -880,15 +949,89 @@ def _sync_planner(services: Services, cfg) -> None:
     compaction = getattr(services, "compaction", None)
     if compaction is not None and compaction.summarizer is not None:
         compaction.summarizer_routing = {
-            "provider": (
-                "anthropic" if provider_protocol == "anthropic" else "openai-compatible"
-            ),
+            "provider": provider_instance,
             "model": primary,
         }
         logger.info(
             "config sync: compaction summarizer aligned with "
-            "routing.primary_model=%s",
+            "routing.primary_model=%s (provider=%s)",
             primary,
+            provider_instance,
+        )
+
+
+def _sync_approvals(services: Services, cfg) -> None:
+    """Apply ``approvals.*`` from config.yaml to the live gate (fix 14).
+
+    Hermes re-reads the approval posture on every check; Zero froze it
+    at boot from ``ZERO_TOOL_APPROVAL_MODE``. Unset file keys keep the
+    boot-time value; explicit keys win (config.yaml is operator truth).
+    """
+    gate = getattr(services, "approval_gate", None)
+    if gate is None:
+        return
+    if cfg.approvals.mode is not None and cfg.approvals.mode != gate.mode:
+        previous = gate.mode
+        try:
+            gate.set_mode(cfg.approvals.mode)
+        except ValueError:
+            logger.error(
+                "config sync: invalid approvals.mode=%r — keeping %r",
+                cfg.approvals.mode,
+                previous,
+            )
+        else:
+            logger.info(
+                "config sync: tool approval posture retuned %r -> %r "
+                "(config.yaml approvals.mode)",
+                previous,
+                gate.mode,
+            )
+    if cfg.approvals.pending_ttl_seconds is not None:
+        try:
+            gate.set_pending_ttl(cfg.approvals.pending_ttl_seconds)
+        except ValueError:
+            logger.error(
+                "config sync: invalid approvals.pending_ttl_seconds=%r — keeping %s",
+                cfg.approvals.pending_ttl_seconds,
+                gate._ttl,
+            )
+        else:
+            logger.info(
+                "config sync: approval pending TTL set to %.0fs",
+                cfg.approvals.pending_ttl_seconds,
+            )
+
+
+def _sync_features(services: Services, cfg) -> None:
+    """Apply ``features.*`` from config.yaml to the live scheduler (fix 16).
+
+    Decomposition, task retry budget, and tick parallelism were env-only
+    flags — invisible to a config.yaml operator and un-tunable without a
+    restart. Unset keys keep the env/boot value.
+    """
+    scheduler = getattr(services, "scheduler", None)
+    if scheduler is None:
+        return
+    features = cfg.features
+    if features.decomposition_enabled is not None:
+        scheduler.set_decomposition_enabled(bool(features.decomposition_enabled))
+        logger.info(
+            "config sync: task decomposition %s (features.decomposition_enabled)",
+            "enabled" if features.decomposition_enabled else "disabled",
+        )
+    if features.task_max_attempts is not None:
+        scheduler.set_task_max_attempts(int(features.task_max_attempts))
+        logger.info(
+            "config sync: task retry budget set to %d (features.task_max_attempts)",
+            features.task_max_attempts,
+        )
+    if features.tick_parallel_executions is not None:
+        scheduler.set_parallel_executions(int(features.tick_parallel_executions))
+        logger.info(
+            "config sync: tick parallel executions set to %d "
+            "(features.tick_parallel_executions)",
+            features.tick_parallel_executions,
         )
 
 

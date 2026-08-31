@@ -154,6 +154,35 @@ class ToolApprovalGate:
     def mode(self) -> str:
         return self._mode
 
+    def set_mode(self, mode: str) -> None:
+        """Retune the approval posture at runtime (Hermes ``/approvals``
+        + ``approvals.mode`` parity).
+
+        Hermes re-reads the approval mode on every check so operators can
+        flip manual → auto → off without a restart; Zero's gate used to
+        freeze the boot-time mode forever. Validated with the same
+        contract as construction; safe to call repeatedly.
+        """
+        if mode not in ("off", "manual", "auto"):
+            raise ValueError("approval mode must be 'off', 'manual' or 'auto'")
+        if mode != self._mode:
+            self._mode = mode
+            # A posture change invalidates nothing durable: pending rows
+            # simply stop being consulted in off/auto, standing grants
+            # and deny rules keep their meaning in every mode.
+            import logging
+
+            logging.getLogger(__name__).info(
+                "tool approval mode retuned to %r at runtime", mode
+            )
+
+    def set_pending_ttl(self, seconds: float) -> None:
+        """Retune how long an un-decided pending request stays fresh."""
+        seconds = float(seconds)
+        if seconds <= 0:
+            raise ValueError("pending_ttl_seconds must be positive")
+        self._ttl = seconds
+
     def attach_notifier(self, callback: Any) -> None:
         """Register the pending-request notifier (best-effort by design)."""
         self._notify = callback

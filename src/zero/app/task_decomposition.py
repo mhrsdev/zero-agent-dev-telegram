@@ -809,6 +809,9 @@ class TaskDecomposer:
                 tools=(DECOMPOSITION_TOOL_DECLARATION,),
                 tool_choice={"type": "function", "name": DECOMPOSITION_TOOL_NAME},
                 system_message=system_prompt,
+                # Fix 19b (live drill): stream the long decomposition JSON —
+                # the gateway edge kills long silent bodies (see planner).
+                stream=True,
             )
             transport_attempt = 0
             while True:
@@ -1007,6 +1010,8 @@ class TaskDecomposer:
                     max_tokens=4096,
                     temperature=0.0,
                     system_message=DECOMPOSITION_SYSTEM_PROMPT,
+                    # Fix 19b: stream the fallback decomposition too.
+                    stream=True,
                 ),
                 idempotency_key=f"decompose:{revision_id}",
                 source=source,

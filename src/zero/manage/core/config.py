@@ -113,6 +113,34 @@ class RoutingCfg(_Strict):
     breaker: BreakerCfg = BreakerCfg()
 
 
+class ApprovalsCfg(_Strict):
+    """Per-call tool approval policy (Hermes ``approvals`` parity).
+
+    Hermes re-reads ``approvals.mode`` on every check so operators can
+    flip the posture without a restart; Zero's env-frozen Settings made
+    that impossible. ``None`` (unset) keeps the boot-time mode from
+    ``ZERO_TOOL_APPROVAL_MODE`` — an explicit file value is synced to
+    the live gate at boot and on every config sync.
+    """
+
+    mode: Literal["off", "manual", "auto"] | None = None
+    pending_ttl_seconds: float | None = Field(None, gt=0)
+
+
+class FeaturesCfg(_Strict):
+    """Engine feature flags that were previously env-only.
+
+    Hermes exposes scheduler/delegation policy as config surfaces; Zero
+    gated decomposition and tick parallelism behind ``ZERO_*`` env vars
+    that a config.yaml-only operator could not reach. ``None`` keeps the
+    env/boot value; explicit values are synced into the live scheduler.
+    """
+
+    decomposition_enabled: bool | None = None
+    task_max_attempts: int | None = Field(None, ge=0, le=10)
+    tick_parallel_executions: int | None = Field(None, ge=1, le=8)
+
+
 class UsageLimits(_Strict):
     soft_daily_tokens: int = Field(500_000, ge=0)
     hard_daily_tokens: int = Field(1_000_000, ge=0)
@@ -149,6 +177,8 @@ class ZeroConfig(_Strict):
     access: AccessCfg = AccessCfg()
     providers: list[ProviderCfg] = Field(default_factory=list)
     routing: RoutingCfg = RoutingCfg()
+    approvals: ApprovalsCfg = ApprovalsCfg()
+    features: FeaturesCfg = FeaturesCfg()
     usage: UsageLimits = UsageLimits()
     websearch: WebSearchCfg = WebSearchCfg()
     backups: BackupsCfg = BackupsCfg()
@@ -233,6 +263,10 @@ class ConfigService:
             "server.environment": "ZERO_ENV",
             "telegram.polling_interval_seconds": "ZERO_POLLING_INTERVAL_SECONDS",
             "routing.max_attempts_per_provider": "ZERO_PROVIDER_MAX_ATTEMPTS",
+            "approvals.mode": "ZERO_TOOL_APPROVAL_MODE",
+            "features.decomposition_enabled": "ZERO_DECOMPOSITION_ENABLED",
+            "features.task_max_attempts": "ZERO_TASK_MAX_ATTEMPTS",
+            "features.tick_parallel_executions": "ZERO_TICK_PARALLEL_EXECUTIONS",
             "websearch": "ZERO_OPENAI_API_KEY",
         }
         out = {}

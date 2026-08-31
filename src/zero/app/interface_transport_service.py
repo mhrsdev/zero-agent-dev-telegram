@@ -19,6 +19,7 @@ from zero.adapters.messaging import (
     PermanentTransportError,
     RetryPolicy,
     TransportError,
+    TransportRejectedError,
 )
 from zero.adapters.telegram import TelegramAdapter, _callback_outcome_text
 from zero.app.secret_service import SecretService
@@ -371,6 +372,14 @@ class InterfaceTransportService:
         except PermanentTransportError as exc:
             # exc text is provider status only; safe to carry through.
             raise InterfaceTransportError(f"provider rejected outbound message: {exc}") from exc
+        except TransportRejectedError as exc:
+            # Fix 22: an HTTP rejection (429/408/425/5xx after retries)
+            # arrived WITH a response — the message provably did not land,
+            # so this is a RETRYABLE failure (the durable delivery row
+            # re-arms with exponential backoff), not an ambiguous outcome.
+            raise InterfaceTransportError(
+                f"provider rejected outbound message (retryable): {exc}"
+            ) from exc
         except TransportError as exc:
             # TransportError text is already token-redacted at the adapter
             # boundary; carrying the cause summary makes the durable

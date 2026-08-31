@@ -32,7 +32,13 @@ def _project(pid: str) -> SimpleNamespace:
 
 def _services(projects, run_once):
     return SimpleNamespace(
-        providers=SimpleNamespace(registered_provider_names=["openai-compatible"]),
+        # Fix 13 (2026-09-01): the tick resolves routing from the
+        # REGISTRATION-ORDER view, not the alphabetically sorted one —
+        # the stub must expose both, with order matching names.
+        providers=SimpleNamespace(
+            registered_provider_names=["openai-compatible"],
+            registered_provider_order=("openai-compatible",),
+        ),
         identity=SimpleNamespace(list_projects=lambda: list(projects)),
         worker=SimpleNamespace(reconcile_expired_leases=lambda **kw: 0),
         interface_transports=None,

@@ -23,19 +23,31 @@ from zero.domain.identity import ProjectId
 
 
 def register_tool_approval_routes(app: FastAPI, services: Services) -> None:
+    def _gate_or_409() -> Any:
+        """Resolve the gate; 409 when the posture is off (fix 14).
+
+        The gate is now constructed in every mode, so "disabled" means
+        the operator retuned ``approvals.mode`` to ``off`` — the REST
+        surface must keep refusing to look like approvals exist.
+        """
+        gate = services.approval_gate
+        if gate is None or gate.mode == "off":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "tool_approval_disabled",
+                    "hint": "Set approvals.mode=manual (config.yaml) or "
+                    "ZERO_TOOL_APPROVAL_MODE=manual to enable the gate.",
+                },
+            )
+        return gate
+
     @app.get(
         "/projects/{project_id}/tool-approvals",
         tags=["tool-approvals"],
     )
     def list_tool_approvals(project_id: str, actor_id: str) -> dict[str, Any]:
-        if services.approval_gate is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "error": "tool_approval_disabled",
-                    "hint": "Set ZERO_TOOL_APPROVAL_MODE=manual to enable the gate.",
-                },
-            )
+        gate = _gate_or_409()
         try:
             decision = services.authorization.authorize(
                 actor_id=authenticated_actor(actor_id),
@@ -48,7 +60,7 @@ def register_tool_approval_routes(app: FastAPI, services: Services) -> None:
         if not decision.allowed:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="forbidden")
         try:
-            pending = services.approval_gate.list_pending(project_id=project_id)
+            pending = gate.list_pending(project_id=project_id)
         except ApprovalError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return {
@@ -73,11 +85,7 @@ def register_tool_approval_routes(app: FastAPI, services: Services) -> None:
         request_id: str,
         req: dict[str, Any],
     ) -> dict[str, Any]:
-        if services.approval_gate is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"error": "tool_approval_disabled"},
-            )
+        gate = _gate_or_409()
         claimed_actor = str(req.get("actor_id", "")).strip() or None
         try:
             services.authorization.require_permission(
@@ -94,7 +102,7 @@ def register_tool_approval_routes(app: FastAPI, services: Services) -> None:
                 detail="actor_id is required for resolve",
             ) from None
         try:
-            resolved = services.approval_gate.resolve(
+            resolved = gate.resolve(
                 request_id,
                 decision=str(req.get("decision", "")).strip().lower(),
                 decided_by_user_id=claimed_actor,

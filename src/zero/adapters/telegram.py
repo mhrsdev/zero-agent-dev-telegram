@@ -1050,6 +1050,22 @@ class TelegramAdapter(BaseMessagingAdapter):
                 logger.warning("Telegram polling iteration failed: %s", type(exc).__name__)
                 if stop_event.wait(retry_delay_seconds):
                     break
+            except RuntimeError as exc:
+                # Live audit fix (2026-08-31): ``_call_api`` surfaces a
+                # non-ok Bot API envelope as a plain RuntimeError (e.g.
+                # 401 "Unauthorized" after a token revocation, 404
+                # "Not Found" after a bot deletion). The advertised
+                # public loop only caught typed adapter/transport
+                # errors, so those killed the loop outright. Keep the
+                # loop alive with backoff — if the token is really
+                # dead the operator sees the warning each iteration
+                # and the managed worker's own recovery paths own it.
+                logger.warning(
+                    "Telegram polling iteration failed: RuntimeError: %s",
+                    str(exc)[:200],
+                )
+                if stop_event.wait(retry_delay_seconds):
+                    break
 
 
 __all__ = ["TelegramAdapter", "WebhookAuthError"]

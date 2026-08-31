@@ -272,7 +272,10 @@ def test_config_sync_pins_scheduler_tick_to_routing_primary_model(
     _svc, _bindings, providers = _sync(zero_home)
     assert providers, "provider must register for the alignment to fire"
     provider, model = _svc.scheduler.tick_routing_override()
-    assert provider == "openai-compatible"
+    # Fix 13 (wave 14): adapters register under their config entry id, so
+    # the tick pins to the INSTANCE offering the primary model — not the
+    # protocol-level "openai-compatible" name.
+    assert provider == "openai-0"
     assert model == "test-model"  # routing.primary_model written by _write_config
 
 

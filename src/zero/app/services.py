@@ -10,6 +10,7 @@ app) and by tests.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -292,12 +293,39 @@ class _PluginSecretFacade:
 def _load_extensions(tool_service, *, secret_service=None, identity=None) -> None:
     """Wire MCP servers and plugins (GAP 7); failures are logged only."""
     try:
-        from zero.manage.core.mcp_client import get_mcp_manager
+        from zero.manage.core.mcp_client import parse_server_config
 
-        manager = get_mcp_manager()
-        if manager.load_from_env():
-            registered = manager.register_tools(tool_service)
-            logger.info("MCP extension tools registered: %s", registered)
+        # Live audit fix (2026-08-31): the operator surface for MCP servers
+        # is ZERO_MCP_SERVERS, documented as an environment variable — but
+        # every other ZERO_* variable is honored from $ZERO_HOME/.env too
+        # (Settings.load layers it). The raw os.environ lookup here made
+        # a .env-configured MCP server silently never register while the
+        # identical value in the process env worked. Layer BOTH the same
+        # way Settings does: process env wins, .env fills the rest.
+        mcp_raw = os.environ.get("ZERO_MCP_SERVERS")
+        if not mcp_raw:
+            try:
+                from pathlib import Path as _P
+
+                from zero.config import _read_env
+
+                _home = _P(os.environ.get("ZERO_HOME", str(_P.home() / ".zero")))
+                _default_env = _home / ".env"
+                mcp_raw = (
+                    _read_env(_default_env).get("ZERO_MCP_SERVERS")
+                    if _default_env.is_file()
+                    else None
+                )
+            except Exception:  # noqa: BLE001 - env layering is best-effort
+                mcp_raw = None
+        entries = parse_server_config(mcp_raw)
+        if entries:
+            from zero.manage.core.mcp_client import get_mcp_manager
+
+            manager = get_mcp_manager()
+            if manager.load(entries):
+                registered = manager.register_tools(tool_service)
+                logger.info("MCP extension tools registered: %s", registered)
     except Exception as exc:  # noqa: BLE001 - extensions must not crash startup
         logger.warning("MCP extension loading skipped: %s", type(exc).__name__)
     try:
@@ -471,12 +499,16 @@ def build_services(
         import hashlib
 
         routing = compaction_service.summarizer_routing or {}
-        primary = str(routing.get("provider") or "").strip() or provider_names[0]
+        # Fix 13: degrade to the FIRST REGISTERED adapter (config priority
+        # order), not the alphabetically-sorted view.
+        order = provider_service.registered_provider_order
+        first_registered = order[0] if order else (provider_names[0] if provider_names else "")
+        primary = str(routing.get("provider") or "").strip() or first_registered
         if primary not in provider_names:
             # The routed provider adapter is not registered (e.g. a
             # config edit removed it) — degrade to the first registered
             # adapter rather than dropping the summarizer entirely.
-            primary = provider_names[0]
+            primary = first_registered
         if routing.get("model"):
             model_name = str(routing["model"])
         elif primary == "anthropic":
@@ -496,6 +528,10 @@ def build_services(
                 messages=(CanonicalMessage(role="user", content=transcript_text),),
                 max_tokens=4096,
                 temperature=0.0,
+                # Fix 19c (live drill): the summarizer is a long
+                # generation; stream it so gateway edges that kill long
+                # silent bodies cannot drop compaction (see planner 19a).
+                stream=True,
             ),
             idempotency_key=(
                 f"compaction:{execution_id.value}:"
@@ -585,15 +621,15 @@ def build_services(
         authorization_service,
         interface_transport_service,
     )
-    # GAP 8b/G2 Hermes parity: opt-in per-call tool approval gate.
-    # ``off`` keeps the historical plan-level-only posture byte-for-byte.
+    # GAP 8b/G2 Hermes parity: per-call tool approval gate.
     # B12a (2026-08-31): "auto" also builds the gate — the hardline floor
     # and operator deny rules must stay enforced without a human loop.
-    approval_gate = (
-        ToolApprovalGate(database, mode=settings.tool_approval_mode)
-        if settings.tool_approval_mode in ("manual", "auto")
-        else None
-    )
+    # Fix 14 (2026-08-31, Hermes ``approvals.mode`` parity): the gate is
+    # now constructed in EVERY mode, including ``off`` (evaluate()
+    # short-circuits to cause=mode_off, byte-identical historical
+    # behavior) so the operator can retune the posture at runtime via
+    # config.yaml ``approvals.mode`` instead of rebuilding the process.
+    approval_gate = ToolApprovalGate(database, mode=settings.tool_approval_mode)
     agent_runtime = AgentRuntime(
         worker=worker_service,
         providers=provider_service,

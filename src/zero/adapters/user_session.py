@@ -237,7 +237,13 @@ class UserSessionTelegramAdapter(BaseMessagingAdapter):
             return None
         content = str(update.get("message") or "")
         kind = "command" if content.startswith("/") else "message"
-        event_id = update.get("event_id") or f"us_{update.get('id', 0)}"
+        # Live audit fix (2026-08-31): the fallback event id used to omit
+        # the chat id, so two updates with the same numeric message id
+        # from DIFFERENT chats collided on the same
+        # (platform, binding_scope, external_event_id) claim key and the
+        # second message was swallowed by idempotency. Chat-scoped ids
+        # match the Telethon host path (us_{chat_id}_{message.id}).
+        event_id = update.get("event_id") or f"us_{chat_id}_{update.get('id', 0)}"
         return NormalizedEvent(
             platform="telegram",
             external_event_id=str(event_id),

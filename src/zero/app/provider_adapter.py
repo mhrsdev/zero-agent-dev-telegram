@@ -478,6 +478,7 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
         base_url: str = "https://api.openai.com/v1",
         timeout_seconds: float = 60.0,
         client: httpx.Client | None = None,
+        name: str | None = None,
     ) -> None:
         if not api_key or not api_key.strip():
             raise ValueError("provider API key must be configured")
@@ -490,6 +491,15 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
             raise ValueError("provider timeout must be positive")
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
+        # Hermes parity (fix 13, 2026-08-31): the adapter registry used to
+        # key every OpenAI-compatible gateway under ONE protocol-level name
+        # ("openai-compatible"), so a second config.yaml provider entry was
+        # silently dropped ("already registered — skipped") and a real
+        # second-provider failover was impossible. Each deployment entry now
+        # registers under its own instance name (``providers[].id``) while
+        # the protocol stays implicit in the class. The default keeps the
+        # historical name for env-key / single-adapter deployments.
+        self._name = (name or "openai-compatible").strip()
         self._owns_client = client is None
         self._client = client or httpx.Client(timeout=timeout_seconds)
 
@@ -512,7 +522,7 @@ class OpenAICompatibleProviderAdapter(ProviderAdapter):
 
     @property
     def provider_name(self) -> str:
-        return "openai-compatible"
+        return self._name
 
     def get_model(self, model_name: str) -> ProviderModel:
         # Exact-name match first; otherwise a prefix match on known
@@ -1094,6 +1104,7 @@ class AnthropicMessagesProviderAdapter(ProviderAdapter):
         timeout_seconds: float = 60.0,
         client: httpx.Client | None = None,
         anthropic_version: str = "2023-06-01",
+        name: str | None = None,
     ) -> None:
         if not api_key or not api_key.strip():
             raise ValueError("provider API key must be configured")
@@ -1107,12 +1118,14 @@ class AnthropicMessagesProviderAdapter(ProviderAdapter):
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._anthropic_version = anthropic_version
+        # Instance naming — see OpenAICompatibleProviderAdapter (fix 13).
+        self._name = (name or "anthropic").strip()
         self._owns_client = client is None
         self._client = client or httpx.Client(timeout=timeout_seconds)
 
     @property
     def provider_name(self) -> str:
-        return "anthropic"
+        return self._name
 
     def get_model(self, model_name: str) -> ProviderModel:
         context_window, max_output = self._MODEL_CATALOG.get(

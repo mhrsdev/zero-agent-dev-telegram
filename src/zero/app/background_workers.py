@@ -568,6 +568,13 @@ class BackgroundWorkerHost:
                 if not polled_any:
                     await self._wait(interval)
         finally:
+            # Live audit fix (2026-08-31): retire dispatch lanes
+            # promptly on loop teardown instead of leaving daemon
+            # threads blocked in q.get() until process exit.
+            try:
+                dispatcher.shutdown(timeout=5.0)
+            except Exception:  # noqa: BLE001 - teardown best-effort
+                pass
             poll_lock.release_all()
 
     async def _user_session_loop(self) -> None:
@@ -690,8 +697,12 @@ class BackgroundWorkerHost:
         per-project behavior or error isolation.
         """
         services = self._services
-        provider_names = services.providers.registered_provider_names
-        provider = provider_names[0] if provider_names else "openai-compatible"
+        # Fix 13: fall back to the FIRST REGISTERED adapter (config
+        # priority order), not the alphabetically-sorted registry view —
+        # with multi-instance providers "alphabetical first" routed the
+        # tick at a random gateway until the config_sync pin landed.
+        provider_order = services.providers.registered_provider_order
+        provider = provider_order[0] if provider_order else "openai-compatible"
         model_name = self._settings.openai_model
         # Round-7 routing alignment (live fix): config_sync pins the tick
         # to ``routing.primary_model`` — the scheduler's LLM calls
@@ -924,16 +935,52 @@ class _ChatSerialDispatcher:
     and each lane queues at most ``max_queue`` events. When the queue is
     full the submission raises — the adapter logs and drops, the durable
     claim stays open, and recovery replays the event.
+
+    Live audit fix (2026-08-31) — the permanent 8-chat cap: lane threads
+    used to loop on ``q.get()`` FOREVER (the ``None`` sentinel was never
+    sent), so every chat that ever sent one message kept a live thread.
+    After the 8th unique chat, ``_lane`` raised for every NEW chat for
+    the rest of the process lifetime and its messages were dropped.
+    Lanes now self-retire after ``lane_idle_seconds`` without work and
+    remove themselves from the registry, so the cap applies to
+    RECENTLY-ACTIVE chats, not to all chats ever seen. Additionally a
+    saturated submission first waits a bounded grace period for the
+    queue to drain before giving up (Hermes-style queueing), which
+    makes the drop path practically unreachable for burst traffic.
     """
 
-    def __init__(self, *, max_workers: int = 8, max_queue: int = 16) -> None:
+    def __init__(
+        self,
+        *,
+        max_workers: int | None = None,
+        max_queue: int | None = None,
+        lane_idle_seconds: float = 120.0,
+        saturation_wait_seconds: float = 5.0,
+    ) -> None:
+        import os
         import queue as _queue
         import threading as _threading
 
-        if max_workers < 1 or max_queue < 1:
+        def _from_env(name: str, default: int, cap: int) -> int:
+            try:
+                raw = os.environ.get(name)
+                value = int(raw) if raw else default
+            except (TypeError, ValueError):
+                value = default
+            return max(1, min(value, cap))
+
+        resolved_workers = (
+            max_workers if max_workers is not None else _from_env("ZERO_TELEGRAM_DISPATCH_LANES", 8, 256)
+        )
+        resolved_queue = (
+            max_queue if max_queue is not None else _from_env("ZERO_TELEGRAM_DISPATCH_QUEUE", 16, 4096)
+        )
+        if resolved_workers < 1 or resolved_queue < 1:
             raise ValueError("max_workers and max_queue must be positive")
-        self._max_workers = max_workers
-        self._max_queue = max_queue
+        self._max_workers = resolved_workers
+        self._max_queue = resolved_queue
+        self._lane_idle_seconds = max(1.0, float(lane_idle_seconds))
+        self._saturation_wait_seconds = max(0.0, float(saturation_wait_seconds))
         self._lanes: dict[str, tuple[_threading.Thread, "_queue.SimpleQueue"]] = {}
         self._lock = _threading.Lock()
 
@@ -954,19 +1001,44 @@ class _ChatSerialDispatcher:
                 )
             q: "_queue.SimpleQueue" = _queue.SimpleQueue()
             thread = _threading.Thread(
-                target=self._drain_lane, args=(q,), daemon=True,
+                target=self._drain_lane,
+                args=(q, chat_id),
+                daemon=True,
                 name=f"zero-telegram-dispatch-{chat_id}",
             )
             thread.start()
             self._lanes[chat_id] = (thread, q)
             return thread, q
 
-    @staticmethod
-    def _drain_lane(q) -> None:
+    def _drain_lane(self, q, chat_id: str) -> None:
+        """Serve one chat's queue; retire when idle past the deadline.
+
+        Retiring (instead of looping forever) is the fix for the
+        permanent lane cap: an idle thread blocks on ``get`` with a
+        timeout, exits when nothing arrives, and deregisters itself so
+        a NEW chat can take the slot. A retiring lane that loses a race
+        (a job arrives between timeout expiry and deregistration) puts
+        the job back before exiting, so nothing is lost.
+        """
+        import queue as _queue
+
+        idle_deadline = _loop_monotonic() + self._lane_idle_seconds
         while True:
-            job = q.get()
+            try:
+                job = q.get(timeout=max(0.05, idle_deadline - _loop_monotonic()))
+            except _queue.Empty:
+                with self._lock:
+                    # Retire only if still empty AND we still own the
+                    # registry entry (a concurrent submit may have
+                    # replaced us after our thread died from its view).
+                    if self._lanes.get(chat_id) is not None and self._lanes[chat_id][1] is q and q.empty():
+                        del self._lanes[chat_id]
+                        return
+                idle_deadline = _loop_monotonic() + self._lane_idle_seconds
+                continue
             if job is None:
                 return
+            idle_deadline = _loop_monotonic() + self._lane_idle_seconds
             fn = job[0]
             try:
                 fn()
@@ -974,11 +1046,34 @@ class _ChatSerialDispatcher:
                 logger.debug("dispatch lane job failed", exc_info=True)
 
     def submit_for_chat(self, chat_id: str, fn) -> None:
-        """Queue ``fn`` on the chat's lane; raises when saturated."""
-        thread, q = self._lane(str(chat_id))
-        if q.qsize() >= self._max_queue:
-            raise RuntimeError(f"dispatch lane for chat {chat_id} is saturated")
-        q.put((fn,))
+        """Queue ``fn`` on the chat's lane; raises when saturated.
+
+        Saturation now has a bounded grace period: the caller (the
+        polling loop) waits up to ``saturation_wait_seconds`` for the
+        chat's queue to drain below ``max_queue`` before raising. This
+        converts a hard drop into Hermes-style brief queueing for burst
+        traffic while keeping a hard bound on how long the polling loop
+        can be delayed.
+        """
+        import time as _time
+
+        lane_key = str(chat_id)
+        deadline = _loop_monotonic() + self._saturation_wait_seconds
+        while True:
+            thread, q = self._lane(lane_key)
+            if q.qsize() < self._max_queue:
+                q.put((fn,))
+                return
+            if _loop_monotonic() >= deadline:
+                raise RuntimeError(
+                    f"dispatch lane for chat {chat_id} is saturated"
+                )
+            _time.sleep(0.1)
+            # Reap a dead lane so the next iteration rebuilds it.
+            with self._lock:
+                existing = self._lanes.get(lane_key)
+                if existing is not None and not existing[0].is_alive():
+                    del self._lanes[lane_key]
 
     def submit(self, fn) -> None:
         """Adapter contract: serialize by the event's chat id when the
@@ -995,6 +1090,25 @@ class _ChatSerialDispatcher:
         never processed any message. Alias the call operator to submit
         so both conventions work."""
         self.submit(fn)
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Retire every lane promptly (host stop path).
+
+        Sends the ``None`` sentinel to each lane thread and joins it.
+        Queued-but-unstarted jobs are dropped on purpose: the host is
+        stopping, the durable claims stay open, and the next boot's
+        startup recovery owns them.
+        """
+        with self._lock:
+            lanes = list(self._lanes.items())
+            self._lanes.clear()
+        for _chat_id, (thread, q) in lanes:
+            try:
+                q.put(None)
+            except Exception:  # noqa: BLE001 - teardown best-effort
+                pass
+        for _chat_id, (thread, _q) in lanes:
+            thread.join(timeout=timeout)
 
 
 def _group_require_mention_override(chat_id: str) -> bool | None:
@@ -1277,10 +1391,6 @@ class _UserSessionHost:
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
-
-
-def _user_session_secrets_available(services) -> dict[str, str] | None:
-    return _resolve_user_session_secrets(services)
 
 
 __all__ = [

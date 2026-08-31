@@ -38,6 +38,19 @@ class TransportError(AdapterError):
     """An outbound provider request failed after bounded retries."""
 
 
+class TransportRejectedError(TransportError):
+    """Fix 22 (2026-09-01, live drill): the provider SENT a response that
+    rejected the request (429/408/425/5xx after exhausting retries).
+
+    Unlike a network-level failure, an HTTP rejection proves the request
+    never reached the provider's send queue — the message did not land —
+    so callers may safely RETRY instead of treating the outcome as
+    ambiguous. Carrying this as its own class lets the interface
+    transport layer route rejections to the retryable-failure path while
+    true response-boundary ambiguity stays ``InterfaceTransportUnknownOutcome``.
+    """
+
+
 class PermanentTransportError(TransportError):
     """The provider rejected the request without a retryable transport signal."""
 
@@ -220,7 +233,7 @@ class BaseMessagingAdapter:
                     )
                 status_code = int(response.status_code)
                 if status_code in retryable_statuses or status_code >= 500:
-                    last_error = TransportError(
+                    last_error = TransportRejectedError(
                         f"provider returned retryable HTTP status {status_code}"
                         + _error_body_snippet(response)
                     )
@@ -328,6 +341,7 @@ __all__ = [
     "PermanentTransportError",
     "RetryPolicy",
     "TransportError",
+    "TransportRejectedError",
     "UnsupportedUpdateError",
     "WebhookAuthError",
     "_cursor_get",

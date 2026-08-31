@@ -123,6 +123,23 @@ class TelegramChatBridge:
         if candidate:
             self._model = candidate
 
+    def update_provider(self, provider: str) -> None:
+        """Align the conversational PROVIDER with the routing primary.
+
+        Live audit fix (2026-08-31): ``config_sync._sync_planner``
+        realigned the planner's provider (``anthropic`` vs
+        ``openai-compatible``) but only ever called ``update_model`` on
+        this bridge. An Anthropic-primary deployment therefore kept a
+        bridge pinned to ``openai-compatible`` — a provider name with no
+        registered adapter — and every conversational turn failed with
+        ``ProviderNotFoundError`` while the planner kept succeeding.
+        The bridge must follow the same protocol resolution as the
+        planner.
+        """
+        candidate = str(provider or "").strip()
+        if candidate:
+            self._provider = candidate
+
     # ------------------------------------------------------------------
     # Entry point
     # ------------------------------------------------------------------
@@ -208,6 +225,13 @@ class TelegramChatBridge:
 
         result: Any = None
         live_streamed = False
+        # Live audit fix (2026-08-31): ``live`` was first assigned deep
+        # inside the ``try`` — after ``self._history.recent(...)`` which
+        # can raise. The ``except`` handler references ``live``, so a
+        # history-read failure crashed the handler with ``NameError``
+        # and the user received NO answer at all. Bind it before the
+        # protected region, exactly like ``result``/``live_streamed``.
+        live: TelegramLiveStream | None = None
         try:
             from zero.domain.providers import CanonicalMessage
 

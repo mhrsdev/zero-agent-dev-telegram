@@ -232,6 +232,31 @@ class SchedulerService:
         """(provider, model) pinned by config_sync, or (None, None)."""
         return self._tick_provider, self._tick_model
 
+    # Fix 16 (2026-08-31): the knobs below were frozen at construction
+    # from env vars. config.yaml ``features.*`` now retunes them at boot
+    # and on every config sync (Hermes: policy lives in operator config,
+    # not process env).
+
+    def set_decomposition_enabled(self, enabled: bool) -> None:
+        """Toggle LLM task decomposition on a live scheduler."""
+        self._decomposition_enabled = bool(enabled)
+
+    @property
+    def decomposition_enabled(self) -> bool:
+        return self._decomposition_enabled
+
+    def set_task_max_attempts(self, attempts: int) -> None:
+        """Retune the per-task retry budget (0 disables auto-retry)."""
+        self._task_max_attempts = max(0, int(attempts))
+
+    @property
+    def task_max_attempts(self) -> int:
+        return self._task_max_attempts
+
+    def set_parallel_executions(self, parallel: int) -> None:
+        """Retune bounded cross-execution tick parallelism (1..8)."""
+        self._parallel_executions = max(1, min(8, int(parallel)))
+
     @staticmethod
     def _retry_delay_elapsed(task: Task, *, now: datetime | None = None) -> bool:
         """GAP 12: True when a failed task's backoff window has passed."""

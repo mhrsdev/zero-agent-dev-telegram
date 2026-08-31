@@ -96,6 +96,14 @@ class PlannerService:
             messages=(CanonicalMessage(role="user", content=event.content[:16_384]),),
             max_tokens=4096,
             temperature=0.0,
+            # Fix 19a (live multi-team drill, 2026-09-01): the planner is a
+            # LONG generation (full plan JSON) and used to be the last
+            # non-streaming LLM caller. The operator gateway's CDN edge
+            # kills long silent HTTP bodies → ProviderUnknownOutcomeError
+            # on every slow plan. Stream instead: ProviderService collects
+            # the deltas into the same CanonicalResponse, so the parse
+            # path is unchanged (Hermes parity: stream everything).
+            stream=True,
         )
         _request, response = self._providers.send_request(
             project_id=event.project_id,

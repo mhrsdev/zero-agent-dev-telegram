@@ -47,7 +47,9 @@ def test_config_sync_aligns_compaction_summarizer_with_routing_model(
     assert providers, "provider must register for the alignment to fire"
     routing = _svc.compaction.summarizer_routing
     assert routing is not None
-    assert routing["provider"] == "openai-compatible"
+    # Fix 13 (wave 14): the pin resolves to the config entry id offering
+    # the primary model (instance-level), not a protocol-level name.
+    assert routing["provider"] == "openai-0"
     assert routing["model"] == "test-model"  # routing.primary_model from _write_config
 
 
@@ -91,7 +93,8 @@ def test_compaction_summarizer_sends_aligned_provider_and_model(
         messages=[{"role": "user", "content": "decide the launch codename"}],
     )
     assert summary and "Accepted decisions" in summary
-    assert captured["provider"] == "openai-compatible"
+    # Fix 13 (wave 14): instance-level pin (config entry id "openai-0").
+    assert captured["provider"] == "openai-0"
     assert captured["model_name"] == "test-model"
 
 

@@ -192,7 +192,7 @@ class ProviderService:
         *,
         include_fake: bool = False,
         metrics: Any | None = None,
-        provider_max_attempts: int = 2,
+        provider_max_attempts: int = 4,
     ) -> None:
         self._repo = provider_repo
         self._artifact_service = artifact_service
@@ -204,6 +204,21 @@ class ProviderService:
         self._provider_max_attempts = max(1, min(8, int(provider_max_attempts)))
         self._adapters: dict[str, ProviderAdapter] = {}
         self._fallback_chain: tuple[str, ...] = ()
+        # Hermes parity (fix 13): operators configure fallback ORDER via
+        # config.yaml (``fallback_priority`` + entry order) — an alphabetically
+        # sorted registry view must never decide failover order.
+        self._registration_order: list[str] = []
+        # Hermes parity (fix 13b, conversation_loop ``_rate_limited_until`` /
+        # ``_unavailable_fallback_keys``): providers that keep failing get a
+        # time-boxed cooldown so the fallback chain stops burning attempts on
+        # a dead gateway. Auth failures cool longer than rate limits (a bad
+        # key rarely heals in 60s); streaks escalate exponentially; success
+        # clears the state. ``_breaker_threshold``/``_breaker_base_seconds``
+        # come from config.yaml ``routing.breaker`` via config_sync.
+        self._provider_cooldown_until: dict[str, float] = {}
+        self._provider_fail_streak: dict[str, int] = {}
+        self._breaker_threshold: int = 5
+        self._breaker_base_seconds: float = 60.0
         # Hermes parity (audit 2026-08-28): fallback entries are (provider,
         # model) pairs. The wizard/config's ``routing.fallback_models``
         # promise model-level failover within the primary provider — a
@@ -229,11 +244,116 @@ class ProviderService:
     def register_adapter(self, adapter: ProviderAdapter) -> None:
         """Register a custom adapter."""
         self._adapters[adapter.provider_name] = adapter
+        if adapter.provider_name not in self._registration_order:
+            self._registration_order.append(adapter.provider_name)
 
     @property
     def registered_provider_names(self) -> tuple[str, ...]:
         """Names of adapters that can serve live model requests."""
         return tuple(sorted(self._adapters))
+
+    @property
+    def registered_provider_order(self) -> tuple[str, ...]:
+        """Registration order (config priority order wins over sorting)."""
+        known = [n for n in self._registration_order if n in self._adapters]
+        rest = sorted(n for n in self._adapters if n not in set(known))
+        return tuple([*known, *rest])
+
+    def set_provider_max_attempts(self, attempts: int) -> None:
+        """Apply ``routing.max_attempts_per_provider`` from config.yaml.
+
+        Hermes parity: the per-provider retry budget is operator policy,
+        not a hidden constant. Clamped to the same 1..8 band as boot.
+        """
+        self._provider_max_attempts = max(1, min(8, int(attempts)))
+
+    @property
+    def provider_max_attempts(self) -> int:
+        return self._provider_max_attempts
+
+    def set_breaker_policy(self, *, failure_threshold: int, cooldown_seconds: float) -> None:
+        """Apply ``routing.breaker`` from config.yaml (fix 13b).
+
+        The breaker block used to be config fiction — parsed, persisted,
+        never consulted. It now drives the per-provider cooldown ladder:
+        a provider that terminal-fails ``failure_threshold`` times in a
+        row is skipped for escalating cooldowns (base ``cooldown_seconds``).
+        """
+        self._breaker_threshold = max(1, int(failure_threshold))
+        self._breaker_base_seconds = max(5.0, float(cooldown_seconds))
+
+    # -- provider breaker (Hermes _rate_limited_until parity) ------------
+
+    def provider_cooldown_remaining(self, provider: str) -> float:
+        """Seconds this provider stays on cooldown (0 = healthy)."""
+        until = self._provider_cooldown_until.get(provider, 0.0)
+        return max(0.0, until - time.monotonic())
+
+    def _arm_provider_cooldown(self, provider: str, error_class: str) -> float:
+        """Time-box a failing provider (called on terminal failures only).
+
+        - ``rate_limit`` arms immediately (the gateway said "back off"),
+          escalating exponentially per consecutive failure (60s→2m→…→1h cap).
+        - ``auth_failure`` cools at least 5 minutes — a bad/expired key
+          does not heal inside one request, and retrying it just burns
+          the fallback window.
+        - Transient/other classes count toward the breaker streak: after
+          ``failure_threshold`` consecutive terminal failures the provider
+          cools for ``cooldown_seconds * 2^(streak - threshold)``.
+        Success clears both streak and cooldown for the provider.
+        """
+        streak = self._provider_fail_streak.get(provider, 0) + 1
+        self._provider_fail_streak[provider] = streak
+        base = self._breaker_base_seconds
+        if error_class == "rate_limit":
+            cooldown = min(base * (2 ** max(0, streak - 1)), 3600.0)
+        elif error_class == "auth_failure":
+            cooldown = max(300.0, base)
+        elif streak >= self._breaker_threshold:
+            cooldown = min(base * (2 ** (streak - self._breaker_threshold)), 3600.0)
+        else:
+            return 0.0
+        until = time.monotonic() + cooldown
+        self._provider_cooldown_until[provider] = until
+        logger.warning(
+            "provider breaker: %s cooled down for %.0fs (%s, streak=%d)",
+            provider,
+            cooldown,
+            error_class,
+            streak,
+        )
+        return cooldown
+
+    def _clear_provider_cooldown(self, provider: str) -> None:
+        self._provider_cooldown_until.pop(provider, None)
+        self._provider_fail_streak.pop(provider, None)
+
+    def _available_chain_candidates(
+        self, chain: list[tuple[str, str]], *, primary: str
+    ) -> list[tuple[str, str]]:
+        """Drop cooldown-armed FALLBACK providers, Hermes-style.
+
+        Entries on the primary provider are always attempted (model-level
+        failover does not change gateway health). Other candidates on
+        cooldown are skipped — UNLESS dropping them would collapse the
+        chain to a SINGLE candidate while fallback entries were
+        configured, in which case they are kept (fail open: trying a
+        cooling gateway beats a certainly-doomed one-shot chain,
+        mirroring Hermes restoring the chain when nobody can serve).
+        A multi-entry primary (model-level failover already available)
+        never needs that rescue, so cooled fallbacks stay skipped.
+        """
+        primary_entries = [(p, m) for p, m in chain if p == primary]
+        fallback_entries = [(p, m) for p, m in chain if p != primary]
+        healthy = [
+            (p, m)
+            for p, m in fallback_entries
+            if self.provider_cooldown_remaining(p) <= 0.0
+        ]
+        filtered = primary_entries + healthy
+        if len(filtered) <= 1 and fallback_entries:
+            return primary_entries + fallback_entries
+        return filtered
 
     def tool_call_support(self, provider: str, model_name: str) -> bool:
         """Does this (provider, model) honor the native ``tools`` parameter?
@@ -413,6 +533,9 @@ class ProviderService:
         for name in self._fallback_chain:
             if name != request.provider and all(name != p for p, _m in chain):
                 chain.append((name, request.model_name))
+        # Fix 13b: cooldown-armed providers are skipped unless the whole
+        # chain is cooling (fail-open rather than dead).
+        chain = self._available_chain_candidates(chain, primary=request.provider)
         last_exc: Exception | None = None
         for index, (provider_name, model_name) in enumerate(chain):
             if cancel_event is not None and cancel_event.is_set():
@@ -429,7 +552,14 @@ class ProviderService:
                     system_message=request.system_message,
                     max_tokens=request.max_tokens,
                     temperature=request.temperature,
-                    stream=False,
+                    # Live audit fix (2026-08-31): preserve the caller's
+                    # streaming intent. Fallback attempts used to be
+                    # rebuilt with stream=False, so a long completion on
+                    # a fallback model lost header-early streaming and
+                    # could hit the gateway's edge timeout — the exact
+                    # failure the streaming hardening wave fixed for the
+                    # primary attempt.
+                    stream=request.stream,
                 )
             )
             try:
@@ -725,6 +855,13 @@ class ProviderService:
                     continue
                 # Classify the error.
                 error_class = self._classify_error(exc)
+                # Fix 13b (Hermes breaker parity): a terminal failure arms
+                # the per-provider cooldown so the fallback chain stops
+                # feeding requests to a dead gateway. Cancelled and
+                # unknown-outcome requests say nothing about provider
+                # health and never arm it.
+                if error_class not in ("cancelled", "unknown_outcome"):
+                    self._arm_provider_cooldown(request.provider, error_class)
                 terminal_state = (
                     "unknown"
                     if error_class == "unknown_outcome"
@@ -775,6 +912,9 @@ class ProviderService:
                 raise
 
         # Store the response as an artifact.
+        # Fix 13b: a healthy response clears the provider's fail streak
+        # and any armed cooldown (Hermes: success resets rate-limit state).
+        self._clear_provider_cooldown(request.provider)
         response_text = json.dumps(
             {
                 "content": response.content,

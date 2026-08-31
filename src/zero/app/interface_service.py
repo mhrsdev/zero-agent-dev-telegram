@@ -210,32 +210,6 @@ class InterfaceAdapterService:
             )
         return entry
 
-    @staticmethod
-    def _callback_entry(
-        *,
-        binding: InterfaceBinding,
-        event: NormalizedEvent,
-        user_id: UserId,
-        result: str,
-        detail: str,
-        content: str = "[callback]",
-    ) -> InterfaceEventLogEntry:
-        return InterfaceEventLogEntry(
-            id=InterfaceEventId(generate_interface_event_id()),
-            project_id=binding.project_id,
-            platform=event.platform,
-            external_event_id=event.external_event_id,
-            external_actor_id=event.external_actor_id,
-            resolved_user_id=user_id,
-            chat_id=event.chat_id,
-            topic_id=event.topic_id,
-            event_kind=event.event_kind,
-            event_content=content,
-            processing_result=result,  # type: ignore[arg-type]
-            processing_detail=detail,
-            created_at=now_utc_iso(),
-        )
-
     def _try_auto_link_owner(
         self,
         *,
@@ -1241,6 +1215,7 @@ class InterfaceAdapterService:
                 user_id=user_id,
                 result="denied",
                 detail="callback token belongs to another project",
+                content="[plan approval callback]",
             )
             return self._record_event(entry)
 
@@ -1265,6 +1240,7 @@ class InterfaceAdapterService:
                 user_id=user_id,
                 result="denied",
                 detail="callback actor is not authorized for this action",
+                content="[plan approval callback]",
             )
             return self._record_event(entry)
 
@@ -1278,6 +1254,7 @@ class InterfaceAdapterService:
                 user_id=user_id,
                 result="denied",
                 detail="edit callbacks are not supported by the control plane",
+                content="[plan approval callback]",
             )
             return self._record_event(entry)
 
@@ -1500,8 +1477,10 @@ class InterfaceAdapterService:
             permission="tool.manage",
             source="web",
         )
-        if action not in ("allow_once", "allow_always", "deny"):
-            raise ValueError("action must be allow_once, allow_always, or deny")
+        if action not in ("allow_once", "allow_session", "allow_always", "deny"):
+            raise ValueError(
+                "action must be allow_once, allow_session, allow_always, or deny"
+            )
         if expires_in_hours <= 0 or expires_in_hours > 168:
             raise ValueError("expires_in_hours must be between 1 and 168")
         expires_at = (
@@ -1539,10 +1518,22 @@ class InterfaceAdapterService:
             if live:
                 return "tool approval buttons already exist; not re-sent"
             owner = self._identity_repo.get_project(project_id).owner_user_id
+            # Fix 15 (Hermes 2x2 keyboard parity): the card shipped only
+            # once/always/deny, so the gate's ``session`` grain — approve
+            # for the rest of THIS execution without making it durable —
+            # was reachable only through REST. Hermes puts once/session on
+            # the top row and always/deny on the bottom so labels stay
+            # readable on mobile.
             allow_once = self.create_tool_approval_token(
                 project_id=project_id,
                 approval_id=request.id,
                 action="allow_once",
+                created_by=owner,
+            )
+            allow_session = self.create_tool_approval_token(
+                project_id=project_id,
+                approval_id=request.id,
+                action="allow_session",
                 created_by=owner,
             )
             allow_always = self.create_tool_approval_token(
@@ -1565,11 +1556,17 @@ class InterfaceAdapterService:
                             "callback_data": allow_once.id.value,
                         },
                         {
+                            "text": "🔁 Allow session",
+                            "callback_data": allow_session.id.value,
+                        },
+                    ],
+                    [
+                        {
                             "text": "🔓 Always",
                             "callback_data": allow_always.id.value,
                         },
                         {"text": "✖️ Deny", "callback_data": deny.id.value},
-                    ]
+                    ],
                 ]
             }
             execution_value = str(getattr(request, "execution_id", "") or "")
@@ -1729,6 +1726,7 @@ class InterfaceAdapterService:
 
         decision_map = {
             "allow_once": ("allow", "once"),
+            "allow_session": ("allow", "session"),
             "allow_always": ("allow", "always"),
             "deny": ("deny", "once"),
         }
@@ -1773,8 +1771,17 @@ class InterfaceAdapterService:
         user_id: UserId | None,
         result: str,
         detail: str,
+        content: str = "[tool approval callback]",
     ) -> InterfaceEventLogEntry:
-        """One durable event-log entry for a callback outcome."""
+        """One durable event-log entry for a callback outcome.
+
+        Live audit fix (2026-08-31): this method was silently shadowing
+        a dead ``@staticmethod`` twin that supported a ``content``
+        parameter, so EVERY callback — including plan approve/reject —
+        was durably mislabeled ``[tool approval callback]`` in the
+        event log. The parameter is restored; plan callbacks now pass
+        their own label explicitly.
+        """
         return InterfaceEventLogEntry(
             id=InterfaceEventId(generate_interface_event_id()),
             project_id=binding.project_id,

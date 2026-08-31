@@ -50,6 +50,21 @@ class ApproveRevisionRequest(BaseModel):
     redacted_reason: str | None = None
 
 
+class PlannerProposeRequest(BaseModel):
+    """Fix 17 (2026-09-01, multi-team drill): the real LLM planner was only
+    reachable through the Telegram chat path (interface_service calls
+    ``planner.propose_from_event`` after message intake). An operator
+    running MULTIPLE teams — the core Zero scale story — can bind one
+    Telegram group to exactly ONE project, so every other team had no
+    way to drive the planner at all. This surface exposes exactly the
+    call the bridge makes: same service, same pinned provider/model,
+    same authenticated-human event requirement, same plan.propose
+    permission gate."""
+
+    actor_id: str
+    event_id: str = Field(..., min_length=1)
+
+
 class RejectRevisionRequest(BaseModel):
     actor_id: str
     expected_revision_number: int = Field(..., ge=1)
@@ -58,6 +73,59 @@ class RejectRevisionRequest(BaseModel):
 
 
 def register_plan_routes(app: FastAPI, services: Services) -> None:
+    @app.post(
+        "/projects/{project_id}/planner/propose",
+        tags=["plans"],
+    )
+    def planner_propose(project_id: str, req: PlannerProposeRequest) -> dict[str, Any]:
+        """Run the REAL LLM planner over one ingested conversation event
+        (fix 17 — API parity with the Telegram chat trigger)."""
+        from zero.app.planner_service import PlannerOutputError
+        from zero.domain.identity import ProjectId
+        from zero.domain.plans import ConversationEventId
+
+        planner = services.planner
+        if planner is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"error": "planner_unavailable"},
+            )
+        provider = getattr(services.interfaces, "_planner_provider", None)
+        model_name = getattr(services.interfaces, "_planner_model", None)
+        if not provider or not model_name:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"error": "planner_routing_unpinned"},
+            )
+        try:
+            revision = planner.propose_from_event(
+                event_id=ConversationEventId(req.event_id),
+                actor_id=authenticated_actor(req.actor_id),
+                provider=provider,
+                model_name=model_name,
+                source="web",
+            )
+        except PlannerOutputError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "planner_output_rejected", "reason": str(exc)},
+            ) from exc
+        except (PlanError, ValueError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="request failed")
+        if revision is None:
+            return {"actionable": False, "revision": None}
+        return {
+            "actionable": True,
+            "revision": {
+                "id": revision.id.value,
+                "plan_id": revision.plan_id.value,
+                "revision_number": revision.revision_number,
+                "state": revision.state,
+                "objective": revision.content.objective,
+                "created_at": revision.created_at,
+            },
+        }
+
     @app.post(
         "/projects/{project_id}/conversation-events",
         tags=["plans"],

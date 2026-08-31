@@ -54,6 +54,11 @@ def test_tui_panels_do_not_override_textual_render_hook():
     overriding `_render(self, payload)` crashes layout with TypeError."""
     import inspect
 
+    # Suite-audit fix (2026-08-31): this test imported ``textual``
+    # unconditionally, so the WHOLE suite failed (1 failed) whenever the
+    # ``[tui]`` extra was absent — contradicting the ledger's 0-failed
+    # claim. Sibling tests already skip correctly; mirror them.
+    pytest.importorskip("textual")
     import textual
     from textual.widget import Widget
 

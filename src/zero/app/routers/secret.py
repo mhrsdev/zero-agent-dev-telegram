@@ -12,7 +12,7 @@ from zero.app.services import Services
 from zero.domain.identity import (
     ProjectId,
 )
-from zero.domain.secrets import SecretError
+from zero.domain.secrets import SecretAlreadyExistsError, SecretError
 
 
 class StoreSecretRequest(BaseModel):
@@ -43,6 +43,15 @@ def register_secret_routes(app: FastAPI, services: Services) -> None:
             )
         except ValueError:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="request failed")
+        except SecretAlreadyExistsError:
+            # Live-fix (2026-09-01): a re-store of an existing secret name
+            # is an idempotency conflict, NOT a server fault — it used to
+            # surface as a misleading 500 ("configure ZERO_SECRET_KEY")
+            # because SecretAlreadyExistsError is a SecretError subclass.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="secret already exists in this project",
+            )
         except SecretError as exc:
             # Fail closed without leaking internals, but give the
             # operator the one fact that matters for recovery (usually

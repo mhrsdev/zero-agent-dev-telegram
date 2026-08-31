@@ -187,7 +187,7 @@ class Settings(BaseModel):
     #: Total dispatch attempts per provider request (first call +
     #: in-process retries of transient/rate-limit failures). Reference
     #: parity: Hermes defaults to retrying before failing over.
-    provider_max_attempts: int = 2
+    provider_max_attempts: int = 4
     telegram_webhook_secret: SecretStr | None = None
     #: Optional outbound proxy for Telegram Bot API traffic only
     #: (polling + sendMessage). Accepts http://, https://, socks5:// and
@@ -506,7 +506,7 @@ class Settings(BaseModel):
         if tick_project_parallelism < 1 or tick_project_parallelism > 8:
             raise ConfigError("ZERO_TICK_PROJECT_PARALLELISM must be between 1 and 8.")
 
-        provider_attempts_raw = raw.get("ZERO_PROVIDER_MAX_ATTEMPTS", "2")
+        provider_attempts_raw = raw.get("ZERO_PROVIDER_MAX_ATTEMPTS", "4")
         try:
             provider_max_attempts = int(provider_attempts_raw)
         except ValueError as exc:

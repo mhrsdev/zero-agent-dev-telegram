@@ -71,7 +71,7 @@ CallbackAction = Literal["approve", "reject", "edit"]
 #: decision. ``allow_always`` writes the standing always-allow row;
 #: ``deny`` records a denial (escalating to a tool-wide wildcard per
 #: the gate's coarse-deny design).
-ToolApprovalTokenAction = Literal["allow_once", "allow_always", "deny"]
+ToolApprovalTokenAction = Literal["allow_once", "allow_session", "allow_always", "deny"]
 
 
 # ----------------------------------------------------------------------

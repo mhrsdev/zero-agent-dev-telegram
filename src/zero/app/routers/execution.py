@@ -56,6 +56,19 @@ class RunReadyTasksRequest(BaseModel):
     max_tasks: int = Field(1, ge=1, le=32)
 
 
+class ReconcileTaskRequest(BaseModel):
+    """Body for the blocked-task reconcile surface (fix 21).
+
+    Module level (not nested in ``register_execution_routes``): this
+    module uses ``from __future__ import annotations``, so locally
+    defined annotation targets degrade to unresolvable strings in
+    FastAPI's type-hint evaluation — the model silently became a
+    required QUERY parameter (observed live as 422 "query req").
+    """
+
+    actor_id: str
+
+
 class SchedulerTickRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
@@ -445,4 +458,53 @@ def register_execution_routes(app: FastAPI, services: Services) -> None:
             "id": execution.id.value,
             "state": execution.state,
             "blocker_reason": execution.blocker_reason,
+        }
+
+    @app.post(
+        "/projects/{project_id}/executions/{execution_id}/tasks/{task_id}/reconcile",
+        tags=["executions"],
+    )
+    def reconcile_blocked_task(
+        request: Request,
+        project_id: str,
+        execution_id: str,
+        task_id: str,
+        req: ReconcileTaskRequest,
+    ) -> dict[str, Any]:
+        """Operator reconciliation for a blocked task (fix 21, 2026-09-01).
+
+        ``WorkerService.reconcile_blocked_task`` (``blocked -> ready``)
+        existed as a documented real-run fix but had NO HTTP surface: a
+        paused "provider outcome unknown; reconciliation required"
+        execution could only be unblocked by in-process callers. The
+        provider-request reconcile route covered the request ledger, not
+        the task graph. This surface exposes the same audited transition
+        for web/API operators.
+        """
+        from zero.domain.execution import ExecutionId, TaskId
+        from zero.domain.identity import ProjectId
+        from zero.app.auth_service import authenticated_actor
+        from zero.app.worker_service import (
+            InvalidTaskTransitionError,
+            TaskNotFoundError,
+        )
+
+        try:
+            task = services.worker.reconcile_blocked_task(
+                execution_id=ExecutionId(execution_id),
+                project_id=ProjectId(project_id),
+                task_id=TaskId(task_id),
+                actor_id=authenticated_actor(req.actor_id),
+                source="web",
+            )
+        except (TaskNotFoundError, ValueError):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="request failed")
+        except InvalidTaskTransitionError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+        except ExecutionError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="request failed")
+        return {
+            "id": task.id.value,
+            "state": task.state,
+            "blocker_reason": task.blocker_reason,
         }
