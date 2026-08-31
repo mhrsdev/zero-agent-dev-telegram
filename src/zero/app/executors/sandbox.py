@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -50,7 +51,7 @@ class CommandExecutor(Protocol):
 #: The fixed, scrubbed environment shared by every backend. No host
 #: environment variables pass through — this list IS the environment.
 def scrubbed_env(cwd: str) -> dict[str, str]:
-    return {
+    env = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": cwd,
         "LANG": "C",
@@ -59,6 +60,63 @@ def scrubbed_env(cwd: str) -> dict[str, str]:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
     }
+    # Live-run fix (2026-08-31, B11): the engine runs inside the project
+    # virtualenv (``.venv``), but this scrubbed PATH resolved bare
+    # ``python3``/``pytest`` to the SYSTEM interpreter — which has no
+    # pytest and no project stack. The evidence test command therefore
+    # failed with "/usr/bin/python3: No module named pytest" on EVERY
+    # attempt regardless of what the agent produced. When the engine
+    # itself is venv-mounted, expose that venv to child commands: the
+    # same interpreter the operator validated is used, isolation is
+    # unchanged (still a fixed env — no host variables leak through),
+    # and the allowlist semantics are identical.
+    if sys.prefix != sys.base_prefix:  # engine is venv-mounted
+        venv_bin = os.path.join(sys.prefix, "bin")
+        env["VIRTUAL_ENV"] = sys.prefix
+        env["PATH"] = venv_bin + os.pathsep + env["PATH"]
+    return env
+
+
+#: Bare interpreter names that resolve through PATH inside the scrubbed
+#: environment. Only BARE names are rewritten — an explicit absolute or
+#: relative interpreter path is honored as written.
+_INTERPRETER_BASENAMES = frozenset(
+    {
+        "python",
+        "python3",
+        f"python{sys.version_info.major}",
+        f"python{sys.version_info.major}.{sys.version_info.minor}",
+        "pytest",
+    }
+)
+
+
+def host_interpreter_argv(argv: list[str]) -> list[str]:
+    """Route bare CPython/pytest invocations to the engine's interpreter.
+
+    Live-run fix (2026-08-31, B11): with ``host_bounded`` isolation the
+    scrubbed env resolves ``python3 -m pytest`` to the system python,
+    which typically lacks the project's test stack, so the configured
+    evidence test command could never pass. When the engine runs inside
+    a virtualenv, a bare ``python``/``python3``/``python3.N`` argv[0]
+    is rewritten to :data:`sys.executable` and a bare ``pytest`` to
+    ``[sys.executable, "-m", "pytest"]`` so the verified environment
+    executes the command. Absolute interpreter paths are honored as
+    written, non-venv deployments are untouched, and this helper must
+    NEVER be applied on container backends (the container interpreter
+    differs from the host venv).
+    """
+    if not argv or sys.prefix == sys.base_prefix:
+        return argv
+    base = os.path.basename(argv[0])
+    if base not in _INTERPRETER_BASENAMES:
+        return argv
+    if os.path.sep in argv[0] or (os.altsep or "") and os.path.altsep in argv[0]:
+        # Explicit path: honor it exactly as configured.
+        return argv
+    if base == "pytest":
+        return [sys.executable, "-m", "pytest", *argv[1:]]
+    return [sys.executable, *argv[1:]]
 
 
 #: Host variables the ``docker`` CLI itself needs to reach the daemon.

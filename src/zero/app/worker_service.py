@@ -842,9 +842,14 @@ class WorkerService:
             )
             self._execution_repo.insert_attempt(attempt, commit=False)
             # A recovered/paused execution with ready work resumes when a
-            # scheduler successfully claims the work.
+            # scheduler successfully claims the work. Clear the stale
+            # retry blocker so the state stays truthful (live cosmetic
+            # bug 2026-08-31: executions showed "awaiting automatic task
+            # retry" while running).
             if execution.state in {"pending", "paused"}:
-                self._execution_repo.update_execution_state(execution_id, "running", commit=False)
+                self._execution_repo.update_execution_state(
+                    execution_id, "running", blocker_reason="", commit=False
+                )
         return attempt
 
     def renew_task_lease(

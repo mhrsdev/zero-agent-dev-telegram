@@ -78,3 +78,78 @@ tasks previously failed with no command configured).
 1. **Rotate the leaked API key** (it was committed upstream in `scripts/probe_gateway_tools.py` before this fix; the file is now env-read/fail-closed).
 2. Boot recovery + tick reconciliation are automatic; no manual DB surgery is required after restarts/crashes.
 3. See `docs/LIVE_RUN_REPORT.md` for the live run narrative and `realrun-evidence/` for artifacts.
+
+---
+
+## Round 4 — Resumed live run with the API alive (2026-08-31, B10–B14)
+
+The engine was resumed against the real gateway (claude-opus-5 via
+api.justwoker.icu) and real Telegram group. The greeting goal was re-run
+end-to-end. Four more real bugs were found and fixed; the goal now
+COMPLETES the full pipeline (planner → decomposition → scheduler → agent
+runtime with worktree + tools → evidence pytest exit=0 → result delivery
+to the group, message_id=805).
+
+| ID | File(s) | Problem (seen live) | Fix |
+|----|---------|---------------------|-----|
+| B10 | `worktree_service.py`, `agent_runtime.py` | Every worktree carries the server-managed hygiene `.gitignore` (committed at creation), so the cumulative diff was NEVER empty and the "required diff evidence" gate passed even when the agent produced nothing. Additionally, the cumulative FALLBACK (meant for aggregation tasks) let generative tasks pass on their dependencies' work alone (the live "create the test module" task completed without creating any file). | Hygiene paths excluded from incremental/cumulative diffs and the status section; a genuinely change-less attempt yields EMPTY diff content (rejected by the existing gate). PLUS: a generative objective (create/write/fix/…) whose diff evidence is only the no-change fallback marker now raises `RuntimeEvidenceError`. |
+| B11 | `executors/sandbox.py`, `worktree_service.py` | The scrubbed child env resolved bare `python3`/`pytest` to the SYSTEM interpreter — "No module named pytest" on every evidence run. | `scrubbed_env` exposes the engine venv (`VIRTUAL_ENV` + venv PATH) when venv-mounted; `host_interpreter_argv` rewrites bare `python`/`python3`/`pytest` to the engine's own interpreter on the HOST path only (never container backends). |
+| B12a | `approval_gate.py`, `config.py`, `services.py` | `ZERO_TOOL_APPROVAL_MODE` had no unattended option (`off`/`manual` only); manual gated EVERY call including `ls`/`git status` — the live agent burned whole attempts on pending approvals and gave up. | New `auto` mode: hardline floor + operator deny rules stay enforced, everything else flows without a human click. Hardline matching hardened for argv-shaped JSON (strip keys/separators before matching — `"rm", "-rf", "/"` now matches). |
+| B12b | `approval_gate.py` | Manual mode had no read-only triage. | Provably read-only calls (read_file, capture_diff, `ls`/`grep`, read-only git subcommands, `git worktree list`) auto-allow with cause `safe_readonly`; deny rules still outrank. |
+| B13 | `agent_runtime.py` | Retries ran with the IDENTICAL prompt (blind), and the evidence error said only `exit=5` — the agent could not know "no tests ran" means CREATE the tests. | `_task_prompt_with_retry` appends the last failed attempt's redacted error + pattern-specific actionable guidance (e.g. "no tests ran → create the test files yourself with write_file"); the evidence error now carries a bounded command-output tail. |
+| B14 | `config_sync.py` | **THE BIG ONE**: the tool-capability model requires a grant per (project, tool, agent_scope); only `internet_search` was ever granted. EVERY task agent's workspace tool call (`read_file`/`write_file`/`run_command`/`capture_diff`) was denied with "No grant for tool … in scope …" for the whole deployment — agents could do nothing, while the runtime's own evidence commands (bypassing ToolService) kept working and masked the gap. | `_ensure_workspace_tool_grants` at config sync: grants all four workspace tools to `main_worker` + `sub_agent_type`, idempotently, at every boot. |
+| CORRUPTION | `tool_service.py` | The source contained a syntax-breaking corruption at 2 sites (`self._handlers[handler_key]` → `self._handlersandler_key`) — masked by stale bytecode caches; any fresh install would die with SyntaxError. (The corruption was baked into the previous archive/commit.) | Repaired both sites; full `compileall` clean; all bytecode caches flushed. |
+| cosmetic | `worker_service.py` | Executions showed a stale "awaiting automatic task retry" blocker while running. | Claiming work on a paused execution clears the blocker. |
+
+### Resumed-run verification
+
+- Fresh greeting goal `exec_5q6dolo3fid5d0tszoufbji6`: **completed** — all 4 tasks green, evidence pytest exit=0 (agent-created `tests/test_greeting.py` asserting `greet("World") == "Hello, World!"`), result delivered to the real group (message_id=805).
+- DB invariants after the run: 0 stale agent instances, 0 stale worktrees.
+- Full deterministic suite: EXIT=0 (includes 25 new wave12 regression tests).
+- Live battery 28/28 re-verified earlier in this session (see Round 2 evidence).
+
+---
+
+## Round 5 — Mega-scale live run: super-massive project/task/team management (2026-08-31, M15)
+
+The hardest real run: 3 real projects, 3 real teams (10 agent types with
+staggered concurrency limits), 3 large goals decomposed by the REAL LLM
+planner into 44 tasks with dependency graphs, all worked concurrently
+against the real gateway and real Telegram group.
+
+### Live-found bug
+
+| ID | File(s) | Problem (seen live) | Fix |
+|----|---------|---------------------|-----|
+| M15 | `background_workers.py`, `config.py` | **Head-of-line blocking across projects**: the managed worker iterated projects SEQUENTIALLY. One project's long tick (the 15-task textkit graph grinding its frontier for ~9 minutes) starved every other project's scheduling — the freshly approved Nettools/Dataviz plans sat UNCLAIMED for 12+ minutes while P1 monopolized the loop. `tick_parallel_executions` only parallelizes executions WITHIN one project's tick, so nothing helped across projects. | New `ZERO_TICK_PROJECT_PARALLELISM` (1..8, default 1 = historical serial). N>1 ticks up to N projects concurrently via a bounded ThreadPoolExecutor. Per-project error isolation preserved (`scheduler:{id}` / `reconcile:{id}` / `scheduler-parallel:{id}` error records); claims/leases remain exactly-once — the same concurrency model the intra-tick execution pool already exercises. Restart safety was already in place: boot recovery reconciled the interrupted P1 frontier task automatically (0 stale instances, 0 stale worktrees). |
+
+### Live-verified engine invariants (observed, no code change needed)
+
+- **One-chat-one-project governance**: `create_binding` refuses to bind the
+  same Telegram group to a second project ("interface binding already
+  belongs to another project") — a real scope-isolation invariant, pinned
+  here as documented behavior. Mega setup therefore gave P2/P3 their own
+  encrypted bot-token secrets, and progress fan-out stays on P1's binding.
+- **At-capacity deferral (B6) under real load**: `live-keeper` raised to
+  max_concurrent_instances=2 runs 2 tasks in parallel worktrees while
+  further ready tasks stay `ready` (never claimed+failed).
+- **Automatic retry with backoff (GAP 12)**: a P3 task interrupted by the
+  engine restart re-entered the queue with `next_retry_at` set and the
+  execution honestly `paused` with "awaiting automatic task retry".
+
+| M15b | `background_workers.py` | The pool-per-cycle variant still joined the SLOWEST project's tick: fast projects ticked only once per P1-cycle (P1's long graph drain gates every cycle). | Independent per-project scheduler loops (Hermes-style per-scope loops): each project ticks at its own cadence; a coordinator discovers projects DYNAMICALLY (projects created after boot join without an engine restart; dead loops are respawned); `ZERO_TICK_PROJECT_PARALLELISM` bounds concurrent ticks via a semaphore (provider load cap). Serial default (1) untouched. |
+| M16 | `config_sync.py` | **Per-project tool floors were management-project only**: operator-created projects had ZERO tool grants, so every task agent's `read_file`/`write_file`/`run_command`/`capture_diff` was denied ("No grant for tool ... in scope ...") and coding tasks failed HONESTLY with `required diff evidence contains no file change` — agents literally could not write. | `_ensure_per_project_tool_floors`: the `internet_search` + four workspace tool floors are per-project boot invariants, granted idempotently for EVERY project with per-project isolation. Verified live: grants flow to the new projects at restart. |
+| M16b | operator config (no code change) | New projects had no repository, so coding tasks fail-closed: `a coding task requires repository_id when the project does not have exactly one repository`. | Correct engine behavior; the operator registers the project's repository (`register_repository`). Done live for both new projects (shared live-repo path; isolated per-task worktrees remain). |
+
+| M17 | `agent_runtime.py` | **The base task prompt sabotaged coding agents**: its final line — "Return a concise completion report..." — was obeyed literally by read-heavy agents (objectives referencing dependency documents). They returned text-only reports without ever calling `write_file`, failing the diff gate attempt after attempt (`task objective expects file changes but the attempt recorded none of its own`). | Diff-evidence tasks now end with an explicit hands-on imperative (use workspace tools, ACTUALLY implement in the workspace, text-only answers FAIL the gate), keeping the honesty clause; non-diff tasks keep the historical report contract. |
+| M18 | `agent_runtime.py` | **Dependency text outputs were inaccessible**: a dependency task with `provider_response` evidence (the nettools API contract) produced a text artifact that lives ONLY in the database. Downstream objectives referenced "the documented rules" — the agent searched the workspace, found nothing, and honestly reported it could not proceed (text-only → failed diff gate). | Completed dependencies' `provider_response` texts are injected into downstream task prompts (`_dependency_output_context`, bounded: 1800 chars/dependency, 6000 total, silent fallback on errors). Found by the wave13 test itself: the no-failed-attempt early return initially skipped the context — first attempts (the most important ones) now always receive it. |
+
+### Mega-run verification
+
+- 3 goals → REAL planner revisions approved → REAL decomposer graphs:
+  textkit 15 tasks / 23 edges, nettools 15 tasks, dataviz-ascii 14 tasks.
+- Full deterministic suite after M15: **1265 passed / 0 failed** (10
+  env-gated skips), including 6 new `tests/test_mega_scale_wave13.py`
+  regression tests (concurrent wall-clock overlap, multi-thread spread,
+  serial-order backcompat, per-project isolation, 8-project clamp,
+  env validation, default=1).

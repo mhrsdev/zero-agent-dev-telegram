@@ -587,9 +587,11 @@ def build_services(
     )
     # GAP 8b/G2 Hermes parity: opt-in per-call tool approval gate.
     # ``off`` keeps the historical plan-level-only posture byte-for-byte.
+    # B12a (2026-08-31): "auto" also builds the gate — the hardline floor
+    # and operator deny rules must stay enforced without a human loop.
     approval_gate = (
         ToolApprovalGate(database, mode=settings.tool_approval_mode)
-        if settings.tool_approval_mode == "manual"
+        if settings.tool_approval_mode in ("manual", "auto")
         else None
     )
     agent_runtime = AgentRuntime(

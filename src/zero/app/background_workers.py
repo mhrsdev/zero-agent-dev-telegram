@@ -106,11 +106,27 @@ class BackgroundWorkerHost:
             await asyncio.to_thread(self._startup_recovery)
         except Exception as exc:  # noqa: BLE001 - boot recovery must not kill the host
             logger.warning("startup recovery failed: %s", type(exc).__name__)
-        tasks = [
-            asyncio.create_task(self._scheduler_loop(), name="zero-scheduler-worker"),
-            asyncio.create_task(self._delivery_loop(), name="zero-delivery-worker"),
-            asyncio.create_task(self._polling_loop(), name="zero-polling-worker"),
-        ]
+        tasks = []
+        # Mega-scale fix (2026-08-31, live-found, M15b): with
+        # ZERO_TICK_PROJECT_PARALLELISM > 1 each project gets its OWN
+        # recurring scheduler loop (Hermes-style per-scope loops) + a
+        # bounded concurrency semaphore. A pool-per-cycle starved fast
+        # projects behind the slowest tick of the cycle; independent
+        # loops let every project tick at its own cadence and pick up
+        # projects created AFTER boot (dynamic discovery below).
+        if max(1, min(8, int(self._settings.tick_project_parallelism))) > 1:
+            tasks.append(
+                asyncio.create_task(
+                    self._project_scheduler_coordinator(),
+                    name="zero-scheduler-coordinator",
+                )
+            )
+        else:
+            tasks.append(
+                asyncio.create_task(self._scheduler_loop(), name="zero-scheduler-worker")
+            )
+        tasks.append(asyncio.create_task(self._delivery_loop(), name="zero-delivery-worker"))
+        tasks.append(asyncio.create_task(self._polling_loop(), name="zero-polling-worker"))
         # GAP 4 wiring fix (2026-08-31): ``ZERO_TELEGRAM_MODE=user_session``
         # used to validate in Settings but changed NOTHING at runtime — the
         # adapter existed and was never constructed. The mode now starts a
@@ -594,6 +610,85 @@ class BackgroundWorkerHost:
     # ------------------------------------------------------------------
 
     def _scheduler_tick(self) -> None:
+        """Serial mode (parallelism=1): tick every project once, in order."""
+        for project in self._services.identity.list_projects():
+            self._tick_single_project(project)
+
+    async def _project_scheduler_coordinator(self) -> None:
+        """M15b: discover projects dynamically and run one scheduler loop
+        per project, bounded by ZERO_TICK_PROJECT_PARALLELISM.
+
+        A project created after boot joins on the next scan without an
+        engine restart; a loop that dies is restarted on the next scan.
+        """
+        interval = max(0.1, float(self._settings.scheduler_interval_seconds))
+        parallelism = max(1, min(8, int(self._settings.tick_project_parallelism)))
+        semaphore = asyncio.Semaphore(parallelism)
+        loops: dict[str, asyncio.Task] = {}
+        try:
+            while not self._stop.is_set():
+                try:
+                    projects = await asyncio.to_thread(
+                        self._services.identity.list_projects
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - coordinator must survive
+                    self._record_error(
+                        f"coordinator:list_projects: {type(exc).__name__}"
+                    )
+                    projects = []
+                for project in projects:
+                    key = project.id.value
+                    existing = loops.get(key)
+                    if existing is not None and not existing.done():
+                        continue
+                    if existing is not None and existing.done():
+                        exc = existing.exception()
+                        if exc is not None and not isinstance(
+                            exc, asyncio.CancelledError
+                        ):
+                            self._record_error(
+                                f"scheduler-project:{key}: {type(exc).__name__}"
+                            )
+                    loops[key] = asyncio.create_task(
+                        self._project_scheduler_loop(project, semaphore),
+                        name=f"zero-scheduler:{key}",
+                    )
+                await self._wait(interval)
+        finally:
+            for task in loops.values():
+                task.cancel()
+
+    async def _project_scheduler_loop(
+        self, project, semaphore: asyncio.Semaphore
+    ) -> None:
+        """Tick ONE project forever at its own cadence (M15b)."""
+        interval = max(0.1, float(self._settings.scheduler_interval_seconds))
+        while not self._stop.is_set():
+            await semaphore.acquire()
+            try:
+                await asyncio.to_thread(self._tick_single_project, project)
+                self.status.scheduler_ticks += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - per-project isolation
+                self._record_error(
+                    f"scheduler-project:{project.id.value}: {type(exc).__name__}"
+                )
+            finally:
+                semaphore.release()
+            await self._wait(interval)
+
+    def _tick_single_project(self, project) -> None:
+        """Tick ONE project: routing resolution + lease reconciliation +
+        scheduler run_once.
+
+        Extracted from the historical serial loop so projects can tick
+        independently (serial mode, or one dedicated loop per project
+        under ZERO_TICK_PROJECT_PARALLELISM) without changing the
+        per-project behavior or error isolation.
+        """
         services = self._services
         provider_names = services.providers.registered_provider_names
         provider = provider_names[0] if provider_names else "openai-compatible"
@@ -601,11 +696,7 @@ class BackgroundWorkerHost:
         # Round-7 routing alignment (live fix): config_sync pins the tick
         # to ``routing.primary_model`` — the scheduler's LLM calls
         # (decomposition + task execution) must call the configured
-        # model, not the ``settings.openai_model`` default. On the
-        # operator's gateway the gpt-4o-mini default stopped being served
-        # outright (every task call edge-403'd) while the aligned planner
-        # and chat bridge kept working — this override makes the tasks
-        # follow the SAME routing truth.
+        # model, not the ``settings.openai_model`` default.
         try:
             tick_provider, tick_model = services.scheduler.tick_routing_override()
         except Exception:  # noqa: BLE001 - scheduler optional in some compositions
@@ -615,51 +706,50 @@ class BackgroundWorkerHost:
         if tick_model:
             model_name = tick_model
         combined_command = self._settings.combined_test_command
-        for project in services.identity.list_projects():
+        try:
+            owner = project.owner_user_id
+            # Live-run fix (2026-08-31): reconcile running tasks whose
+            # lease expired (dead owner) BEFORE claiming — boot-only
+            # recovery left dead-lease tasks blocking their graph
+            # (and their agent-type slot) forever when the lease was
+            # still live at boot but the owner died afterwards.
             try:
-                owner = project.owner_user_id
-                # Live-run fix (2026-08-31): reconcile running tasks whose
-                # lease expired (dead owner) BEFORE claiming — boot-only
-                # recovery left dead-lease tasks blocking their graph
-                # (and their agent-type slot) forever when the lease was
-                # still live at boot but the owner died afterwards.
-                try:
-                    reconciled = services.worker.reconcile_expired_leases(
-                        project_id=project.id,
-                        actor_id=owner,
-                        source="system",
-                    )
-                    if reconciled:
-                        logger.info(
-                            "tick reconciliation: %d execution(s) recovered from expired leases",
-                            reconciled,
-                        )
-                except Exception as exc:  # noqa: BLE001 - advisory
-                    self._record_error(
-                        f"reconcile:{project.id.value}: {type(exc).__name__}"
-                    )
-                # Hermes live-report parity (gap C): task executions
-                # stream live progress into every enabled Telegram
-                # binding of the project (lazy: quiet ticks send
-                # nothing). Any sink failure degrades to silent — the
-                # durable scheduler outcome never depends on it.
-                stream_cb, task_event_cb = self._build_live_progress_callbacks(
-                    project_id=project.id, actor_id=owner
-                )
-                services.scheduler.run_once(
+                reconciled = services.worker.reconcile_expired_leases(
                     project_id=project.id,
                     actor_id=owner,
-                    lease_owner="managed-worker-host",
-                    provider=provider,
-                    model_name=model_name,
-                    combined_test_command=(combined_command[0] if combined_command else None),
-                    combined_test_args=tuple(combined_command[1:]),
-                    combined_test_timeout_seconds=self._settings.combined_test_timeout_seconds,
-                    stream_callback=stream_cb,
-                    task_event_callback=task_event_cb,
+                    source="system",
                 )
-            except Exception as exc:  # noqa: BLE001 - per-project isolation
-                self._record_error(f"scheduler:{project.id.value}: {type(exc).__name__}")
+                if reconciled:
+                    logger.info(
+                        "tick reconciliation: %d execution(s) recovered from expired leases",
+                        reconciled,
+                    )
+            except Exception as exc:  # noqa: BLE001 - advisory
+                self._record_error(
+                    f"reconcile:{project.id.value}: {type(exc).__name__}"
+                )
+            # Hermes live-report parity (gap C): task executions
+            # stream live progress into every enabled Telegram
+            # binding of the project (lazy: quiet ticks send
+            # nothing). Any sink failure degrades to silent — the
+            # durable scheduler outcome never depends on it.
+            stream_cb, task_event_cb = self._build_live_progress_callbacks(
+                project_id=project.id, actor_id=owner
+            )
+            services.scheduler.run_once(
+                project_id=project.id,
+                actor_id=owner,
+                lease_owner="managed-worker-host",
+                provider=provider,
+                model_name=model_name,
+                combined_test_command=(combined_command[0] if combined_command else None),
+                combined_test_args=tuple(combined_command[1:]),
+                combined_test_timeout_seconds=self._settings.combined_test_timeout_seconds,
+                stream_callback=stream_cb,
+                task_event_callback=task_event_cb,
+            )
+        except Exception as exc:  # noqa: BLE001 - per-project isolation
+            self._record_error(f"scheduler:{project.id.value}: {type(exc).__name__}")
 
     def _build_live_progress_callbacks(self, *, project_id, actor_id):
         """Build (stream_callback, task_event_callback) fanning out to

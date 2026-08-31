@@ -148,7 +148,15 @@ def sync_management_config(settings: Settings, services: Services) -> None:
     _sync_providers(settings, services, project, owner_id, cfg, cfgsvc)
     _sync_telegram_bindings(services, project, owner_id, cfg, cfgsvc, settings)
     _sync_planner(services, cfg)
-    _ensure_web_search_tool(services, project, owner_id)
+    # M16 (2026-08-31, mega-run live-found): the per-project tool floors
+    # (workspace tools + internet_search) used to be granted for the
+    # MANAGEMENT project only. Operator-created projects — the entire
+    # point of multi-project scale — had ZERO grants, so every task
+    # agent's read_file/write_file/run_command/capture_diff was denied
+    # ("No grant for tool ... in scope ...") and coding tasks failed
+    # honestly with empty diff evidence. The floors are per-project
+    # boot invariants: grant them for EVERY project, idempotently.
+    _ensure_per_project_tool_floors(services)
 
     # Bootstrap helper: in owner_only mode, the first sender to message
     # the bot is auto-linked as the project owner. This closes the
@@ -882,6 +890,98 @@ def _sync_planner(services: Services, cfg) -> None:
             "routing.primary_model=%s",
             primary,
         )
+
+
+def _ensure_per_project_tool_floors(services: Services) -> None:
+    """M16: apply the per-project tool floors to EVERY project.
+
+    The tool-capability model requires a grant per (project, tool,
+    agent_scope); the floors (internet_search + the four workspace
+    tools) are boot invariants per project, not per deployment. Each
+    project is isolated: a failure grants nothing for that project but
+    never crashes boot.
+    """
+    try:
+        projects = services.identity.list_projects()
+    except Exception as exc:  # noqa: BLE001 - boot must survive
+        logger.warning(
+            "config sync: could not list projects for tool floors: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return
+    for project in projects:
+        owner_id = project.owner_user_id
+        for ensure in (_ensure_web_search_tool, _ensure_workspace_tool_grants):
+            try:
+                ensure(services, project, owner_id)
+            except Exception as exc:  # noqa: BLE001 - per-project isolation
+                logger.warning(
+                    "config sync: tool floor failed for project %s: %s: %s",
+                    project.id.value,
+                    type(exc).__name__,
+                    exc,
+                )
+
+
+def _ensure_workspace_tool_grants(services: Services, project, owner_id) -> None:
+    """Grant the four workspace tools to every execution agent scope.
+
+    Live-run fix B14 (2026-08-31): the tool-capability model REQUIRES a
+    grant per (project, tool, agent_scope) — ``ToolService.invoke``
+    denies anything ungranted ("No grant for tool ... in scope ...").
+    Only ``internet_search`` was ever auto-granted, so EVERY task
+    agent's ``read_file`` / ``write_file`` / ``run_command`` /
+    ``capture_diff`` call was denied for the whole live deployment: the
+    agents could literally do nothing (the transcript said "Every
+    workspace tool call was denied by policy in this session"), while
+    the runtime's own evidence commands (which bypass ToolService) kept
+    working — masking the gap. The deterministic tests granted tools in
+    fixtures, so the hole never surfaced there.
+
+    Grants are idempotent (existing grant short-circuits) and scoped to
+    the project. ``main_worker`` and ``sub_agent_type`` are the scopes
+    the execution runtime and the delegate tool actually use.
+    """
+    scopes = ("main_worker", "sub_agent_type")
+    for tool_name in ("read_file", "write_file", "run_command", "capture_diff"):
+        try:
+            tool = services.tools._tool_repo.get_tool_by_name(tool_name)
+        except Exception:  # noqa: BLE001 - tool registry row missing
+            logger.debug("config sync: workspace tool %s not registered", tool_name)
+            continue
+        for scope in scopes:
+            try:
+                existing = [
+                    grant
+                    for grant in services.tools._tool_repo.list_grants_for_project(
+                        project.id
+                    )
+                    if grant.tool_id == tool.id and grant.agent_scope == scope
+                ]
+                if existing:
+                    continue
+                services.tools.grant_tool(
+                    project_id=project.id,
+                    actor_id=owner_id,
+                    tool_id=tool.id,
+                    agent_scope=scope,
+                    source="system",
+                )
+                logger.info(
+                    "config sync: %s granted to %s (project %s)",
+                    tool_name,
+                    scope,
+                    project.id.value,
+                )
+            except Exception as exc:  # noqa: BLE001 - grant must not crash boot
+                logger.warning(
+                    "config sync: %s grant failed for scope %s: %s: %s",
+                    tool_name,
+                    scope,
+                    type(exc).__name__,
+                    exc,
+                )
 
 
 def _ensure_web_search_tool(services: Services, project, owner_id) -> None:

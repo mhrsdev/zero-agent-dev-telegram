@@ -18,7 +18,14 @@ ports the portable core:
 
 The gate is opt-in per deployment via ``ZERO_TOOL_APPROVAL_MODE``:
 ``off`` (default) keeps historical behavior byte-for-byte; ``manual``
-consults this service before executing each declared tool call.
+consults this service before executing each declared tool call;
+``auto`` (2026-08-31, live-run B12a) enforces ONLY the hardline floor
+and deny rules — no human loop — so autonomous pipelines can run
+unattended while catastrophic calls and operator deny rules still fail
+closed. ``manual`` additionally auto-allows PROVABLY read-only calls
+(B12b, Hermes triage parity: ``read_file`` / ``capture_diff`` /
+read-only ``run_command`` shapes) — the live run showed an agent
+paralyzed because even ``ls`` and ``git status`` needed a human click.
 """
 
 from __future__ import annotations
@@ -57,6 +64,61 @@ class ApprovalError(RuntimeError):
     """Typed failure raised by resolve/list operations."""
 
 
+#: B12b (2026-08-31): git subcommands whose ENTIRE surface is read-only;
+#: safe for manual-mode auto-allow. Mutable subcommands (add/commit/
+#: checkout/reset/push/...) are deliberately absent.
+_READONLY_GIT_SUBCOMMANDS = frozenset(
+    {
+        "status",
+        "log",
+        "diff",
+        "show",
+        "branch",
+        "rev-parse",
+        "ls-files",
+        "cat-file",
+        "describe",
+        "blame",
+        "shortlog",
+        "grep",
+    }
+)
+
+
+def _is_safe_readonly(tool_name: str, input_data: dict[str, Any]) -> bool:
+    """Classify a tool call as provably read-only (manual-mode triage).
+
+    B12b (live run 2026-08-31): manual mode gated EVERY call, including
+    ``ls``/``git status``/``read_file``; the live agent burned its whole
+    attempt on pending approvals for pure reads and finalized with
+    "I could not perform the task". Hermes triage: reads flow, writes
+    ask.
+    """
+    if tool_name in ("read_file", "capture_diff"):
+        return True
+    if tool_name != "run_command":
+        return False
+    command = input_data.get("command")
+    if not isinstance(command, str) or not command:
+        return False
+    args = input_data.get("args") or []
+    if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
+        return False
+    if command in ("ls", "grep"):
+        return True
+    if command == "git":
+        if not args:
+            return False
+        sub = args[0].strip().lower()
+        if sub in _READONLY_GIT_SUBCOMMANDS:
+            return True
+        if sub == "worktree":
+            rest = [a.strip().lower() for a in args[1:]]
+            return bool(rest) and rest[0] == "list"
+        return False
+    return False
+
+
 class ToolNotFoundDuringApproval(ApprovalError):
     pass
 
@@ -72,8 +134,8 @@ class ToolApprovalGate:
         pending_ttl_seconds: float = 600.0,
         clock: Any = time.time,
     ) -> None:
-        if mode not in ("off", "manual"):
-            raise ValueError("approval mode must be 'off' or 'manual'")
+        if mode not in ("off", "manual", "auto"):
+            raise ValueError("approval mode must be 'off', 'manual' or 'auto'")
         self._db = database
         self._mode = mode
         self._ttl = pending_ttl_seconds
@@ -108,8 +170,16 @@ class ToolApprovalGate:
     @staticmethod
     def hardline_match(tool_name: str, input_data: dict[str, Any]) -> str | None:
         blob = f"{tool_name}\n{json.dumps(input_data, ensure_ascii=False)}"
+        # B12a hardening (2026-08-31): argv-shaped JSON separates tokens
+        # with quotes/commas AND interleaves key names ("command": "rm",
+        # "args": ["-rf", "/"]) so the catastrophic patterns — written
+        # for shell-string shapes — never saw them. Strip JSON keys,
+        # then separators, and match both shapes; fail-closed bias is
+        # intentional for the hardline floor.
+        normalized = re.sub(r'"[^"\\]*"\s*:', " ", blob)
+        normalized = re.sub(r'["\[\]{},\\]', " ", normalized)
         for pattern in _HARDLINE_PATTERNS:
-            match = pattern.search(blob)
+            match = pattern.search(blob) or pattern.search(normalized)
             if match:
                 return pattern.pattern
         return None
@@ -182,6 +252,17 @@ class ToolApprovalGate:
         if rule_row is not None:
             request = self._row_to_request(rule_row)
             return ApprovalVerdict(state="denied", cause="rule", request=request)
+
+        # B12a (2026-08-31): auto mode = unattended operation with the
+        # SAME safety floor. Hardline and operator deny rules were already
+        # enforced above; everything else flows without a human click.
+        if self._mode == "auto":
+            return ApprovalVerdict(state="allowed", cause="mode_auto")
+
+        # B12b: manual-mode triage — provably read-only calls never need
+        # a human click (deny rules above still outrank this allow).
+        if _is_safe_readonly(tool_name, input_data):
+            return ApprovalVerdict(state="allowed", cause="safe_readonly")
 
         try:
             standing_row = (

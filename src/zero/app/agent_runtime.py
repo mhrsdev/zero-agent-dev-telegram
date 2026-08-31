@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, replace
 from threading import Event
 from typing import TYPE_CHECKING, Any, cast
@@ -60,6 +61,22 @@ if TYPE_CHECKING:
 _MAX_EVIDENCE_BYTES = 64 * 1024
 _DEFAULT_MAX_TOOL_ROUNDS = 8
 _LOGGER = logging.getLogger(__name__)
+
+# B10 refinement (live run 2026-08-31): capture_diff marks the cumulative
+# fallback with this stable marker; a generative objective whose diff
+# evidence contains ONLY the fallback recorded no work of its own.
+_TASK_MADE_NO_CHANGES_MARKER = "(this task made no changes on top of its dependency"
+
+_OBJECTIVE_CHANGE_VERBS = re.compile(
+    r"\b(create|write|add|implement|update|fix|repair|refactor|remove"
+    r"|delete|migrate|extend|modify|generate|produce)\b",
+    re.IGNORECASE,
+)
+
+
+def _objective_expects_changes(objective: str) -> bool:
+    """Whether the objective's wording implies the agent must change files."""
+    return bool(_OBJECTIVE_CHANGE_VERBS.search(objective or ""))
 #: Hermes-parity resilience knobs for the execution tool loop.
 #:
 #: A single malformed tool-call argument or one repeated tool failure
@@ -753,7 +770,7 @@ class AgentRuntime:
                     agent_type_id=policy.type_id,
                     system_message=base_system_message,
                     user_prefix=f"Project {project_id.value}",
-                    plan_contract=self._task_prompt(task),
+                    plan_contract=self._task_prompt_with_retry(task, actor_id=actor_id),
                     execution_snapshot=snapshot.graph_state if snapshot else "{}",
                     conversation_tail=[],
                     query=task.objective,
@@ -772,7 +789,8 @@ class AgentRuntime:
             messages = (
                 CanonicalMessage(
                     role="user",
-                    content=workspace_prompt + self._task_prompt(task),
+                    content=workspace_prompt
+                    + self._task_prompt_with_retry(task, actor_id=actor_id),
                 ),
             )
 
@@ -798,7 +816,7 @@ class AgentRuntime:
                                 "Only report actions supported by durable evidence."
                             ),
                             user_prefix=f"Project {project_id.value}",
-                            plan_contract=self._task_prompt(task),
+                            plan_contract=self._task_prompt_with_retry(task, actor_id=actor_id),
                             execution_snapshot=snapshot.graph_state if snapshot else "{}",
                             conversation_messages=conversation_messages,
                             context_window=context_window,
@@ -927,7 +945,7 @@ class AgentRuntime:
                                 "Only report actions supported by durable evidence."
                             ),
                             user_prefix=f"Project {project_id.value}",
-                            plan_contract=self._task_prompt(task),
+                            plan_contract=self._task_prompt_with_retry(task, actor_id=actor_id),
                             execution_snapshot=snapshot.graph_state if snapshot else "{}",
                             conversation_messages=[_message_to_record(m) for m in messages_final],
                             context_window=context_window,
@@ -1163,17 +1181,223 @@ class AgentRuntime:
             agent_type_id=policy.type_id.value if policy.type_id is not None else None,
         )
 
+    def _task_prompt_with_retry(self, task: Task, *, actor_id) -> str:
+        """Task prompt plus retry context when prior attempts failed.
+
+        Live-run gap B13 (2026-08-31): retries re-ran with the IDENTICAL
+        prompt, so the agent could not correct course — the live
+        "create the test module" agent repeatedly produced no file
+        changes and the evidence gate failed it with "required diff
+        evidence contains no file change" with no way to learn why.
+        The last failed attempt's redacted error is now part of the
+        prompt so bounded retries are informative, not blind.
+        """
+        prompt = self._task_prompt(task)
+        dep_context = self._dependency_output_context(task, actor_id=actor_id)
+        base = prompt + dep_context
+        if self._worker is None:
+            return base
+        try:
+            attempts = self._worker.list_attempts(
+                task.id,
+                project_id=task.project_id,
+                actor_id=actor_id,
+                source="system",
+            )
+        except Exception:  # noqa: BLE001 - prompt context is best-effort
+            return base
+        last_failed = max(
+            (a for a in attempts if a.state == "failed"),
+            key=lambda a: a.attempt_number,
+            default=None,
+        )
+        if last_failed is None or not last_failed.error_message:
+            return base
+        reason = last_failed.error_message.strip()
+        if len(reason) > 500:
+            reason = reason[:500] + "…"
+        guidance = (
+            "Correct the previous approach. If the failure says no file"
+            " change was recorded, you must actually create or modify the"
+            " required files with the workspace tools before finalizing."
+        )
+        # Live-run B13 refinement (2026-08-31): pattern-specific,
+        # actionable guidance beats generic "correct course" — the suite
+        # agent kept re-running pytest against an EMPTY repository
+        # without ever creating the missing tests.
+        lowered = reason.lower()
+        if "no tests ran" in lowered or "exit=5" in lowered:
+            guidance = (
+                "The test command collected NO tests because the repository"
+                " has no test files yet. You MUST create the required test"
+                " file(s) yourself with the write_file tool (e.g."
+                " tests/test_greeting.py covering the task objective), then"
+                " run the suite via run_command and make it pass before"
+                " finalizing. Do not just report that no tests exist."
+            )
+        elif "required diff evidence contains no file change" in lowered:
+            guidance = (
+                "Your previous attempt produced zero file changes. You MUST"
+                " create or modify the required files with the write_file"
+                " tool before finalizing — a report without changes cannot"
+                " satisfy diff evidence."
+            )
+        return (
+            base
+            + f"\n\nPrevious attempt #{last_failed.attempt_number} FAILED:\n"
+            + f"{reason}\n"
+            + guidance
+        )
+
+    def _dependency_output_context(self, task: Task, *, actor_id) -> str:
+        """M18 (2026-08-31, mega-run live-found): completed dependency
+        tasks whose evidence is ``provider_response`` produce TEXT
+        artifacts (API contracts, decisions, summaries) that live ONLY in
+        the database. Downstream objectives routinely reference them
+        ("the documented rules") — but the agent had no access: it
+        searched the workspace, found nothing, and honestly reported it
+        could not proceed (text-only answer → failed diff gate, attempt
+        after attempt). Completed dependencies' text outputs are now
+        injected into the task prompt, bounded per dependency and in
+        total. Failure to build the context is silent — the prompt falls
+        back to the historical shape.
+        """
+        if self._worker is None or self._artifacts is None:
+            return ""
+        try:
+            deps = self._worker.list_dependencies(
+                task.execution_id,
+                project_id=task.project_id,
+                actor_id=actor_id,
+                source="system",
+            )
+            upstream_ids = [
+                d.depends_on_task_id for d in deps if d.task_id == task.id
+            ]
+            if not upstream_ids:
+                return ""
+            tasks_by_id = {
+                t.id: t
+                for t in self._worker.list_tasks(
+                    task.execution_id,
+                    project_id=task.project_id,
+                    actor_id=actor_id,
+                    source="system",
+                )
+            }
+        except Exception:  # noqa: BLE001 - context is best-effort
+            return ""
+        sections: list[str] = []
+        total = 0
+        max_per_dep = 1800
+        max_total = 6000
+        for upstream_id in upstream_ids:
+            dep = tasks_by_id.get(upstream_id)
+            if dep is None or dep.state != "completed":
+                continue
+            text = self._dependency_report_text(dep, actor_id=actor_id)
+            if not text:
+                continue
+            remaining = max_total - total
+            if remaining <= 0:
+                break
+            if len(text) > max_per_dep:
+                text = text[:max_per_dep] + "…"
+            text = text[:remaining]
+            total += len(text)
+            objective = (dep.objective or "").strip()
+            label = objective[:110] + ("…" if len(objective) > 110 else "")
+            sections.append(
+                f"--- Output of dependency task ({label}):\n{text}"
+            )
+        if not sections:
+            return ""
+        return (
+            "\n\nOutputs produced by your completed dependency tasks"
+            " (normative wherever your objective references them):\n"
+            + "\n".join(sections)
+            + "\nUse them, but DO THE WORK in the workspace with the tools;"
+            " a text-only answer fails the diff-evidence gate."
+        )
+
+    def _dependency_report_text(self, dep: Task, *, actor_id) -> str:
+        """Extract bounded text output(s) of a completed dependency task."""
+        parts: list[str] = []
+        for artifact_id in dep.completion_evidence or ():
+            try:
+                artifact = self._artifacts.get_artifact(
+                    project_id=dep.project_id,
+                    artifact_id=ArtifactId(artifact_id),
+                    actor_id=actor_id,
+                    source="system",
+                )
+            except Exception:  # noqa: BLE001 - context is best-effort
+                continue
+            content = getattr(artifact, "content", None)
+            if not content:
+                continue
+            text = self._provider_response_text(content)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)[:4000]
+
+    @staticmethod
+    def _provider_response_text(content: Any) -> str:
+        """provider_response artifacts store a JSON envelope; extract the
+        model's text content when parseable, else the raw string."""
+        if not isinstance(content, str):
+            return ""
+        try:
+            payload = json.loads(content)
+        except Exception:
+            return content
+        if not isinstance(payload, dict):
+            return ""
+        response = payload.get("response")
+        if isinstance(response, dict):
+            inner = response.get("content")
+            if isinstance(inner, str) and inner.strip():
+                return inner
+        for key in ("text", "content"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return ""
+
     @staticmethod
     def _task_prompt(task: Task) -> str:
         scope = ", ".join(task.permitted_scope) or "(none declared)"
         evidence = ", ".join(task.expected_evidence) or "(none declared)"
-        return (
-            f"Objective: {task.objective}\n"
-            f"Permitted scope: {scope}\n"
-            f"Required evidence: {evidence}\n"
-            "Return a concise completion report and do not claim actions "
-            "that you did not perform."
-        )
+        lines = [
+            f"Objective: {task.objective}",
+            f"Permitted scope: {scope}",
+            f"Required evidence: {evidence}",
+        ]
+        # M17 (2026-08-31, mega-run live-found): the historical single
+        # closing line — "Return a concise completion report..." — read as
+        # the FINAL instruction. For read-heavy coding tasks (objectives
+        # that reference documents produced by dependency tasks) the model
+        # obeyed it literally: it read the referenced material and returned
+        # a text REPORT without ever calling write_file, failing the diff
+        # gate attempt after attempt. Diff-evidence tasks are HANDS-ON:
+        # the prompt must say so explicitly, in the imperative, AFTER the
+        # objective — while keeping the honesty clause.
+        if "diff" in [e.strip().lower() for e in (task.expected_evidence or ())]:
+            lines.append(
+                "This is a hands-on coding task: use the workspace tools "
+                "(read_file to inspect, write_file to create/modify files, "
+                "run_command to verify) to ACTUALLY implement the objective "
+                "in the current workspace before you finish. A text-only "
+                "answer with no file changes FAILS the diff-evidence gate. "
+                "Do the work first; only then return a concise completion "
+                "report, and do not claim actions that you did not perform."
+            )
+        else:
+            lines.append(
+                "Return a concise completion report and do not claim actions "
+                "that you did not perform."
+            )
+        return "\n".join(lines)
 
     def _dependency_worktree_bases(
         self,
@@ -2361,7 +2585,28 @@ class AgentRuntime:
                 source=source,
             )
             if not diff.content.strip():
-                raise RuntimeEvidenceError("required diff evidence contains no file change")
+                raise RuntimeEvidenceError(
+                    "required diff evidence contains no file change"
+                )
+            if (
+                _TASK_MADE_NO_CHANGES_MARKER in diff.content
+                and _objective_expects_changes(task.objective)
+            ):
+                # B10 refinement (live run 2026-08-31): the cumulative
+                # fallback exists for AGGREGATION tasks ("capture the
+                # final diff"), whose incremental work is legitimately
+                # empty because dependency branches carry the change set.
+                # But a GENERATIVE objective (create/write/fix/...) that
+                # recorded no change OF ITS OWN must not pass on its
+                # dependencies' work — the live "create the test module"
+                # task completed without creating any file because the
+                # cumulative diff contained greeting.py.
+                raise RuntimeEvidenceError(
+                    "task objective expects file changes but the attempt "
+                    "recorded none of its own on top of its dependency "
+                    "branches (diff evidence contains only the execution's "
+                    "cumulative change set)"
+                )
             store_task_artifact(diff, label="diff", kind="diff")
 
         if "source_snapshot" in required:
@@ -2396,8 +2641,23 @@ class AgentRuntime:
                 source=source,
             )
             if command_run.state != "completed" or command_run.exit_code != 0:
+                # B13/B3 (live run 2026-08-31): "exit=5" alone told the
+                # retrying agent nothing — it kept re-running pytest
+                # without ever creating the missing tests because the
+                # durable error never said "no tests ran". Attach a
+                # bounded output excerpt so the failure is actionable.
+                excerpt = ""
+                by_kind_now = {a.kind: a.content for a in command_artifacts}
+                for kind in ("stderr", "stdout"):
+                    text = (by_kind_now.get(kind) or "").strip()
+                    if text:
+                        excerpt = text[-500:]
+                        break
+                suffix = f"\ncommand output tail:\n{excerpt}" if excerpt else ""
                 raise RuntimeEvidenceError(
-                    f"configured test command did not pass (state={command_run.state}, exit={command_run.exit_code})"
+                    f"configured test command did not pass "
+                    f"(state={command_run.state}, exit={command_run.exit_code})"
+                    f"{suffix}"
                 )
             by_kind = {artifact.kind: artifact for artifact in command_artifacts}
             if "stdout" in required:

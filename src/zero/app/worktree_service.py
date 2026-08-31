@@ -489,10 +489,18 @@ class WorktreeService:
                 output_limit=self._max_output_bytes,
             )
             return result.exit_code, result.timed_out, result.stdout, result.stderr
-        from zero.app.executors.sandbox import run_bounded_process, scrubbed_env
+        from zero.app.executors.sandbox import (
+            host_interpreter_argv,
+            run_bounded_process,
+            scrubbed_env,
+        )
 
         exec_result = run_bounded_process(
-            argv,
+            # B11 (2026-08-31): bare python3/pytest must run the ENGINE's
+            # venv interpreter, not the scrubbed-PATH system python (which
+            # has no pytest). Host path only — container backends build
+            # their own environment.
+            host_interpreter_argv(argv),
             cwd=cwd,
             env=scrubbed_env(cwd),
             timeout_seconds=timeout_seconds,
@@ -1481,6 +1489,12 @@ class WorktreeService:
                     "--no-ext-diff",
                     "--no-textconv",
                     worktree.base_revision,
+                    # B10 (2026-08-31): the server-owned hygiene .gitignore
+                    # must never count as task work (see the cumulative
+                    # diff below for the full rationale).
+                    "--",
+                    ".",
+                    ":(exclude).gitignore",
                 ],
                 cwd=worktree.worktree_path,
                 timeout=60,
@@ -1521,7 +1535,15 @@ class WorktreeService:
             )
             if status_output:
                 parts.append("--- Status (includes untracked) ---\n")
-                parts.append(status_output)
+                # B10: drop hygiene .gitignore lines (any porcelain shape:
+                # "?? .gitignore", "M .gitignore", "A  .gitignore") so the
+                # server-owned file can never satisfy status evidence.
+                status_lines = [
+                    line
+                    for line in status_output.splitlines(keepends=True)
+                    if not line.rstrip().endswith(".gitignore")
+                ]
+                parts.append("".join(status_lines))
             if status_truncated:
                 parts.append("\n[git status truncated by policy]\n")
         except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
@@ -1607,6 +1629,18 @@ class WorktreeService:
                     "--no-ext-diff",
                     "--no-textconv",
                     f"{base}..HEAD",
+                    # B10 (live run 2026-08-31): every worktree carries the
+                    # server-managed hygiene baseline commit (auto-
+                    # .gitignore), so base..HEAD was NEVER empty and the
+                    # placeholder header + 7 hygiene lines satisfied the
+                    # runtime's "required diff evidence" gate even when the
+                    # agent produced nothing (the live test-module agent
+                    # completed with every tool call blocked on approval).
+                    # Exclude the hygiene path so the cumulative diff only
+                    # reflects REAL task/dependency work.
+                    "--",
+                    ".",
+                    ":(exclude).gitignore",
                 ],
                 cwd=worktree.worktree_path,
                 timeout=60,

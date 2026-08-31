@@ -176,6 +176,14 @@ class Settings(BaseModel):
     #: single tick drains concurrently (1 = historical serial ticks).
     #: Within one execution, dependency order stays strictly serial.
     tick_parallel_executions: int = 1
+    #: Mega-scale fix (2026-08-31, live-found): the managed worker used to
+    #: iterate projects SEQUENTIALLY, so one project's long tick (a big
+    #: graph grinding its frontier) head-of-line blocked every other
+    #: project's scheduling — new projects' approved plans sat unclaimed
+    #: for the whole duration. 1 keeps the historical serial behavior;
+    #: N>1 ticks up to N projects concurrently (each tick keeps its own
+    #: per-project error isolation; claims/leases stay exactly-once).
+    tick_project_parallelism: int = 1
     #: Total dispatch attempts per provider request (first call +
     #: in-process retries of transient/rate-limit failures). Reference
     #: parity: Hermes defaults to retrying before failing over.
@@ -475,8 +483,12 @@ class Settings(BaseModel):
 
         tool_approval_mode = str(raw.get("ZERO_TOOL_APPROVAL_MODE", "off") or "off")
         tool_approval_mode = tool_approval_mode.strip().lower()
-        if tool_approval_mode not in ("off", "manual"):
-            raise ConfigError("ZERO_TOOL_APPROVAL_MODE must be 'off' or 'manual'.")
+        # B12a (2026-08-31): "auto" runs the pipeline unattended with the
+        # hardline floor + deny rules still enforced (no human loop).
+        if tool_approval_mode not in ("off", "manual", "auto"):
+            raise ConfigError(
+                "ZERO_TOOL_APPROVAL_MODE must be 'off', 'manual' or 'auto'."
+            )
 
         tick_parallel_raw = str(raw.get("ZERO_TICK_PARALLEL_EXECUTIONS", "1"))
         try:
@@ -485,6 +497,14 @@ class Settings(BaseModel):
             raise ConfigError("ZERO_TICK_PARALLEL_EXECUTIONS must be an integer.") from exc
         if tick_parallel_executions < 1 or tick_parallel_executions > 8:
             raise ConfigError("ZERO_TICK_PARALLEL_EXECUTIONS must be between 1 and 8.")
+
+        tick_project_raw = str(raw.get("ZERO_TICK_PROJECT_PARALLELISM", "1"))
+        try:
+            tick_project_parallelism = int(tick_project_raw)
+        except ValueError as exc:
+            raise ConfigError("ZERO_TICK_PROJECT_PARALLELISM must be an integer.") from exc
+        if tick_project_parallelism < 1 or tick_project_parallelism > 8:
+            raise ConfigError("ZERO_TICK_PROJECT_PARALLELISM must be between 1 and 8.")
 
         provider_attempts_raw = raw.get("ZERO_PROVIDER_MAX_ATTEMPTS", "2")
         try:
@@ -558,6 +578,7 @@ class Settings(BaseModel):
             decomposition_analytics_path=decomposition_analytics_path,
             tool_approval_mode=tool_approval_mode,
             tick_parallel_executions=tick_parallel_executions,
+            tick_project_parallelism=tick_project_parallelism,
             telegram_webhook_secret=telegram_webhook_secret,
             telegram_proxy_url=telegram_proxy_url,
             discord_application_public_key=discord_application_public_key,

@@ -526,11 +526,15 @@ def test_failure_detail_includes_class_and_message() -> None:
 def test_failure_detail_redacts_secrets() -> None:
     from zero.app.agent_runtime import _failure_detail
 
+    # Synthetic key (scanner-exempt fixture marker embedded). The REAL
+    # leaked key must never appear in tracked files again — the
+    # redaction itself is shape-based, so a same-shape fixture proves
+    # the mechanism without re-committing the secret.
     exc = RuntimeError(
-        "gateway rejected key sk-BlwjB2GhsGBwFLjQBBAhKK7FpmfJYP9usqGfrImaLaA1JOKW"
+        "gateway rejected key sk-WAVE11FIXTUREAAHcSECRETVALUE0000000000"
     )
     detail = _failure_detail(exc)
-    assert "sk-BlwjB2GhsGBwFLjQBBAhKK7FpmfJYP9usqGfrImaLaA1JOKW" not in detail
+    assert "sk-WAVE11FIXTUREAAHcSECRETVALUE0000000000" not in detail
 
 
 def test_runtime_setup_failure_message_carries_cause(services) -> None:
